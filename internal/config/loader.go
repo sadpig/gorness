@@ -114,6 +114,19 @@ func (m *Manager) Current() *Snapshot {
 	return m.current.Load()
 }
 
+// Reload 同步校验并原子替换全局活跃配置快照；若磁盘配置存在语法错误则保留原合法快照不变并返回诊断错误。
+func (m *Manager) Reload() (*Snapshot, error) {
+	if m == nil {
+		return nil, errors.New("nil config manager")
+	}
+	snap, err := m.loadGlobalSnapshot()
+	if err != nil {
+		return m.Current(), err
+	}
+	m.current.Store(snap)
+	return snap, nil
+}
+
 // ForWorkspace 基于当前全局快照合并项目 <wsRoot>/.gorness/ 局部配置：
 // 1. 强制规范路径校验：任何逃逸出 canonWs 或指向 ~/.gorness/ 的符号链接一律拒绝读取，阻断宿主机密钥经 SystemPrompt 外泄；
 // 2. 项目级 mcp.toml、providers.toml 与 agents/*.md 的 api_key 必须通过 SHA-256 白名单核验方可生效；

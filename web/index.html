@@ -1,0 +1,445 @@
+<!DOCTYPE html>
+<html lang="zh-CN" data-theme="auto">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Gorness Studio — Apple HIG Zero-DB Agent Workbench</title>
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <div id="app-shell" class="app-shell">
+    <!-- Top Unified Cupertino Toolbar -->
+    <header class="topbar" role="banner">
+      <div class="topbar-left">
+        <div class="brand-mark" aria-hidden="true">
+          <span class="dot dot-red"></span>
+          <span class="dot dot-amber"></span>
+          <span class="dot dot-green"></span>
+        </div>
+        <div class="brand-title">
+          <strong>Gorness</strong>
+          <span class="brand-sub" data-i18n="brandSub">macOS 纯 Go · 零数据库工作台</span>
+        </div>
+        <span id="health-pill" class="status-pill ok" title="127.0.0.1 Loopback">127.0.0.1</span>
+      </div>
+
+      <div class="topbar-center">
+        <div class="segmented-control" role="tablist" aria-label="Center Mode">
+          <button id="mode-chat-btn" class="seg-btn active" type="button" data-mode="chat" data-i18n="modeChat">对话工作台</button>
+          <button id="mode-fleet-btn" class="seg-btn" type="button" data-mode="fleet">
+            <span data-i18n="modeFleet">多智能体编排画布</span>
+            <span id="fleet-live-badge" class="pill-count hidden">0</span>
+          </button>
+        </div>
+      </div>
+
+      <div class="topbar-right">
+        <button id="alwayson-drawer-btn" class="toolbar-btn" type="button">
+          <span class="pulse-dot idle" id="alwayson-dot"></span>
+          <span data-i18n="alwaysOnBtn">常驻队列</span>
+          <span id="alwayson-count" class="pill-count hidden">0</span>
+        </button>
+
+        <div class="segmented-control compact" aria-label="Theme">
+          <button class="seg-btn theme-btn active" type="button" data-theme-val="auto" data-i18n="themeAuto">自动</button>
+          <button class="seg-btn theme-btn" type="button" data-theme-val="light" data-i18n="themeLight">浅色</button>
+          <button class="seg-btn theme-btn" type="button" data-theme-val="dark" data-i18n="themeDark">深色</button>
+        </div>
+
+        <button id="lang-toggle-btn" class="toolbar-btn mono" type="button" title="切换中英文 / Toggle Language">中文 / EN</button>
+      </div>
+    </header>
+
+    <!-- Main Resizable Three-Pane Workbench -->
+    <div class="workbench-grid" id="workbench-grid">
+      <!-- LEFT PANE: Cross-Workspace Attention Queue, Search, Projects & Sessions -->
+      <aside class="left-pane" id="left-pane" aria-label="Workspaces and Sessions">
+        <div class="pane-section search-box-wrap">
+          <input
+            id="global-search-input"
+            class="search-input"
+            type="search"
+            autocomplete="off"
+            data-i18n-placeholder="searchPlaceholder"
+            placeholder="跨项目搜索会话与代码片段 (⌘K)..."
+          >
+          <div id="search-results-popover" class="search-results hidden"></div>
+        </div>
+
+        <!-- Cross-Workspace Needs Attention Queue -->
+        <section id="attention-section" class="attention-section hidden">
+          <div class="section-label">
+            <span data-i18n="needsAttention">待审批事项</span>
+            <span id="attention-badge" class="pill-count warn">0</span>
+          </div>
+          <div id="attention-list" class="attention-list"></div>
+        </section>
+
+        <!-- Workspaces & Grouped Sessions -->
+        <div class="sidebar-header-row">
+          <span class="section-label-text" data-i18n="projectsHeader">工作区与会话</span>
+          <div class="row-actions">
+            <button id="add-workspace-btn" class="ghost-xs-btn" type="button" data-i18n="addProjectBtn">+ 项目</button>
+            <button id="new-session-btn" class="primary-xs-btn" type="button" data-i18n="newSessionBtn">+ 会话</button>
+          </div>
+        </div>
+
+        <div id="workspace-tree" class="workspace-tree"></div>
+
+        <!-- ~/.gorness/ Zero-DB Vault Footer -->
+        <footer class="vault-footer">
+          <div class="vault-meta">
+            <div class="vault-title">
+              <span class="vault-dot"></span>
+              <code id="vault-path-label">~/.gorness</code>
+            </div>
+            <span class="vault-formats">TOML · MD · JSONL · HTML</span>
+          </div>
+          <button id="open-config-studio-btn" class="ghost-xs-btn" type="button" data-i18n="configStudioBtn">配置矩阵</button>
+        </footer>
+      </aside>
+
+      <div class="splitter" id="left-splitter" role="separator" aria-orientation="vertical"></div>
+
+      <!-- CENTER PANE: Dual Mode (A) Streaming Conversation | (B) Visual Multi-Agent SVG Studio -->
+      <main class="center-pane" id="center-pane">
+        <!-- Reload Diagnostic Banner (if malformed TOML/MD saved mid-edit) -->
+        <div id="reload-diag-banner" class="diag-banner hidden"></div>
+
+        <!-- MODE A: Conversation Workbench -->
+        <section id="chat-mode-view" class="mode-view">
+          <div class="session-bar">
+            <div class="session-title-group">
+              <input id="session-title-input" class="session-title-input" type="text" value="New Session" aria-label="Session Title">
+              <span id="session-seq-badge" class="meta-chip mono">seq #0</span>
+              <span id="session-cost-badge" class="meta-chip mono">0 tok · $0.0000</span>
+            </div>
+
+            <div class="session-controls">
+              <label class="inline-select-label">
+                <span data-i18n="roleLabel">角色</span>
+                <select id="agent-role-select" class="mac-select"></select>
+              </label>
+
+              <label class="inline-select-label">
+                <span data-i18n="permLabel">权限</span>
+                <select id="perm-mode-select" class="mac-select">
+                  <option value="auto">auto</option>
+                  <option value="accept_edits">accept_edits</option>
+                  <option value="ask">ask</option>
+                  <option value="plan">plan</option>
+                  <option value="yolo">yolo</option>
+                </select>
+              </label>
+
+              <input id="model-override-input" class="mac-input-xs mono" type="text" data-i18n-placeholder="modelOverridePh" placeholder="provider/model 覆盖">
+
+              <button id="compact-session-btn" class="ghost-xs-btn" type="button" title="/compact" data-i18n="compactBtn">压缩</button>
+              <button id="fork-session-btn" class="ghost-xs-btn" type="button" title="/fork" data-i18n="forkBtn">分叉</button>
+              <button id="export-html-btn" class="ghost-xs-btn" type="button" data-i18n="exportHtmlBtn">导出预览</button>
+              <button id="stop-run-btn" class="danger-xs-btn hidden" type="button" data-i18n="stopBtn">停止</button>
+            </div>
+          </div>
+
+          <!-- 500ms-Guarded Partial Hunk Diff Approval Banner -->
+          <div id="approval-banner-host" class="approval-banner-host"></div>
+
+          <!-- Streaming Message Timeline -->
+          <div id="chat-timeline" class="chat-timeline">
+            <div id="chat-history-entries"></div>
+            <div id="chat-live-stream"></div>
+          </div>
+
+          <!-- Composer with @file / $skill / /command Palette -->
+          <div class="composer-shell">
+            <div id="composer-palette" class="composer-palette hidden"></div>
+            <textarea
+              id="composer-input"
+              class="composer-textarea"
+              rows="3"
+              data-i18n-placeholder="composerPlaceholder"
+              placeholder="输入任务指令… 输入 @ 引用文件，$ 激活技能，/ 调用命令（Shift+Enter 换行，Enter 发送 / 运行中注入 Steer）"
+            ></textarea>
+            <div class="composer-footer">
+              <div class="composer-hints">
+                <span class="kbd-hint"><code>@</code> <span data-i18n="hintFile">文件</span></span>
+                <span class="kbd-hint"><code>$</code> <span data-i18n="hintSkill">技能</span></span>
+                <span class="kbd-hint"><code>/</code> <span data-i18n="hintCmd">命令</span></span>
+                <span id="draft-saved-indicator" class="draft-indicator"></span>
+              </div>
+              <div class="composer-actions">
+                <button id="launch-fleet-quick-btn" class="ghost-sm-btn" type="button" data-i18n="launchFleetQuick">启动舰队协同…</button>
+                <button id="send-or-steer-btn" class="primary-sm-btn" type="button" data-i18n="sendBtn">发送</button>
+              </div>
+            </div>
+          </div>
+        </section>
+
+        <!-- MODE B: Interactive Visual Multi-Agent Orchestration Studio -->
+        <section id="fleet-mode-view" class="mode-view hidden">
+          <div class="fleet-toolbar">
+            <div class="fleet-toolbar-left">
+              <select id="mission-select" class="mac-select wide"></select>
+              <span id="mission-status-pill" class="status-pill">idle</span>
+              <span id="mission-cost-pill" class="meta-chip mono">$0.0000</span>
+            </div>
+            <div class="fleet-toolbar-right">
+              <div id="refinery-queue-bar" class="refinery-bar"></div>
+              <button id="stop-mission-btn" class="danger-xs-btn hidden" type="button" data-i18n="stopMissionBtn">终止编排</button>
+              <button id="new-mission-modal-btn" class="primary-sm-btn" type="button" data-i18n="newMissionBtn">+ 启动多智能体编排</button>
+            </div>
+          </div>
+
+          <div class="fleet-studio-body">
+            <!-- Live Animated SVG Topology Graph -->
+            <div class="fleet-canvas-card">
+              <div class="canvas-legend">
+                <span id="fleet-goal-banner" class="fleet-goal-text" data-i18n="fleetEmptyGoal">选择或启动任意 6 种异构模型多智能体拓扑</span>
+                <span class="legend-pills">
+                  <span class="legend-item"><i class="lg-dot idle"></i> idle</span>
+                  <span class="legend-item"><i class="lg-dot running"></i> running</span>
+                  <span class="legend-item"><i class="lg-dot merging"></i> refinery</span>
+                  <span class="legend-item"><i class="lg-dot completed"></i> landed</span>
+                </span>
+              </div>
+              <div class="svg-stage-wrap">
+                <svg id="fleet-svg-canvas" class="fleet-svg" viewBox="0 0 920 430" preserveAspectRatio="xMidYMid meet"></svg>
+              </div>
+            </div>
+
+            <!-- Bottom Split: Clicked Node Worktree Diff & Steer + Markdown Blackboard -->
+            <div class="fleet-bottom-grid">
+              <div class="fleet-panel">
+                <div class="panel-head">
+                  <strong id="selected-node-title" data-i18n="nodeInspectorTitle">节点详情与 Git Worktree 差异</strong>
+                  <span id="selected-node-badge" class="meta-chip mono">—</span>
+                </div>
+                <div class="node-steer-row">
+                  <input
+                    id="node-steer-input"
+                    class="mac-input"
+                    type="text"
+                    data-i18n-placeholder="nodeSteerPh"
+                    placeholder="向选中节点中途注入步边界 Steer 指令…"
+                  >
+                  <button id="node-steer-send-btn" class="primary-xs-btn" type="button" data-i18n="steerNodeBtn">注入 Steer</button>
+                </div>
+                <div id="selected-node-stream" class="node-stream-log mono"></div>
+                <pre id="selected-node-diff" class="diff-viewer mono" data-i18n="clickNodeHint">点击上方拓扑中的任意 Agent 节点查看其实时流与隔离 Git Worktree Diff。</pre>
+              </div>
+
+              <div class="fleet-panel">
+                <div class="panel-head">
+                  <strong data-i18n="blackboardTitle">Markdown 共享黑板 (tasks/*.md &amp; notes/*.md)</strong>
+                  <span id="blackboard-counts" class="meta-chip mono">0 tasks · 0 notes</span>
+                </div>
+                <div id="blackboard-tasks-list" class="blackboard-list"></div>
+                <div id="blackboard-notes-list" class="blackboard-notes"></div>
+              </div>
+            </div>
+          </div>
+        </section>
+      </main>
+
+      <div class="splitter" id="right-splitter" role="separator" aria-orientation="vertical"></div>
+
+      <!-- RIGHT PANE: Resizable 4-Tab Inspector -->
+      <aside class="right-pane" id="right-pane" aria-label="Inspector">
+        <nav class="inspector-tabs" role="tablist">
+          <button class="insp-tab active" type="button" data-tab="files" data-i18n="tabFiles">文件</button>
+          <button class="insp-tab" type="button" data-tab="snapshots" data-i18n="tabSnapshots">时光机</button>
+          <button class="insp-tab" type="button" data-tab="config" data-i18n="tabConfig">配置矩阵</button>
+          <button class="insp-tab" type="button" data-tab="preview" data-i18n="tabPreview">沙箱预览</button>
+        </nav>
+
+        <!-- Tab 1: Workspace Files & Safe Copy-Opener -->
+        <section id="insp-panel-files" class="insp-panel">
+          <div class="insp-toolbar">
+            <input id="file-filter-input" class="mac-input" type="search" data-i18n-placeholder="filterFilesPh" placeholder="过滤项目文件…">
+            <button id="refresh-files-btn" class="ghost-xs-btn" type="button">↻</button>
+          </div>
+          <div id="workspace-files-list" class="files-list"></div>
+          <div id="file-viewer-card" class="file-viewer-card hidden">
+            <div class="file-viewer-head">
+              <code id="file-viewer-path"></code>
+              <button id="safe-open-file-btn" class="ghost-xs-btn" type="button" data-i18n="safeOpenBtn">安全打开 / Finder</button>
+            </div>
+            <pre id="file-viewer-code" class="code-preview mono"></pre>
+          </div>
+        </section>
+
+        <!-- Tab 2: Snapshot Time-Machine (/rewind & /fork) -->
+        <section id="insp-panel-snapshots" class="insp-panel hidden">
+          <div class="insp-note">
+            <label class="checkbox-row">
+              <input id="rewind-restore-files-cb" type="checkbox" checked>
+              <span data-i18n="restoreFilesToggle">回退时按 SHA-256 快照同步还原源码文件</span>
+            </label>
+          </div>
+          <div id="snapshots-timeline-list" class="snapshots-list"></div>
+        </section>
+
+        <!-- Tab 3: Heterogeneous Agent-Model Matrix & Live ~/.gorness/ TOML/MD Editor -->
+        <section id="insp-panel-config" class="insp-panel hidden">
+          <div class="config-block">
+            <div class="subhead-row">
+              <strong data-i18n="agentMatrixTitle">异构 Agent 角色模型矩阵</strong>
+              <button id="toggle-add-provider-btn" class="ghost-xs-btn" type="button" data-i18n="addProviderBtn">+ 供应商</button>
+            </div>
+
+            <form id="quick-provider-form" class="mini-card-form hidden">
+              <input id="prov-id-in" class="mac-input" type="text" placeholder="id (e.g. apple_genai)" required>
+              <select id="prov-proto-in" class="mac-select">
+                <option value="anthropic">anthropic</option>
+                <option value="openai-responses">openai-responses</option>
+                <option value="openai-compat">openai-compat</option>
+                <option value="gemini">gemini</option>
+              </select>
+              <input id="prov-url-in" class="mac-input" type="text" placeholder="base_url (https://...)" required>
+              <input id="prov-key-in" class="mac-input mono" type="text" placeholder="env:API_KEY or keychain:service">
+              <input id="prov-model-in" class="mac-input mono" type="text" placeholder="default model id">
+              <button class="primary-xs-btn" type="submit" data-i18n="saveProviderBtn">写入 providers.toml</button>
+            </form>
+
+            <div id="agent-matrix-rows" class="agent-matrix-rows"></div>
+          </div>
+
+          <div class="config-block grow">
+            <div class="subhead-row">
+              <strong data-i18n="vaultEditorTitle">~/.gorness 实时 TOML / MD 编辑器</strong>
+              <button id="save-vault-file-btn" class="primary-xs-btn" type="button" data-i18n="saveHotReloadBtn">保存并热加载</button>
+            </div>
+            <select id="vault-file-select" class="mac-select full"></select>
+            <textarea id="vault-file-editor" class="vault-editor mono" spellcheck="false"></textarea>
+            <div id="vault-save-status" class="tiny-status"></div>
+          </div>
+        </section>
+
+        <!-- Tab 4: Isolated Sandboxed HTML Artifact Preview -->
+        <section id="insp-panel-preview" class="insp-panel hidden">
+          <div class="preview-controls">
+            <select id="preview-artifact-select" class="mac-select full"></select>
+            <div class="row-actions">
+              <button id="new-html-snippet-btn" class="ghost-xs-btn" type="button" data-i18n="renderSnippetBtn">新建 HTML 沙箱</button>
+              <a id="open-preview-standalone" class="ghost-xs-btn link-btn" href="#" target="_blank" rel="noopener noreferrer" data-i18n="openStandalone">独立窗口 ↗</a>
+            </div>
+          </div>
+          <div class="csp-shield-note mono">sandbox="allow-scripts" · zero same-origin · connect-src 'none'</div>
+          <div id="custom-preview-composer" class="mini-card-form hidden">
+            <input id="custom-preview-title" class="mac-input" type="text" placeholder="Artifact Title">
+            <textarea id="custom-preview-html" class="vault-editor mono short" placeholder="<h1>Hello Sandbox</h1>"></textarea>
+            <button id="mint-preview-btn" class="primary-xs-btn" type="button" data-i18n="mintPreviewBtn">生成隔离预览</button>
+          </div>
+          <iframe
+            id="inspector-preview-frame"
+            class="inspector-preview-frame"
+            sandbox="allow-scripts"
+            referrerpolicy="no-referrer"
+            title="Isolated HTML Artifact Preview"
+          ></iframe>
+        </section>
+      </aside>
+    </div>
+  </div>
+
+  <!-- Modal: Register Workspace -->
+  <div id="workspace-modal" class="modal-backdrop hidden" role="dialog" aria-modal="true">
+    <div class="modal-sheet">
+      <div class="modal-head">
+        <h3 data-i18n="registerWsTitle">注册本地 macOS 项目工作区</h3>
+        <button class="close-modal-btn" type="button" data-close="workspace-modal">✕</button>
+      </div>
+      <form id="register-ws-form" class="modal-form">
+        <label>
+          <span data-i18n="wsPathLabel">本地目录绝对路径</span>
+          <input id="ws-path-input" class="mac-input mono" type="text" placeholder="/Users/you/Projects/my-service" required>
+        </label>
+        <label>
+          <span data-i18n="wsNameLabel">显示名称（可选）</span>
+          <input id="ws-name-input" class="mac-input" type="text" placeholder="My Service">
+        </label>
+        <div class="modal-actions">
+          <button class="ghost-sm-btn close-modal-btn" type="button" data-close="workspace-modal" data-i18n="cancelBtn">取消</button>
+          <button class="primary-sm-btn" type="submit" data-i18n="confirmRegisterBtn">注册项目</button>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <!-- Modal: Launch Visual Multi-Agent Fleet Mission (6 Topologies) -->
+  <div id="fleet-launcher-modal" class="modal-backdrop hidden" role="dialog" aria-modal="true">
+    <div class="modal-sheet wide">
+      <div class="modal-head">
+        <h3 data-i18n="launchFleetTitle">启动可视化异构多智能体协同编排</h3>
+        <button class="close-modal-btn" type="button" data-close="fleet-launcher-modal">✕</button>
+      </div>
+      <form id="launch-fleet-form" class="modal-form">
+        <div class="topology-cards-grid" id="topology-cards-grid"></div>
+
+        <label>
+          <span data-i18n="missionGoalLabel">编排目标 (Mission Goal)</span>
+          <textarea id="fleet-goal-input" class="mac-textarea" rows="3" placeholder="描述跨模块架构改造、并发探索或生成-盲审闭环目标…" required></textarea>
+        </label>
+
+        <div class="two-col">
+          <label>
+            <span data-i18n="verifyCmdLabel">Refinery 验收门控命令</span>
+            <input id="fleet-verify-input" class="mac-input mono" type="text" value="go test ./...">
+          </label>
+          <label>
+            <span data-i18n="budgetLabel">预算上限 (USD, 0=不限)</span>
+            <input id="fleet-budget-input" class="mac-input mono" type="number" step="0.5" min="0" value="0">
+          </label>
+        </div>
+
+        <label class="checkbox-row">
+          <input id="fleet-worktrees-cb" type="checkbox" checked>
+          <span data-i18n="useWorktreesLabel">启用独立 Git Worktree 物理隔离与串行变基快进合入 (--ff-only)</span>
+        </label>
+
+        <div class="modal-actions">
+          <button class="ghost-sm-btn close-modal-btn" type="button" data-close="fleet-launcher-modal" data-i18n="cancelBtn">取消</button>
+          <button class="primary-sm-btn" type="submit" data-i18n="startMissionSubmit">立即启动拓扑</button>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <!-- Modal / Drawer: Always-On Sleep-Wake Primitives -->
+  <div id="alwayson-modal" class="modal-backdrop hidden" role="dialog" aria-modal="true">
+    <div class="modal-sheet wide">
+      <div class="modal-head">
+        <h3 data-i18n="alwaysOnTitle">Always-On 休眠唤醒中枢 (Inbox · Timers · Deferred · Outbox · Dreamer)</h3>
+        <button class="close-modal-btn" type="button" data-close="alwayson-modal">✕</button>
+      </div>
+      <div class="alwayson-grid">
+        <div class="ao-box">
+          <div class="subhead-row">
+            <strong data-i18n="aoTimersHead">持久化定时器 (timers.toml)</strong>
+            <button id="trigger-dream-btn" class="ghost-xs-btn" type="button" data-i18n="runDreamBtn">运行 Dreamer 提炼技能</button>
+          </div>
+          <form id="add-timer-form" class="inline-form">
+            <input id="timer-cron-input" class="mac-input mono" type="text" placeholder="*/30 * * * * (留空则为 60s Follow-up)">
+            <input id="timer-note-input" class="mac-input" type="text" placeholder="巡检任务说明…" required>
+            <button class="primary-xs-btn" type="submit">+</button>
+          </form>
+          <div id="ao-timers-list" class="ao-list"></div>
+        </div>
+
+        <div class="ao-box">
+          <div class="subhead-row">
+            <strong data-i18n="aoWebhookHead">本地事件注入 &amp; 发件箱 (outbox.jsonl)</strong>
+          </div>
+          <form id="send-webhook-form" class="inline-form">
+            <input id="webhook-text-input" class="mac-input" type="text" placeholder="投递幂等 Inbox 事件…" required>
+            <button class="primary-xs-btn" type="submit" data-i18n="enqueueBtn">投递</button>
+          </form>
+          <div id="ao-outbox-list" class="ao-list"></div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <script type="module" src="/app.js"></script>
+</body>
+</html>
