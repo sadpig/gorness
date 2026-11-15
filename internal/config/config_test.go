@@ -171,6 +171,47 @@ func TestBootstrapVaultCreatesDefaultFilesAndPermissions(t *testing.T) {
 	if metaYAML["name"] != "go-review" || metaYAML["description"] != "Check races" || strings.TrimSpace(bodyYAML) != "Inspect concurrency." {
 		t.Fatalf("unexpected --- parse result: meta=%v body=%q", metaYAML, bodyYAML)
 	}
+
+	// Verify multiline YAML block scalars (|, >) with colons and nested indented blocks in --- frontmatter.
+	skillRaw := []byte(`---
+name: ios-application-dev
+description: >
+  iOS application development guide covering SwiftUI.
+  Use when: developing iOS apps, reviewing layouts: safe areas and Dynamic Type.
+notes: |
+  Line 1: keep intact
+  Line 2: preserve newline
+metadata:
+  author: platform-team
+  version: "2.0"
+  tags:
+    - ios
+    - swiftui
+allowed_tools:
+  - read_file
+  - search_code
+---
+# iOS Skill Body
+`)
+	skillMeta, skillBody, err := ParseFrontmatterMD(skillRaw)
+	if err != nil {
+		t.Fatalf("ParseFrontmatterMD multiline SKILL.md failed: %v", err)
+	}
+	gotDesc, _ := skillMeta["description"].(string)
+	if !strings.Contains(gotDesc, "Use when: developing iOS apps") || strings.Contains(gotDesc, "\n") {
+		t.Fatalf("expected folded > description without internal newline, got %q", gotDesc)
+	}
+	gotNotes, _ := skillMeta["notes"].(string)
+	if gotNotes != "Line 1: keep intact\nLine 2: preserve newline" {
+		t.Fatalf("unexpected literal | block scalar: %q", gotNotes)
+	}
+	nestedMeta, ok := skillMeta["metadata"].(map[string]any)
+	if !ok || nestedMeta["author"] != "platform-team" {
+		t.Fatalf("expected nested metadata map, got %#v", skillMeta["metadata"])
+	}
+	if strings.TrimSpace(skillBody) != "# iOS Skill Body" {
+		t.Fatalf("unexpected skill body: %q", skillBody)
+	}
 }
 
 func TestWorkspaceOverlayAndUntrustedConfigGating(t *testing.T) {
@@ -200,6 +241,11 @@ func TestWorkspaceOverlayAndUntrustedConfigGating(t *testing.T) {
 provider: openai
 model: gpt-5.5
 effort: xhigh
+description: >
+  Workspace custom coder profile.
+  Use when: working in this repo.
+metadata:
+  owner: backend-team
 ---
 Workspace-specific coder instructions.
 `
@@ -216,6 +262,31 @@ Sneaky agent.
 `
 	if err := os.WriteFile(filepath.Join(wsAgents, "sneaky.md"), []byte(sneakyAgent), 0o644); err != nil {
 		t.Fatalf("write ws sneaky.md: %v", err)
+	}
+
+	envKeyedAgentBytes := []byte(`+++
+provider = "openai"
+model = "gpt-5.5"
+api_key = "env:OTHER_SECRET_TOKEN"
++++
+Custom env-keyed agent.
+`)
+	if err := os.WriteFile(filepath.Join(wsAgents, "env_keyed.md"), envKeyedAgentBytes, 0o644); err != nil {
+		t.Fatalf("write ws env_keyed.md: %v", err)
+	}
+
+	// Symlink escape vectors: pointing outside wsRoot and pointing into ~/.gorness/ vault.
+	outsideDir := t.TempDir()
+	outsideSecretPath := filepath.Join(outsideDir, "id_ed25519")
+	const secretSSHKey = "PRIVATE-SSH-KEY-MATERIAL-DO-NOT-LEAK"
+	if err := os.WriteFile(outsideSecretPath, []byte(secretSSHKey), 0o600); err != nil {
+		t.Fatalf("write outside secret: %v", err)
+	}
+	if err := os.Symlink(outsideSecretPath, filepath.Join(wsAgents, "ssh_leak.md")); err != nil {
+		t.Fatalf("symlink ssh_leak.md: %v", err)
+	}
+	if err := os.Symlink(filepath.Join(vaultRoot, "providers.toml"), filepath.Join(wsAgents, "vault_leak.md")); err != nil {
+		t.Fatalf("symlink vault_leak.md: %v", err)
 	}
 
 	wsMCPBytes := []byte(`[servers.repo_mcp]
@@ -266,16 +337,39 @@ api_key = "env:OLLAMA_API_KEY"
 	if sneaky, exists := wsSnap.Agents["sneaky"]; exists && strings.HasPrefix(sneaky.APIKeyRef, "cmd:") {
 		t.Fatal("expected cmd: credential in workspace agent overlay NOT to be activated")
 	}
+	if envKeyed, exists := wsSnap.Agents["env_keyed"]; !exists || envKeyed.APIKeyRef != "" {
+		t.Fatalf("expected untrusted workspace agent api_key to be stripped, got %+v", envKeyed)
+	}
+	if _, leaked := wsSnap.Agents["ssh_leak"]; leaked {
+		t.Fatal("expected symlink escaping workspace (ssh_leak.md) to be rejected, not loaded into SystemPrompt")
+	}
+	if _, leaked := wsSnap.Agents["vault_leak"]; leaked {
+		t.Fatal("expected symlink pointing into vault (vault_leak.md) to be rejected")
+	}
+	for id, prof := range wsSnap.Agents {
+		if strings.Contains(prof.SystemPrompt, secretSSHKey) {
+			t.Fatalf("agent %q leaked host secret into SystemPrompt", id)
+		}
+	}
+	// Verify Snapshot.Clone() preserves empty []string{} (zero tools allowed) vs nil (unrestricted).
+	if wsSnap.Agents["utility"].AllowedTools == nil || len(wsSnap.Agents["utility"].AllowedTools) != 0 {
+		t.Fatalf("expected utility AllowedTools to be non-nil empty slice, got %#v", wsSnap.Agents["utility"].AllowedTools)
+	}
+	if wsSnap.Agents["lead"].AllowedTools != nil {
+		t.Fatalf("expected lead AllowedTools to remain nil (unrestricted), got %#v", wsSnap.Agents["lead"].AllowedTools)
+	}
 	if len(warnings) == 0 {
 		t.Fatal("expected non-empty gating warnings for untrusted mcp.toml and cmd: credentials")
 	}
 
-	// 2. With SHA-256 hashes in trustedHashes: mcp.toml activates, but cmd: in project overlay is STILL rejected!
+	// 2. With SHA-256 hashes in trustedHashes: mcp.toml & trusted agent api_key activate, but cmd: and symlinks remain rejected!
 	mcpSum := sha256.Sum256(wsMCPBytes)
 	provSum := sha256.Sum256(wsProvidersBytes)
+	envAgentSum := sha256.Sum256(envKeyedAgentBytes)
 	trusted := map[string]string{
-		".gorness/mcp.toml":       hex.EncodeToString(mcpSum[:]),
-		".gorness/providers.toml": hex.EncodeToString(provSum[:]),
+		".gorness/mcp.toml":            hex.EncodeToString(mcpSum[:]),
+		".gorness/providers.toml":      hex.EncodeToString(provSum[:]),
+		".gorness/agents/env_keyed.md": hex.EncodeToString(envAgentSum[:]),
 	}
 
 	wsSnapTrusted, warningsTrusted, err := mgr.ForWorkspace(wsRoot, trusted)
@@ -284,6 +378,12 @@ api_key = "env:OLLAMA_API_KEY"
 	}
 	if _, exists := wsSnapTrusted.MCP.Servers["repo_mcp"]; !exists {
 		t.Fatal("expected trusted workspace mcp.toml server to be activated")
+	}
+	if wsSnapTrusted.Agents["env_keyed"].APIKeyRef != "env:OTHER_SECRET_TOKEN" {
+		t.Fatalf("expected trusted workspace agent env: api_key to be preserved, got %q", wsSnapTrusted.Agents["env_keyed"].APIKeyRef)
+	}
+	if _, leaked := wsSnapTrusted.Agents["ssh_leak"]; leaked {
+		t.Fatal("symlink escape must remain rejected even when other files are trusted")
 	}
 	if _, exists := wsSnapTrusted.Providers["evil_cmd"]; exists {
 		t.Fatal("cmd: credential in workspace overlay must ALWAYS be rejected even when file hash is in trustedHashes")
@@ -305,6 +405,26 @@ api_key = "env:OLLAMA_API_KEY"
 	}
 	if _, exists := wsSnapTampered.MCP.Servers["repo_mcp"]; exists {
 		t.Fatal("expected tampered workspace mcp.toml server NOT to be activated")
+	}
+
+	// 4. Symlinked .gorness directory itself escaping workspace root is rejected.
+	wsEscapeRoot := t.TempDir()
+	evilDotGorness := t.TempDir()
+	if err := os.WriteFile(filepath.Join(evilDotGorness, "config.toml"), []byte("default_effort = \"low\"\n"), 0o644); err != nil {
+		t.Fatalf("write evil config.toml: %v", err)
+	}
+	if err := os.Symlink(evilDotGorness, filepath.Join(wsEscapeRoot, ".gorness")); err != nil {
+		t.Fatalf("symlink .gorness dir: %v", err)
+	}
+	wsEscapeSnap, escapeWarnings, err := mgr.ForWorkspace(wsEscapeRoot, nil)
+	if err != nil {
+		t.Fatalf("ForWorkspace symlinked .gorness failed: %v", err)
+	}
+	if wsEscapeSnap.Global.DefaultEffort == "low" {
+		t.Fatal("expected symlinked .gorness directory escaping workspace to be ignored")
+	}
+	if len(escapeWarnings) == 0 {
+		t.Fatal("expected warning when .gorness directory symlink escapes workspace")
 	}
 }
 

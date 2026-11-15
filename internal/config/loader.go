@@ -115,8 +115,9 @@ func (m *Manager) Current() *Snapshot {
 }
 
 // ForWorkspace 基于当前全局快照合并项目 <wsRoot>/.gorness/ 局部配置：
-// 1. 项目级 mcp.toml 与 providers.toml 必须通过 SHA-256 白名单核验方可激活；
-// 2. 项目级覆盖中的任何 cmd: 动态命令凭据一律无条件拦截（即使文件哈希在 trustedHashes 中也拒绝执行）。
+// 1. 强制规范路径校验：任何逃逸出 canonWs 或指向 ~/.gorness/ 的符号链接一律拒绝读取，阻断宿主机密钥经 SystemPrompt 外泄；
+// 2. 项目级 mcp.toml、providers.toml 与 agents/*.md 的 api_key 必须通过 SHA-256 白名单核验方可生效；
+// 3. 项目级覆盖中的任何 cmd: 动态命令凭据一律无条件拦截（即使文件哈希在 trustedHashes 中也拒绝执行）。
 func (m *Manager) ForWorkspace(wsRoot string, trustedHashes map[string]string) (*Snapshot, []string, error) {
 	base := m.Current()
 	if base == nil {
@@ -129,22 +130,62 @@ func (m *Manager) ForWorkspace(wsRoot string, trustedHashes map[string]string) (
 		return snap, nil, nil
 	}
 
-	// 用户级技能目录排在前面，确保同名用户技能优先覆盖项目内技能。
-	snap.SkillDirs = append(snap.SkillDirs,
+	canonWs, err := filepath.EvalSymlinks(wsRoot)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return snap, nil, nil
+		}
+		return nil, nil, fmt.Errorf("resolve workspace root %s: %w", wsRoot, err)
+	}
+	canonWs = filepath.Clean(canonWs)
+
+	canonVault := filepath.Clean(m.paths.Root)
+	if resolvedVault, err := filepath.EvalSymlinks(m.paths.Root); err == nil {
+		canonVault = filepath.Clean(resolvedVault)
+	}
+
+	if isPathWithinOrEqual(canonWs, canonVault) {
+		warnings = append(warnings, fmt.Sprintf("rejected workspace %s inside gorness vault %s", wsRoot, m.paths.Root))
+		snap.UntrustedWarnings = warnings
+		return snap, warnings, nil
+	}
+
+	// 用户级技能目录排在前面，确保同名用户技能优先覆盖项目内技能；逃逸边界的技能目录软链不予挂载。
+	for _, candSkillDir := range []string{
 		filepath.Join(wsRoot, ".gorness", "skills"),
 		filepath.Join(wsRoot, ".agents", "skills"),
 		filepath.Join(wsRoot, ".claude", "skills"),
-	)
+	} {
+		_, exists, safe := isSafeWorkspacePath(candSkillDir, canonWs, canonVault)
+		if exists && !safe {
+			warnings = append(warnings, fmt.Sprintf("rejected unsafe symlinked workspace skill dir %s", candSkillDir))
+			continue
+		}
+		snap.SkillDirs = append(snap.SkillDirs, candSkillDir)
+	}
 
 	wsGorness := filepath.Join(wsRoot, ".gorness")
-	st, err := os.Stat(wsGorness)
+	canonGorness, exists, safe := isSafeWorkspacePath(wsGorness, canonWs, canonVault)
+	if !exists {
+		snap.UntrustedWarnings = warnings
+		return snap, warnings, nil
+	}
+	if !safe {
+		warnings = append(warnings, fmt.Sprintf("rejected unsafe workspace .gorness directory %s: symlink escapes workspace or enters vault", wsGorness))
+		snap.UntrustedWarnings = warnings
+		return snap, warnings, nil
+	}
+	st, err := os.Stat(canonGorness)
 	if err != nil || !st.IsDir() {
-		return snap, nil, nil
+		snap.UntrustedWarnings = warnings
+		return snap, warnings, nil
 	}
 
 	// 0. config.toml 安全偏好覆盖（仅允许覆盖模型/推理强度/界面偏好，不允许项目配置擅自放宽沙箱或权限级别）
 	wsConfigPath := filepath.Join(wsGorness, "config.toml")
-	if raw, err := os.ReadFile(wsConfigPath); err == nil {
+	if raw, ok, err := readSafeWorkspaceFile(wsConfigPath, canonWs, canonVault, &warnings); err != nil {
+		return nil, nil, err
+	} else if ok {
 		var wsCfg struct {
 			DefaultProvider string `toml:"default_provider"`
 			DefaultModel    string `toml:"default_model"`
@@ -176,58 +217,98 @@ func (m *Manager) ForWorkspace(wsRoot string, trustedHashes map[string]string) (
 		}
 	}
 
-	// 1. agents/*.md 角色覆盖（拦截 cmd: 凭据）
+	// 1. agents/*.md 角色覆盖（逐文件校验符号链接边界；cmd: 无条件拒绝；非空 api_key 需文件 SHA-256 授信）
 	wsAgentsDir := filepath.Join(wsGorness, "agents")
-	if info, err := os.Stat(wsAgentsDir); err == nil && info.IsDir() {
-		profiles, err := loadAgentsDir(wsAgentsDir)
-		if err != nil {
-			return nil, nil, err
-		}
-		for id, prof := range profiles {
-			if hasCmdSecret(prof.APIKeyRef) {
-				warnings = append(warnings, fmt.Sprintf("rejected cmd: credential in workspace agent %s: cmd: is forbidden in project overlays", prof.SourceFile))
-				prof.APIKeyRef = ""
+	if canonAgentsDir, dirExists, dirSafe := isSafeWorkspacePath(wsAgentsDir, canonWs, canonVault); dirExists {
+		if !dirSafe {
+			warnings = append(warnings, fmt.Sprintf("rejected unsafe symlinked workspace agents dir %s", wsAgentsDir))
+		} else if info, err := os.Stat(canonAgentsDir); err == nil && info.IsDir() {
+			entries, err := os.ReadDir(canonAgentsDir)
+			if err != nil {
+				return nil, nil, &fileLoadError{File: wsAgentsDir, Err: err}
 			}
-			snap.Agents[id] = prof
+			names := make([]string, 0, len(entries))
+			for _, ent := range entries {
+				if strings.HasSuffix(ent.Name(), ".md") {
+					names = append(names, ent.Name())
+				}
+			}
+			sort.Strings(names)
+			for _, name := range names {
+				agentPath := filepath.Join(wsAgentsDir, name)
+				raw, ok, err := readSafeWorkspaceFile(agentPath, canonWs, canonVault, &warnings)
+				if err != nil {
+					return nil, nil, err
+				}
+				if !ok {
+					continue
+				}
+				prof, err := parseAgentProfileBytes(agentPath, name, raw)
+				if err != nil {
+					return nil, nil, err
+				}
+				if hasCmdSecret(prof.APIKeyRef) {
+					warnings = append(warnings, fmt.Sprintf("rejected cmd: credential in workspace agent %s: cmd: is forbidden in project overlays", agentPath))
+					prof.APIKeyRef = ""
+				} else if strings.TrimSpace(prof.APIKeyRef) != "" {
+					if !isWorkspaceFileTrusted(wsRoot, canonWs, agentPath, raw, trustedHashes) {
+						warnings = append(warnings, fmt.Sprintf("stripped untrusted api_key in workspace agent %s (SHA-256 not in trustedHashes)", agentPath))
+						prof.APIKeyRef = ""
+					} else if !isDynamicSecretRef(prof.APIKeyRef) {
+						m.secrets.RegisterLiteralSource(strings.TrimSpace(prof.APIKeyRef), agentPath)
+						tightenFilePerm0600(agentPath)
+					}
+				}
+				snap.Agents[prof.ID] = prof
+			}
 		}
 	}
 
-	// 2. workflows/*.toml 拓扑覆盖（未授信工作流不放行自定义 verify_command）
+	// 2. workflows/*.toml 拓扑覆盖（逐文件校验符号链接边界；未授信工作流不放行自定义 verify_command）
 	wsWorkflowsDir := filepath.Join(wsGorness, "workflows")
-	if info, err := os.Stat(wsWorkflowsDir); err == nil && info.IsDir() {
-		entries, err := os.ReadDir(wsWorkflowsDir)
-		if err != nil {
-			return nil, nil, err
-		}
-		for _, ent := range entries {
-			if ent.IsDir() || !strings.HasSuffix(ent.Name(), ".toml") {
-				continue
-			}
-			wfPath := filepath.Join(wsWorkflowsDir, ent.Name())
-			raw, err := os.ReadFile(wfPath)
+	if canonWorkflowsDir, dirExists, dirSafe := isSafeWorkspacePath(wsWorkflowsDir, canonWs, canonVault); dirExists {
+		if !dirSafe {
+			warnings = append(warnings, fmt.Sprintf("rejected unsafe symlinked workspace workflows dir %s", wsWorkflowsDir))
+		} else if info, err := os.Stat(canonWorkflowsDir); err == nil && info.IsDir() {
+			entries, err := os.ReadDir(canonWorkflowsDir)
 			if err != nil {
-				return nil, nil, &fileLoadError{File: wfPath, Err: err}
+				return nil, nil, &fileLoadError{File: wsWorkflowsDir, Err: err}
 			}
-			wf, err := parseWorkflowFile(wfPath, raw)
-			if err != nil {
-				return nil, nil, err
+			for _, ent := range entries {
+				if !strings.HasSuffix(ent.Name(), ".toml") {
+					continue
+				}
+				wfPath := filepath.Join(wsWorkflowsDir, ent.Name())
+				raw, ok, err := readSafeWorkspaceFile(wfPath, canonWs, canonVault, &warnings)
+				if err != nil {
+					return nil, nil, err
+				}
+				if !ok {
+					continue
+				}
+				wf, err := parseWorkflowFile(wfPath, raw)
+				if err != nil {
+					return nil, nil, err
+				}
+				if wf.VerifyCommand != "" && !isWorkspaceFileTrusted(wsRoot, canonWs, wfPath, raw, trustedHashes) {
+					warnings = append(warnings, fmt.Sprintf("stripped untrusted verify_command in workspace workflow %s", wfPath))
+					wf.VerifyCommand = ""
+				}
+				snap.Workflows[wf.ID] = wf
 			}
-			if wf.VerifyCommand != "" && !isWorkspaceFileTrusted(wsRoot, wfPath, raw, trustedHashes) {
-				warnings = append(warnings, fmt.Sprintf("stripped untrusted verify_command in workspace workflow %s", wfPath))
-				wf.VerifyCommand = ""
-			}
-			snap.Workflows[wf.ID] = wf
 		}
 	}
 
-	// 3. providers.toml 覆盖（文件需哈希授信，且 cmd: 永远无条件拒绝）
+	// 3. providers.toml 覆盖（校验符号链接边界；文件需哈希授信，且 cmd: 永远无条件拒绝）
 	wsProvidersPath := filepath.Join(wsGorness, "providers.toml")
-	if raw, err := os.ReadFile(wsProvidersPath); err == nil {
+	if raw, ok, err := readSafeWorkspaceFile(wsProvidersPath, canonWs, canonVault, &warnings); err != nil {
+		return nil, nil, err
+	} else if ok {
 		provs, err := parseProvidersBytes(wsProvidersPath, raw)
 		if err != nil {
 			return nil, nil, err
 		}
-		trusted := isWorkspaceFileTrusted(wsRoot, wsProvidersPath, raw, trustedHashes)
+		trusted := isWorkspaceFileTrusted(wsRoot, canonWs, wsProvidersPath, raw, trustedHashes)
 		for id, p := range provs {
 			if providerHasCmdSecret(p) {
 				warnings = append(warnings, fmt.Sprintf("rejected cmd: credential for provider %q in workspace overlay %s: cmd: is always forbidden in project overlays", id, wsProvidersPath))
@@ -242,10 +323,12 @@ func (m *Manager) ForWorkspace(wsRoot string, trustedHashes map[string]string) (
 		}
 	}
 
-	// 4. mcp.toml 覆盖（必须通过 SHA-256 白名单核验，且拦截 cmd: 环境变量/头）
+	// 4. mcp.toml 覆盖（校验符号链接边界；必须通过 SHA-256 白名单核验，且拦截 cmd: 环境变量/头）
 	wsMCPPath := filepath.Join(wsGorness, "mcp.toml")
-	if raw, err := os.ReadFile(wsMCPPath); err == nil {
-		if !isWorkspaceFileTrusted(wsRoot, wsMCPPath, raw, trustedHashes) {
+	if raw, ok, err := readSafeWorkspaceFile(wsMCPPath, canonWs, canonVault, &warnings); err != nil {
+		return nil, nil, err
+	} else if ok {
+		if !isWorkspaceFileTrusted(wsRoot, canonWs, wsMCPPath, raw, trustedHashes) {
 			warnings = append(warnings, fmt.Sprintf("skipped untrusted workspace MCP config %s (SHA-256 not in trustedHashes)", wsMCPPath))
 		} else {
 			wsMCP, err := parseMCPBytes(wsMCPPath, raw)
@@ -262,9 +345,11 @@ func (m *Manager) ForWorkspace(wsRoot string, trustedHashes map[string]string) (
 		}
 	}
 
-	// 5. rules.toml 覆盖（始终允许收紧 deny/ask；放宽 allow 需哈希授信）
+	// 5. rules.toml 覆盖（校验符号链接边界；始终允许收紧 deny/ask；放宽 allow 需哈希授信）
 	wsRulesPath := filepath.Join(wsGorness, "rules.toml")
-	if raw, err := os.ReadFile(wsRulesPath); err == nil {
+	if raw, ok, err := readSafeWorkspaceFile(wsRulesPath, canonWs, canonVault, &warnings); err != nil {
+		return nil, nil, err
+	} else if ok {
 		var wsRules RuleSet
 		if err := toml.Unmarshal(raw, &wsRules); err != nil {
 			return nil, nil, &fileLoadError{File: wsRulesPath, Err: err}
@@ -272,7 +357,7 @@ func (m *Manager) ForWorkspace(wsRoot string, trustedHashes map[string]string) (
 		snap.Rules.DenyCommands = append(snap.Rules.DenyCommands, wsRules.DenyCommands...)
 		snap.Rules.DenyPaths = append(snap.Rules.DenyPaths, wsRules.DenyPaths...)
 		snap.Rules.AskCommands = append(snap.Rules.AskCommands, wsRules.AskCommands...)
-		if isWorkspaceFileTrusted(wsRoot, wsRulesPath, raw, trustedHashes) {
+		if isWorkspaceFileTrusted(wsRoot, canonWs, wsRulesPath, raw, trustedHashes) {
 			snap.Rules.AllowCommands = append(snap.Rules.AllowCommands, wsRules.AllowCommands...)
 			snap.Rules.AllowPaths = append(snap.Rules.AllowPaths, wsRules.AllowPaths...)
 			snap.Rules.AllowedDomains = append(snap.Rules.AllowedDomains, wsRules.AllowedDomains...)
@@ -286,7 +371,65 @@ func (m *Manager) ForWorkspace(wsRoot string, trustedHashes map[string]string) (
 	return snap, warnings, nil
 }
 
-func isWorkspaceFileTrusted(wsRoot, absFile string, raw []byte, trustedHashes map[string]string) bool {
+func isPathWithinOrEqual(path, root string) bool {
+	if path == root {
+		return true
+	}
+	if root == string(filepath.Separator) {
+		return strings.HasPrefix(path, root)
+	}
+	return strings.HasPrefix(path, root+string(filepath.Separator))
+}
+
+func isSafeWorkspacePath(targetPath, canonWs, canonVault string) (canonTarget string, exists bool, safe bool) {
+	if _, err := os.Lstat(targetPath); err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return "", false, false
+		}
+		return "", true, false
+	}
+	resolved, err := filepath.EvalSymlinks(targetPath)
+	if err != nil {
+		return "", true, false
+	}
+	resolved = filepath.Clean(resolved)
+	if isPathWithinOrEqual(resolved, canonVault) {
+		return resolved, true, false
+	}
+	if !isPathWithinOrEqual(resolved, canonWs) {
+		return resolved, true, false
+	}
+	return resolved, true, true
+}
+
+func readSafeWorkspaceFile(lexicalPath, canonWs, canonVault string, warnings *[]string) ([]byte, bool, error) {
+	canonFile, exists, safe := isSafeWorkspacePath(lexicalPath, canonWs, canonVault)
+	if !exists {
+		return nil, false, nil
+	}
+	if !safe {
+		*warnings = append(*warnings, fmt.Sprintf("rejected unsafe symlinked workspace file %s: target escapes workspace or enters vault", lexicalPath))
+		return nil, false, nil
+	}
+	st, err := os.Stat(canonFile)
+	if err != nil {
+		return nil, false, &fileLoadError{File: lexicalPath, Err: err}
+	}
+	if st.IsDir() {
+		return nil, false, nil
+	}
+	if !st.Mode().IsRegular() {
+		*warnings = append(*warnings, fmt.Sprintf("skipped non-regular workspace file %s", lexicalPath))
+		return nil, false, nil
+	}
+	raw, err := os.ReadFile(canonFile)
+	if err != nil {
+		return nil, false, &fileLoadError{File: lexicalPath, Err: err}
+	}
+	return raw, true, nil
+}
+
+func isWorkspaceFileTrusted(wsRoot, canonWs, absFile string, raw []byte, trustedHashes map[string]string) bool {
 	if len(trustedHashes) == 0 {
 		return false
 	}
@@ -294,14 +437,25 @@ func isWorkspaceFileTrusted(wsRoot, absFile string, raw []byte, trustedHashes ma
 	actualHex := hex.EncodeToString(sumBytes[:])
 
 	candidates := []string{absFile}
-	if canon, err := filepath.EvalSymlinks(absFile); err == nil && canon != absFile {
-		candidates = append(candidates, canon)
+	canonFile, canonErr := filepath.EvalSymlinks(absFile)
+	if canonErr == nil && canonFile != absFile {
+		candidates = append(candidates, canonFile)
 	}
-	if rel, err := filepath.Rel(wsRoot, absFile); err == nil {
-		relSlash := filepath.ToSlash(rel)
-		candidates = append(candidates, relSlash)
-		if trimmed, ok := strings.CutPrefix(relSlash, ".gorness/"); ok {
-			candidates = append(candidates, trimmed)
+	for _, base := range []string{wsRoot, canonWs} {
+		if base == "" {
+			continue
+		}
+		for _, target := range []string{absFile, canonFile} {
+			if target == "" {
+				continue
+			}
+			if rel, err := filepath.Rel(base, target); err == nil && !strings.HasPrefix(rel, "..") {
+				relSlash := filepath.ToSlash(rel)
+				candidates = append(candidates, relSlash)
+				if trimmed, ok := strings.CutPrefix(relSlash, ".gorness/"); ok {
+					candidates = append(candidates, trimmed)
+				}
+			}
 		}
 	}
 
@@ -494,32 +648,50 @@ func loadAgentsDir(dir string) (map[string]AgentProfile, error) {
 		if err != nil {
 			return nil, &fileLoadError{File: p, Err: err}
 		}
-		meta, body, err := ParseFrontmatterMD(raw)
+		prof, err := parseAgentProfileBytes(p, name, raw)
 		if err != nil {
-			return nil, &fileLoadError{File: p, Err: err}
+			return nil, err
 		}
-		var prof AgentProfile
-		if len(meta) > 0 {
-			encoded, err := toml.Marshal(meta)
-			if err != nil {
-				return nil, &fileLoadError{File: p, Err: err}
-			}
-			if err := toml.Unmarshal(encoded, &prof); err != nil {
-				return nil, &fileLoadError{File: p, Err: err}
-			}
-		}
-		stem := strings.TrimSuffix(name, ".md")
-		if prof.ID == "" {
-			prof.ID = stem
-		}
-		if prof.Name == "" {
-			prof.Name = prof.ID
-		}
-		prof.SystemPrompt = strings.TrimSpace(body)
-		prof.SourceFile = p
 		agents[prof.ID] = prof
 	}
 	return agents, nil
+}
+
+func parseAgentProfileBytes(filePath, fileName string, raw []byte) (AgentProfile, error) {
+	meta, body, err := ParseFrontmatterMD(raw)
+	if err != nil {
+		return AgentProfile{}, &fileLoadError{File: filePath, Err: err}
+	}
+	var prof AgentProfile
+	if len(meta) > 0 {
+		encoded, err := toml.Marshal(meta)
+		if err != nil {
+			return AgentProfile{}, &fileLoadError{File: filePath, Err: err}
+		}
+		if err := toml.Unmarshal(encoded, &prof); err != nil {
+			return AgentProfile{}, &fileLoadError{File: filePath, Err: err}
+		}
+		// 显式保留空切片 []string{} 与未设置 nil 的语义区别（如 utility 角色 allowed_tools = [] 表示零工具权限）。
+		if v, exists := meta["allowed_tools"]; exists && v != nil && prof.AllowedTools == nil {
+			prof.AllowedTools = []string{}
+		}
+		if v, exists := meta["disallowed_tools"]; exists && v != nil && prof.DisallowedTools == nil {
+			prof.DisallowedTools = []string{}
+		}
+		if v, exists := meta["fallbacks"]; exists && v != nil && prof.Fallbacks == nil {
+			prof.Fallbacks = []string{}
+		}
+	}
+	stem := strings.TrimSuffix(fileName, ".md")
+	if prof.ID == "" {
+		prof.ID = stem
+	}
+	if prof.Name == "" {
+		prof.Name = prof.ID
+	}
+	prof.SystemPrompt = strings.TrimSpace(body)
+	prof.SourceFile = filePath
+	return prof, nil
 }
 
 func loadWorkflowsDir(dir string) (map[string]WorkflowTemplate, error) {

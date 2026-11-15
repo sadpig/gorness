@@ -164,12 +164,21 @@ type Snapshot struct {
 	LoadedAt          time.Time                   `json:"loaded_at"`
 }
 
+func cloneSlice[T any](in []T) []T {
+	if in == nil {
+		return nil
+	}
+	out := make([]T, len(in))
+	copy(out, in)
+	return out
+}
+
 func (s *Snapshot) Clone() *Snapshot {
 	if s == nil {
 		return nil
 	}
 	cp := *s
-	cp.Global.ExtraSkillDirs = append([]string(nil), s.Global.ExtraSkillDirs...)
+	cp.Global.ExtraSkillDirs = cloneSlice(s.Global.ExtraSkillDirs)
 
 	cp.Providers = make(map[string]ProviderConfig, len(s.Providers))
 	for k, p := range s.Providers {
@@ -192,18 +201,18 @@ func (s *Snapshot) Clone() *Snapshot {
 	cp.Agents = make(map[string]AgentProfile, len(s.Agents))
 	for k, a := range s.Agents {
 		aCopy := a
-		aCopy.Fallbacks = append([]string(nil), a.Fallbacks...)
-		aCopy.AllowedTools = append([]string(nil), a.AllowedTools...)
-		aCopy.DisallowedTools = append([]string(nil), a.DisallowedTools...)
+		aCopy.Fallbacks = cloneSlice(a.Fallbacks)
+		aCopy.AllowedTools = cloneSlice(a.AllowedTools)
+		aCopy.DisallowedTools = cloneSlice(a.DisallowedTools)
 		cp.Agents[k] = aCopy
 	}
 
 	cp.Workflows = make(map[string]WorkflowTemplate, len(s.Workflows))
 	for k, w := range s.Workflows {
 		wCopy := w
-		wCopy.Roles = append([]string(nil), w.Roles...)
-		wCopy.Nodes = append([]WorkflowNodeSpec(nil), w.Nodes...)
-		wCopy.Edges = append([]WorkflowEdgeSpec(nil), w.Edges...)
+		wCopy.Roles = cloneSlice(w.Roles)
+		wCopy.Nodes = cloneSlice(w.Nodes)
+		wCopy.Edges = cloneSlice(w.Edges)
 		if w.RoleModels != nil {
 			wCopy.RoleModels = make(map[string]string, len(w.RoleModels))
 			for rk, rv := range w.RoleModels {
@@ -214,13 +223,13 @@ func (s *Snapshot) Clone() *Snapshot {
 	}
 
 	cp.Rules = RuleSet{
-		AllowCommands:  append([]string(nil), s.Rules.AllowCommands...),
-		AskCommands:    append([]string(nil), s.Rules.AskCommands...),
-		DenyCommands:   append([]string(nil), s.Rules.DenyCommands...),
-		AllowPaths:     append([]string(nil), s.Rules.AllowPaths...),
-		DenyPaths:      append([]string(nil), s.Rules.DenyPaths...),
-		AllowedDomains: append([]string(nil), s.Rules.AllowedDomains...),
-		Rules:          append([]PermissionRule(nil), s.Rules.Rules...),
+		AllowCommands:  cloneSlice(s.Rules.AllowCommands),
+		AskCommands:    cloneSlice(s.Rules.AskCommands),
+		DenyCommands:   cloneSlice(s.Rules.DenyCommands),
+		AllowPaths:     cloneSlice(s.Rules.AllowPaths),
+		DenyPaths:      cloneSlice(s.Rules.DenyPaths),
+		AllowedDomains: cloneSlice(s.Rules.AllowedDomains),
+		Rules:          cloneSlice(s.Rules.Rules),
 	}
 
 	cp.MCP = MCPConfig{
@@ -228,7 +237,7 @@ func (s *Snapshot) Clone() *Snapshot {
 	}
 	for k, srv := range s.MCP.Servers {
 		srvCopy := srv
-		srvCopy.Args = append([]string(nil), srv.Args...)
+		srvCopy.Args = cloneSlice(srv.Args)
 		if srv.Env != nil {
 			srvCopy.Env = make(map[string]string, len(srv.Env))
 			for ek, ev := range srv.Env {
@@ -248,8 +257,8 @@ func (s *Snapshot) Clone() *Snapshot {
 		cp.MCP.Servers[k] = srvCopy
 	}
 
-	cp.SkillDirs = append([]string(nil), s.SkillDirs...)
-	cp.UntrustedWarnings = append([]string(nil), s.UntrustedWarnings...)
+	cp.SkillDirs = cloneSlice(s.SkillDirs)
+	cp.UntrustedWarnings = cloneSlice(s.UntrustedWarnings)
 	return &cp
 }
 
