@@ -788,6 +788,71 @@ details.thinking-box pre {
   word-break: break-word;
 }
 
+details.subagent-card {
+  margin-top: 9px;
+  border: 1px solid var(--hairline-strong);
+  border-left: 3px solid var(--accent);
+  border-radius: 10px;
+  background: var(--bg-elevated);
+  padding: 8px 12px;
+}
+details.subagent-card.is-error {
+  border-left-color: var(--red);
+}
+details.subagent-card > summary {
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  font-size: 12px;
+  font-weight: 600;
+  list-style: none;
+}
+details.subagent-card > summary::-webkit-details-marker {
+  display: none;
+}
+.subagent-summary-left {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  min-width: 0;
+}
+.subagent-role-pill {
+  padding: 1px 7px;
+  border-radius: 999px;
+  background: var(--bg-selected);
+  color: var(--accent);
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  font-weight: 600;
+}
+.subagent-body {
+  margin-top: 8px;
+  padding-top: 8px;
+  border-top: 1px solid var(--hairline);
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  font-size: 12px;
+}
+.subagent-worker-row {
+  padding: 5px 8px;
+  border-radius: 7px;
+  background: var(--bg-canvas);
+  border: 1px solid var(--hairline);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+.msg-card.chat-error-card {
+  border-color: var(--red);
+  border-left: 3px solid var(--red);
+  background: var(--red-bg);
+  color: var(--red);
+}
+
 /* Composer */
 .composer-shell {
   margin: 0 16px 14px;

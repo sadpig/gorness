@@ -23,6 +23,7 @@ import (
 	"gorness.dev/gorness/internal/fleet"
 	"gorness.dev/gorness/internal/llm"
 	"gorness.dev/gorness/internal/server"
+	"gorness.dev/gorness/internal/store"
 	"gorness.dev/gorness/internal/tools"
 )
 
@@ -963,5 +964,238 @@ func TestEndToEndMultiProjectSessionFleetAndAlwaysOnAPI(t *testing.T) {
 		return nil
 	}); err != nil {
 		t.Fatalf("walk vaultDir: %v", err)
+	}
+}
+
+func TestWorkbenchDraftRestoreNestedSubagentsAndRunErrors(t *testing.T) {
+	nodeBin, err := exec.LookPath("node")
+	if err != nil {
+		t.Skip("node binary not available")
+	}
+
+	wsDir := filepath.Join(t.TempDir(), "studio-ui-proj")
+	initTempGitRepo(t, wsDir)
+
+	baseDir := t.TempDir()
+	fakeHome := filepath.Join(baseDir, "home")
+	vaultDir := filepath.Join(fakeHome, ".gorness")
+	if err := os.MkdirAll(fakeHome, 0o700); err != nil {
+		t.Fatalf("mkdir fakeHome: %v", err)
+	}
+
+	cfgMgr, err := config.NewManager(config.Options{
+		VaultRoot:   vaultDir,
+		UserHomeDir: fakeHome,
+		EnvLookup:   func(k string) (string, bool) { return "secret-" + k, true },
+	})
+	if err != nil {
+		t.Fatalf("config.NewManager: %v", err)
+	}
+
+	uiStreamer := llm.StreamerFunc(func(_ context.Context, req llm.Request) (<-chan llm.StreamEvent, error) {
+		ch := make(chan llm.StreamEvent, 4)
+		var lastText string
+		if len(req.History) > 0 {
+			for _, b := range req.History[len(req.History)-1].Blocks {
+				if b.Text != "" {
+					lastText = b.Text
+				}
+			}
+		}
+		if strings.Contains(lastText, "TRIGGER_STREAM_FAIL") {
+			ch <- llm.StreamEvent{Type: llm.StreamError, Err: fmt.Errorf("upstream gateway 502 authentication failure")}
+			close(ch)
+			return ch, nil
+		}
+		ch <- llm.StreamEvent{Type: llm.StreamTextDelta, Text: "ok"}
+		ch <- llm.StreamEvent{Type: llm.StreamDone, StopReason: "end_turn"}
+		close(ch)
+		return ch, nil
+	})
+
+	router := llm.NewRouter(cfgMgr, cfgMgr.Secrets(), uiStreamer)
+	eng, err := core.NewEngine(core.EngineOptions{
+		Config:   cfgMgr,
+		Router:   router,
+		UserHome: fakeHome,
+	})
+	if err != nil {
+		t.Fatalf("core.NewEngine: %v", err)
+	}
+	defer func() { _ = eng.Close() }()
+
+	srv := server.NewServer(server.Deps{
+		Config: cfgMgr,
+		Engine: eng,
+		Opener: func(_ context.Context, _ []string) error { return nil },
+	})
+	defer func() { _ = srv.Close() }()
+
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+
+	ws, err := eng.Workspaces().Register(wsDir, "StudioUIProj")
+	if err != nil {
+		t.Fatalf("register ws: %v", err)
+	}
+	sess, err := eng.Sessions().Create(ws.ID, "Parent Architecture Session", "lead")
+	if err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+
+	// Seed a user turn + subagent delegation tool_use & tool_result + forked child session + persisted draft!
+	_, _ = eng.Sessions().Append(sess.ID, store.SessionEntry{
+		Role:      "user",
+		AgentRole: "lead",
+		Blocks:    []store.ContentBlock{{Type: "text", Text: "Delegate audit to explorer"}},
+	})
+	subEntry, err := eng.Sessions().Append(sess.ID, store.SessionEntry{
+		Role:      "assistant",
+		AgentRole: "lead",
+		ModelID:   "claude-opus-5-5",
+		Blocks: []store.ContentBlock{
+			{
+				Type:       "tool_use",
+				ToolCallID: "call_sub_1",
+				ToolName:   "spawn_subagent",
+				ToolInput:  json.RawMessage(`{"agent_role":"explorer","prompt":"Scan app.go symbols"}`),
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("append subagent tool_use: %v", err)
+	}
+	_, _ = eng.Sessions().Append(sess.ID, store.SessionEntry{
+		Role:      "tool",
+		AgentRole: "lead",
+		Blocks: []store.ContentBlock{
+			{
+				Type:       "tool_result",
+				ToolCallID: "call_sub_1",
+				ToolName:   "spawn_subagent",
+				Text:       "Found Value() in app.go:3",
+			},
+		},
+	})
+	if _, err := eng.Sessions().Fork(sess.ID, subEntry.Seq, "Explorer Branch Investigation"); err != nil {
+		t.Fatalf("fork child session: %v", err)
+	}
+	const wantDraft = "Persisted unsent multi-line refactor draft"
+	if _, err := eng.Sessions().UpdateMeta(sess.ID, func(m *store.SessionMeta) {
+		m.Draft = wantDraft
+	}); err != nil {
+		t.Fatalf("persist draft: %v", err)
+	}
+
+	appJSPath, err := filepath.Abs(filepath.Join("..", "..", "web", "app.js"))
+	if err != nil {
+		t.Fatalf("resolve web/app.js path: %v", err)
+	}
+
+	nodeScript := fmt.Sprintf(`
+import assert from "node:assert/strict";
+import { pathToFileURL } from "node:url";
+
+const baseURL = %q;
+const elements = new Map();
+function makeEl(id) {
+  return {
+    id,
+    value: "",
+    textContent: "",
+    innerHTML: "",
+    checked: true,
+    disabled: false,
+    href: "",
+    src: "",
+    style: { setProperty() {}, width: "" },
+    dataset: {},
+    scrollHeight: 200,
+    scrollTop: 200,
+    clientHeight: 200,
+    classList: {
+      _set: new Set(["hidden"]),
+      add(...c) { c.forEach((x) => this._set.add(x)); },
+      remove(...c) { c.forEach((x) => this._set.delete(x)); },
+      toggle(c, force) {
+        if (force === undefined) {
+          if (this._set.has(c)) { this._set.delete(c); return false; }
+          this._set.add(c); return true;
+        }
+        if (force) this._set.add(c); else this._set.delete(c);
+        return force;
+      },
+      contains(c) { return this._set.has(c); }
+    },
+    setAttribute(k, v) { this[k] = v; },
+    getAttribute(k) { return this[k] || ""; },
+    addEventListener() {}
+  };
+}
+function getEl(id) {
+  if (!elements.has(id)) elements.set(id, makeEl(id));
+  return elements.get(id);
+}
+
+const storage = new Map();
+globalThis.__GORNESS_TEST_NO_AUTOBOOT__ = true;
+globalThis.localStorage = {
+  getItem: (k) => storage.get(k) ?? null,
+  setItem: (k, v) => storage.set(k, String(v))
+};
+globalThis.CSS = { escape: (s) => String(s) };
+globalThis.document = {
+  activeElement: null,
+  documentElement: { lang: "zh-CN", style: { setProperty() {} }, setAttribute() {} },
+  getElementById: (id) => getEl(id),
+  querySelectorAll: () => [],
+  querySelector: () => null,
+  addEventListener() {}
+};
+globalThis.window = { innerWidth: 1280, addEventListener() {} };
+
+const origFetch = globalThis.fetch;
+globalThis.fetch = (input, init = {}) => {
+  const url = typeof input === "string" && input.startsWith("/") ? baseURL + input : input;
+  const headers = Object.assign({ Origin: baseURL }, init.headers || {});
+  return origFetch(url, Object.assign({}, init, { headers }));
+};
+
+const mod = await import(pathToFileURL(%q).href);
+
+// 1. Verify initial Studio loadBootstrap() restores persisted session draft and does NOT wipe it after 450ms timer!
+await mod.loadBootstrap();
+assert.equal(getEl("composer-input").value, %q, "composer must restore persisted draft on Studio load");
+await new Promise((r) => setTimeout(r, 550));
+const checkAfterBoot = await (await globalThis.fetch("/api/sessions/" + encodeURIComponent(%q))).json();
+assert.equal(checkAfterBoot.meta.draft, %q, "server-side persisted draft must NOT be overwritten with empty string after 450ms debounce");
+
+// 2. Verify Mode A renderChatHistory() renders collapsible nested .subagent-card blocks for both subagent tool delegation and forked child session!
+const historyHTML = getEl("chat-history-entries").innerHTML;
+assert.match(historyHTML, /class="subagent-card/, "expected nested .subagent-card in Mode A conversation");
+assert.match(historyHTML, /Explorer Branch Investigation/, "expected forked child session card in Mode A");
+assert.match(historyHTML, /Scan app\.go symbols/, "expected subagent delegation task summary in Mode A");
+assert.match(historyHTML, /Found Value\(\) in app\.go:3/, "expected paired subagent result inside nested card");
+
+// 3. Verify failed /api/runs/stream (HTTP 400 invalid provider/model) preserves composer prompt and surfaces error banner/card!
+getEl("composer-input").value = "Unsent prompt preserved on HTTP 400";
+getEl("model-override-input").value = "unknown_provider/nonexistent_model";
+await mod.sendPromptOrSteer();
+assert.equal(getEl("composer-input").value, "Unsent prompt preserved on HTTP 400", "prompt must not be lost when /api/runs/stream fails");
+assert.equal(getEl("reload-diag-banner").classList.contains("hidden"), false, "diag banner should be visible on HTTP failure");
+assert.match(getEl("chat-history-entries").innerHTML, /chat-error-card/, "timeline should render inline chat-error-card");
+
+// 4. Verify mid-stream run_failed SSE event surfaces error persistently after stream closes!
+getEl("model-override-input").value = "";
+getEl("composer-input").value = "TRIGGER_STREAM_FAIL";
+await mod.sendPromptOrSteer();
+assert.match(mod.state.lastRunError, /502 authentication failure/, "state.lastRunError must capture run_failed message");
+assert.match(getEl("reload-diag-banner").textContent, /502 authentication failure/, "diag banner must retain run_failed message");
+assert.match(getEl("chat-history-entries").innerHTML, /502 authentication failure/, "timeline error card must retain run_failed message");
+`, ts.URL, appJSPath, wantDraft, sess.ID, wantDraft)
+
+	cmd := exec.Command(nodeBin, "--input-type=module", "-e", nodeScript)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("node workbench UI verification failed: %v\n%s", err, string(out))
 	}
 }

@@ -186,6 +186,7 @@ func cmdRun(
 		ModelOverride: modelOver,
 		PermMode:      permMode,
 		SandboxMode:   sandboxMode,
+		Unattended:    true,
 	})
 	if err != nil {
 		fmt.Fprintf(stderr, "start run failed: %v\n", err)
@@ -216,6 +217,10 @@ func cmdRun(
 			case core.EventToolCall:
 				if tc, ok := ev.Payload.(core.ToolCallPayload); ok {
 					fmt.Fprintf(stderr, "[tool] %s\n", tc.ToolName)
+				}
+			case core.EventToolDeferred:
+				if td, ok := ev.Payload.(core.DeferredToolPayload); ok {
+					fmt.Fprintf(stderr, "[deferred] %s (%s): %s\n", td.ToolName, td.ReasonCode, td.Reason)
 				}
 			case core.EventRunFailed:
 				if pe, ok := ev.Payload.(core.RunErrorPayload); ok {
@@ -830,8 +835,11 @@ func cmdACP(
 		})
 	}
 
-	var activeRunMu sync.Mutex
-	activeRunBySession := make(map[string]string)
+	var (
+		activeRunMu        sync.Mutex
+		activeRunBySession = make(map[string]string)
+		promptWG           sync.WaitGroup
+	)
 
 	scanner := bufio.NewScanner(stdin)
 	scanner.Buffer(make([]byte, 0, 64*1024), 8*1024*1024)
@@ -972,102 +980,129 @@ func cmdACP(
 				Prompt:        promptText,
 				AgentRole:     params.AgentRole,
 				ModelOverride: params.Model,
+				Unattended:    true,
 			})
 			if rErr != nil {
 				sendError(msg.ID, -32603, rErr.Error())
 				continue
 			}
 
+			sessID := meta.ID
+			reqID := append(json.RawMessage(nil), msg.ID...)
+
 			activeRunMu.Lock()
-			activeRunBySession[meta.ID] = runID
+			activeRunBySession[sessID] = runID
 			activeRunMu.Unlock()
 
-			var (
-				finalText  string
-				stopReason = "end_turn"
-				failedErr  string
-			)
-			for ev := range evCh {
-				switch ev.Type {
-				case core.EventThinkingDelta:
-					if mp, ok := ev.Payload.(map[string]any); ok {
-						if th, _ := mp["thinking"].(string); th != "" {
+			// 异步消费单轮 evCh，使主协程继续读取 stdin 并即时响应 session/cancel 中途取消请求。
+			promptWG.Add(1)
+			go func() {
+				defer promptWG.Done()
+				var (
+					finalText  string
+					stopReason = "end_turn"
+					failedErr  string
+				)
+				for ev := range evCh {
+					switch ev.Type {
+					case core.EventThinkingDelta:
+						if mp, ok := ev.Payload.(map[string]any); ok {
+							if th, _ := mp["thinking"].(string); th != "" {
+								sendNotification("session/update", map[string]any{
+									"sessionId": sessID,
+									"update": map[string]any{
+										"sessionUpdate": "agent_thought_chunk",
+										"content":       map[string]any{"type": "text", "text": th},
+									},
+								})
+							}
+						}
+					case core.EventTextDelta:
+						if mp, ok := ev.Payload.(map[string]any); ok {
+							if txt, _ := mp["text"].(string); txt != "" {
+								sendNotification("session/update", map[string]any{
+									"sessionId": sessID,
+									"update": map[string]any{
+										"sessionUpdate": "agent_message_chunk",
+										"content":       map[string]any{"type": "text", "text": txt},
+									},
+								})
+							}
+						}
+					case core.EventToolCall:
+						if tc, ok := ev.Payload.(core.ToolCallPayload); ok {
 							sendNotification("session/update", map[string]any{
-								"sessionId": meta.ID,
+								"sessionId": sessID,
 								"update": map[string]any{
-									"sessionUpdate": "agent_thought_chunk",
-									"content":       map[string]any{"type": "text", "text": th},
+									"sessionUpdate": "tool_call",
+									"toolCallId":    tc.ToolCallID,
+									"title":         tc.ToolName,
+									"rawInput":      tc.Args,
 								},
 							})
 						}
-					}
-				case core.EventTextDelta:
-					if mp, ok := ev.Payload.(map[string]any); ok {
-						if txt, _ := mp["text"].(string); txt != "" {
+					case core.EventToolResult:
+						if tr, ok := ev.Payload.(core.ToolResultPayload); ok {
 							sendNotification("session/update", map[string]any{
-								"sessionId": meta.ID,
+								"sessionId": sessID,
 								"update": map[string]any{
-									"sessionUpdate": "agent_message_chunk",
-									"content":       map[string]any{"type": "text", "text": txt},
+									"sessionUpdate": "tool_call_update",
+									"toolCallId":    tr.ToolCallID,
+									"isError":       tr.IsError,
+									"output":        tr.Output,
 								},
 							})
 						}
-					}
-				case core.EventToolCall:
-					if tc, ok := ev.Payload.(core.ToolCallPayload); ok {
-						sendNotification("session/update", map[string]any{
-							"sessionId": meta.ID,
-							"update": map[string]any{
-								"sessionUpdate": "tool_call",
-								"toolCallId":    tc.ToolCallID,
-								"title":         tc.ToolName,
-								"rawInput":      tc.Args,
-							},
-						})
-					}
-				case core.EventToolResult:
-					if tr, ok := ev.Payload.(core.ToolResultPayload); ok {
-						sendNotification("session/update", map[string]any{
-							"sessionId": meta.ID,
-							"update": map[string]any{
-								"sessionUpdate": "tool_call_update",
-								"toolCallId":    tr.ToolCallID,
-								"isError":       tr.IsError,
-								"output":        tr.Output,
-							},
-						})
-					}
-				case core.EventRunCompleted:
-					if out, ok := ev.Payload.(core.RunOutcome); ok {
-						finalText = out.FinalText
-						if out.StopReason != "" {
-							stopReason = out.StopReason
+					case core.EventToolDeferred:
+						stopReason = "deferred"
+						if td, ok := ev.Payload.(core.DeferredToolPayload); ok {
+							sendNotification("session/update", map[string]any{
+								"sessionId": sessID,
+								"update": map[string]any{
+									"sessionUpdate": "tool_deferred",
+									"toolCallId":    td.ToolCallID,
+									"title":         td.ToolName,
+									"reasonCode":    td.ReasonCode,
+									"reason":        td.Reason,
+								},
+							})
 						}
-					}
-				case core.EventRunCancelled:
-					stopReason = "cancelled"
-				case core.EventRunFailed:
-					if pe, ok := ev.Payload.(core.RunErrorPayload); ok {
-						failedErr = pe.Message
-					} else {
-						failedErr = "engine run failed"
+					case core.EventRunCompleted:
+						if out, ok := ev.Payload.(core.RunOutcome); ok {
+							finalText = out.FinalText
+							if out.Status == "deferred" {
+								stopReason = "deferred"
+							} else if out.StopReason != "" {
+								stopReason = out.StopReason
+							}
+						}
+					case core.EventRunCancelled:
+						stopReason = "cancelled"
+					case core.EventRunFailed:
+						if pe, ok := ev.Payload.(core.RunErrorPayload); ok {
+							failedErr = pe.Message
+						} else {
+							failedErr = "engine run failed"
+						}
 					}
 				}
-			}
 
-			activeRunMu.Lock()
-			delete(activeRunBySession, meta.ID)
-			activeRunMu.Unlock()
+				activeRunMu.Lock()
+				if activeRunBySession[sessID] == runID {
+					delete(activeRunBySession, sessID)
+				}
+				activeRunMu.Unlock()
 
-			if failedErr != "" {
-				sendError(msg.ID, -32603, failedErr)
-			} else {
-				sendResult(msg.ID, map[string]any{
-					"sessionId":  meta.ID,
-					"stopReason": stopReason,
-					"finalText":  finalText,
-				})
-			}
+				if failedErr != "" {
+					sendError(reqID, -32603, failedErr)
+				} else {
+					sendResult(reqID, map[string]any{
+						"sessionId":  sessID,
+						"stopReason": stopReason,
+						"finalText":  finalText,
+					})
+				}
+			}()
 
 		case "session/cancel":
 			var params struct {
@@ -1096,6 +1131,7 @@ func cmdACP(
 		}
 	}
 
+	promptWG.Wait()
 	eng.WaitBackground()
 	return 0
 }

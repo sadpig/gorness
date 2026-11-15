@@ -12,11 +12,13 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"gorness.dev/gorness/internal/config"
 	"gorness.dev/gorness/internal/core"
+	"gorness.dev/gorness/internal/llm"
 	"gorness.dev/gorness/internal/tui"
 )
 
@@ -359,6 +361,239 @@ func TestCLIHeadlessJSONAndACPRoundTrip(t *testing.T) {
 			return nil
 		}); err != nil {
 			t.Fatalf("walk vaultDir: %v", err)
+		}
+	})
+}
+
+func TestHeadlessGateAskDeferAndACPMidRunCancel(t *testing.T) {
+	mockLLM := startMockAnthropicSSEServer(t)
+	defer mockLLM.Close()
+
+	vaultDir, homeDir, wsDir := prepareTempVaultWithMockProvider(t, mockLLM.URL)
+
+	t.Run("headless_run_gate_ask_defers_instead_of_hanging", func(t *testing.T) {
+		askToolStreamer := llm.StreamerFunc(func(_ context.Context, _ llm.Request) (<-chan llm.StreamEvent, error) {
+			ch := make(chan llm.StreamEvent, 4)
+			args, _ := json.Marshal(map[string]any{"command": "git push origin main"})
+			ch <- llm.StreamEvent{
+				Type:       llm.StreamToolCall,
+				ToolCallID: "call_push_1",
+				ToolName:   "run_command",
+				ToolInput:  args,
+			}
+			ch <- llm.StreamEvent{Type: llm.StreamDone, StopReason: "tool_use", InputTokens: 15, OutputTokens: 10}
+			close(ch)
+			return ch, nil
+		})
+
+		ctx, cancel := context.WithTimeout(context.Background(), 4*time.Second)
+		defer cancel()
+
+		var stdout, stderr bytes.Buffer
+		code := runCLI(ctx, []string{
+			"run",
+			"--vault", vaultDir,
+			"--workspace", wsDir,
+			"--perm", "ask",
+			"--json",
+			"Push branch",
+		}, strings.NewReader(""), &stdout, &stderr, cliOptions{
+			userHomeDir: homeDir,
+			streamer:    askToolStreamer,
+		})
+		if code != 0 {
+			t.Fatalf("expected exit code 0 on unattended GateDefer, got %d (stderr=%s)", code, stderr.String())
+		}
+
+		var sawDeferred, sawCompletedDeferred bool
+		for _, line := range strings.Split(strings.TrimSpace(stdout.String()), "\n") {
+			if strings.TrimSpace(line) == "" {
+				continue
+			}
+			var ev struct {
+				Type    string `json:"type"`
+				Payload struct {
+					Status string `json:"status"`
+				} `json:"payload"`
+			}
+			if err := json.Unmarshal([]byte(line), &ev); err != nil {
+				t.Fatalf("invalid NDJSON line %q: %v", line, err)
+			}
+			if ev.Type == core.EventToolDeferred {
+				sawDeferred = true
+			}
+			if ev.Type == core.EventRunCompleted && ev.Payload.Status == "deferred" {
+				sawCompletedDeferred = true
+			}
+		}
+		if !sawDeferred || !sawCompletedDeferred {
+			t.Fatalf("expected tool_deferred and run_completed(status=deferred), got:\n%s", stdout.String())
+		}
+	})
+
+	t.Run("acp_gate_ask_defers_and_session_cancel_interrupts_mid_run", func(t *testing.T) {
+		startedSlowCh := make(chan struct{}, 1)
+		acpStreamer := llm.StreamerFunc(func(sCtx context.Context, req llm.Request) (<-chan llm.StreamEvent, error) {
+			var lastPrompt string
+			if len(req.History) > 0 {
+				for _, b := range req.History[len(req.History)-1].Blocks {
+					if b.Text != "" {
+						lastPrompt = b.Text
+					}
+				}
+			}
+			ch := make(chan llm.StreamEvent, 4)
+			if strings.Contains(lastPrompt, "SLOW_BLOCKING_RUN") {
+				select {
+				case startedSlowCh <- struct{}{}:
+				default:
+				}
+				go func() {
+					defer close(ch)
+					ch <- llm.StreamEvent{Type: llm.StreamTextDelta, Text: "starting slow work..."}
+					<-sCtx.Done()
+					ch <- llm.StreamEvent{Type: llm.StreamError, Err: sCtx.Err()}
+				}()
+				return ch, nil
+			}
+			args, _ := json.Marshal(map[string]any{"command": "git push origin main"})
+			ch <- llm.StreamEvent{
+				Type:       llm.StreamToolCall,
+				ToolCallID: "call_acp_push_1",
+				ToolName:   "run_command",
+				ToolInput:  args,
+			}
+			ch <- llm.StreamEvent{Type: llm.StreamDone, StopReason: "tool_use"}
+			close(ch)
+			return ch, nil
+		})
+
+		inR, inW := io.Pipe()
+		outR, outW := io.Pipe()
+		var stderr bytes.Buffer
+
+		ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+		defer cancel()
+
+		doneCh := make(chan int, 1)
+		go func() {
+			code := runCLI(ctx, []string{"acp", "--vault", vaultDir}, inR, outW, &stderr, cliOptions{
+				userHomeDir: homeDir,
+				streamer:    acpStreamer,
+			})
+			_ = outW.Close()
+			doneCh <- code
+		}()
+
+		responsesByID := make(map[int]map[string]any)
+		var respMu sync.Mutex
+		respSignal := make(chan struct{}, 32)
+		go func() {
+			r := bufio.NewReader(outR)
+			for {
+				line, err := r.ReadBytes('\n')
+				if err != nil {
+					return
+				}
+				var obj map[string]any
+				if json.Unmarshal(bytes.TrimSpace(line), &obj) == nil {
+					if idRaw, ok := obj["id"].(float64); ok {
+						respMu.Lock()
+						responsesByID[int(idRaw)] = obj
+						respMu.Unlock()
+						select {
+						case respSignal <- struct{}{}:
+						default:
+						}
+					}
+				}
+			}
+		}()
+
+		sendRPC := func(msg map[string]any) {
+			t.Helper()
+			b, _ := json.Marshal(msg)
+			if _, err := inW.Write(append(b, '\n')); err != nil {
+				t.Fatalf("write rpc: %v", err)
+			}
+		}
+		waitRPC := func(wantID int) map[string]any {
+			t.Helper()
+			deadline := time.After(4 * time.Second)
+			for {
+				respMu.Lock()
+				got, ok := responsesByID[wantID]
+				respMu.Unlock()
+				if ok {
+					return got
+				}
+				select {
+				case <-respSignal:
+				case <-deadline:
+					t.Fatalf("timed out waiting for JSON-RPC response id=%d (stderr=%s)", wantID, stderr.String())
+				}
+			}
+		}
+
+		sendRPC(map[string]any{"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": map[string]any{"protocolVersion": 1}})
+		_ = waitRPC(1)
+
+		sendRPC(map[string]any{"jsonrpc": "2.0", "id": 2, "method": "session/new", "params": map[string]any{"cwd": wsDir}})
+		sessResp := waitRPC(2)
+		sessID := sessResp["result"].(map[string]any)["sessionId"].(string)
+
+		// Start slow blocking prompt (id=10), wait until streamer begins, then send session/cancel (id=11) mid-run!
+		sendRPC(map[string]any{
+			"jsonrpc": "2.0",
+			"id":      10,
+			"method":  "session/prompt",
+			"params": map[string]any{
+				"sessionId": sessID,
+				"prompt":    "SLOW_BLOCKING_RUN",
+			},
+		})
+		select {
+		case <-startedSlowCh:
+		case <-time.After(3 * time.Second):
+			t.Fatalf("slow ACP run never started")
+		}
+
+		sendRPC(map[string]any{
+			"jsonrpc": "2.0",
+			"id":      11,
+			"method":  "session/cancel",
+			"params": map[string]any{
+				"sessionId": sessID,
+			},
+		})
+		cancelResp := waitRPC(11)
+		if cancelled, _ := cancelResp["result"].(map[string]any)["cancelled"].(bool); !cancelled {
+			t.Fatalf("expected session/cancel cancelled=true while prompt active, got: %+v", cancelResp)
+		}
+
+		prompt10Resp := waitRPC(10)
+		if sr, _ := prompt10Resp["result"].(map[string]any)["stopReason"].(string); sr != "cancelled" {
+			t.Fatalf("expected cancelled stopReason for interrupted prompt, got: %+v", prompt10Resp)
+		}
+
+		// Now trigger a GateAsk command over ACP and verify it defers immediately without hanging.
+		sendRPC(map[string]any{
+			"jsonrpc": "2.0",
+			"id":      12,
+			"method":  "session/prompt",
+			"params": map[string]any{
+				"sessionId": sessID,
+				"prompt":    "Run git push",
+			},
+		})
+		prompt12Resp := waitRPC(12)
+		if sr, _ := prompt12Resp["result"].(map[string]any)["stopReason"].(string); sr != "deferred" {
+			t.Fatalf("expected stopReason=deferred for unattended GateAsk in ACP, got: %+v", prompt12Resp)
+		}
+
+		_ = inW.Close()
+		if code := <-doneCh; code != 0 {
+			t.Fatalf("expected gorness acp exit code 0, got %d", code)
 		}
 	})
 }

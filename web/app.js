@@ -79,7 +79,13 @@ const I18N = {
     rewindHereBtn: "回退至此",
     forkHereBtn: "由此分叉",
     emptyChatHint: "选择一个工作区并输入指令，或切换到「多智能体编排画布」启动 6 种异构舰队。",
-    draftSaved: "草稿已防丢保存"
+    draftSaved: "草稿已防丢保存",
+    subagentLabel: "子智能体",
+    forkedChildLabel: "分叉子会话",
+    fleetWorkersLabel: "舰队协同子会话",
+    jumpSessionBtn: "跳转会话 ↗",
+    openFleetBtn: "打开拓扑 ↗",
+    runErrorTitle: "运行错误"
   },
   en: {
     brandSub: "macOS Pure Go · Zero-DB Workbench",
@@ -156,7 +162,13 @@ const I18N = {
     rewindHereBtn: "Rewind Here",
     forkHereBtn: "Fork Here",
     emptyChatHint: "Select a workspace and send a prompt, or switch to Fleet Studio to launch any of the 6 topologies.",
-    draftSaved: "Draft persisted"
+    draftSaved: "Draft persisted",
+    subagentLabel: "Subagent",
+    forkedChildLabel: "Forked Child Session",
+    fleetWorkersLabel: "Fleet Worker Subagents",
+    jumpSessionBtn: "Open Session ↗",
+    openFleetBtn: "Fleet Studio ↗",
+    runErrorTitle: "Run Error"
   }
 };
 
@@ -214,18 +226,20 @@ function formatJSONSafe(val) {
   }
 }
 
-const state = {
-  lang: localStorage.getItem("gorness.lang") || "zh",
-  theme: localStorage.getItem("gorness.theme") || "auto",
+export const state = {
+  lang: (typeof localStorage !== "undefined" && localStorage.getItem("gorness.lang")) || "zh",
+  theme: (typeof localStorage !== "undefined" && localStorage.getItem("gorness.theme")) || "auto",
   centerMode: "chat",
   inspectorTab: "files",
   config: null,
   configFiles: [],
   diagnostic: null,
+  lastRunError: "",
   workspaces: [],
   sessions: [],
   activeWorkspaceId: "",
   activeSessionId: "",
+  sessionLoaded: false,
   sessionEntries: [],
   sessionSnapshots: [],
   activeRuns: [],
@@ -356,7 +370,7 @@ function syncSendOrSteerButtonLabel() {
 // Bootstrap & Global Live Event Stream
 // ============================================================================
 
-async function loadBootstrap() {
+export async function loadBootstrap() {
   const data = await apiJSON("/api/bootstrap");
   state.config = data.config || null;
   state.configFiles = data.config_files || [];
@@ -377,9 +391,10 @@ async function loadBootstrap() {
   if (!state.activeWorkspaceId && state.workspaces.length > 0) {
     state.activeWorkspaceId = state.workspaces[0].id;
   }
-  if (!state.activeSessionId && state.sessions.length > 0) {
+  let targetSessionId = state.activeSessionId;
+  if (!targetSessionId && state.sessions.length > 0) {
     const wsSess = state.sessions.find((s) => s.workspace_id === state.activeWorkspaceId && !s.archived) || state.sessions[0];
-    if (wsSess) state.activeSessionId = wsSess.id;
+    if (wsSess) targetSessionId = wsSess.id;
   }
   if (!state.activeMissionId && state.missions.length > 0) {
     state.activeMissionId = state.missions[0].id;
@@ -398,8 +413,8 @@ async function loadBootstrap() {
   if (state.activeWorkspaceId) {
     refreshWorkspaceContext(state.activeWorkspaceId);
   }
-  if (state.activeSessionId) {
-    await selectSession(state.activeSessionId, false);
+  if (targetSessionId) {
+    await selectSession(targetSessionId, false);
   } else {
     renderChatHistory();
   }
@@ -455,6 +470,11 @@ function connectGlobalEventStream() {
       case "run_completed":
       case "run_failed":
       case "run_cancelled":
+        if (ev.type === "run_failed" && (!ev.session_id || ev.session_id === state.activeSessionId)) {
+          const msg = (ev.payload && (ev.payload.message || ev.payload.error)) || "Agent run failed";
+          const code = ev.payload && ev.payload.code ? `[${ev.payload.code}] ` : "";
+          surfaceRunError(`${code}${msg}`);
+        }
         refreshActiveStatusQuietly();
         if (ev.session_id && ev.session_id === state.activeSessionId) {
           loadSessionDetail(state.activeSessionId);
@@ -497,16 +517,35 @@ async function refreshActiveStatusQuietly() {
   }
 }
 
+function surfaceRunError(errMsg) {
+  state.lastRunError = String(errMsg || "").trim();
+  renderDiagnosticBanner();
+  renderChatHistory();
+}
+
+function clearRunError() {
+  if (!state.lastRunError) return;
+  state.lastRunError = "";
+  renderDiagnosticBanner();
+}
+
 function renderDiagnosticBanner() {
   const banner = document.getElementById("reload-diag-banner");
   if (!banner) return;
-  if (!state.diagnostic || !state.diagnostic.message) {
+  const parts = [];
+  if (state.diagnostic && state.diagnostic.message) {
+    parts.push(`Reload Warning (${escapeBidi(state.diagnostic.file || "vault")}): ${escapeBidi(state.diagnostic.message)}`);
+  }
+  if (state.lastRunError) {
+    parts.push(`${t("runErrorTitle")}: ${escapeBidi(state.lastRunError)}`);
+  }
+  if (parts.length === 0) {
     banner.classList.add("hidden");
     banner.textContent = "";
     return;
   }
   banner.classList.remove("hidden");
-  banner.textContent = `Reload Warning (${escapeBidi(state.diagnostic.file || "vault")}): ${escapeBidi(state.diagnostic.message)}`;
+  banner.textContent = parts.join("  ·  ");
 }
 
 // ============================================================================
@@ -615,7 +654,7 @@ function populateAgentRoleSelect() {
 }
 
 function saveDraftLocally() {
-  if (!state.activeSessionId) return;
+  if (!state.activeSessionId || !state.sessionLoaded) return;
   const composer = document.getElementById("composer-input");
   if (!composer) return;
   const val = composer.value;
@@ -635,16 +674,34 @@ function saveDraftLocally() {
   }, 450);
 }
 
-async function selectSession(sessionId, switchMode = true) {
-  saveDraftLocally();
+function flushDraftImmediate(sessionId, val) {
+  if (!sessionId) return;
+  state.drafts[sessionId] = val;
+  clearTimeout(state.draftTimer);
+  apiJSON(`/api/sessions/${encodeURIComponent(sessionId)}`, {
+    method: "PATCH",
+    body: JSON.stringify({ draft: val })
+  }).catch(() => {});
+}
+
+export async function selectSession(sessionId, switchMode = true) {
+  if (state.sessionLoaded && state.activeSessionId && state.activeSessionId !== sessionId) {
+    const prevComposer = document.getElementById("composer-input");
+    if (prevComposer) {
+      flushDraftImmediate(state.activeSessionId, prevComposer.value);
+    }
+  }
   state.activeSessionId = sessionId;
+  state.sessionLoaded = false;
+  state.lastRunError = "";
   state.liveStreamThinking = "";
   state.liveStreamText = "";
   state.liveStreamTools = [];
+  renderDiagnosticBanner();
 
-  const meta = state.sessions.find((s) => s.id === sessionId);
-  if (meta && meta.workspace_id !== state.activeWorkspaceId) {
-    state.activeWorkspaceId = meta.workspace_id;
+  const cachedMeta = state.sessions.find((s) => s.id === sessionId);
+  if (cachedMeta && cachedMeta.workspace_id !== state.activeWorkspaceId) {
+    state.activeWorkspaceId = cachedMeta.workspace_id;
     refreshWorkspaceContext(state.activeWorkspaceId);
   }
   if (switchMode && state.centerMode !== "chat") {
@@ -652,12 +709,17 @@ async function selectSession(sessionId, switchMode = true) {
   }
 
   renderSidebarTree();
-  await loadSessionDetail(sessionId);
+  const detailMeta = await loadSessionDetail(sessionId);
 
   const composer = document.getElementById("composer-input");
   if (composer && !state.isComposingIME) {
-    composer.value = state.drafts[sessionId] ?? (meta && meta.draft) ?? "";
+    const hasLocalDraft = Object.prototype.hasOwnProperty.call(state.drafts, sessionId);
+    const serverDraft = (detailMeta && detailMeta.draft) ?? (cachedMeta && cachedMeta.draft) ?? "";
+    composer.value = hasLocalDraft ? state.drafts[sessionId] : serverDraft;
+    const ind = document.getElementById("draft-saved-indicator");
+    if (ind) ind.textContent = composer.value ? t("draftSaved") : "";
   }
+  state.sessionLoaded = true;
   syncSendOrSteerButtonLabel();
 }
 
@@ -691,53 +753,251 @@ async function loadSessionDetail(sessionId) {
   renderLiveStreamCard();
   renderApprovalBanners();
   renderSnapshotTimeMachine();
+  return meta;
 }
 
-function renderChatHistory() {
+function parseSubagentDelegation(toolName, rawInput) {
+  const name = String(toolName || "").trim();
+  const lower = name.toLowerCase();
+  let parsed = null;
+  if (rawInput && typeof rawInput === "object") {
+    parsed = rawInput;
+  } else if (typeof rawInput === "string") {
+    try {
+      parsed = JSON.parse(rawInput);
+    } catch {
+      parsed = null;
+    }
+  }
+  const isNamedSubagent =
+    lower === "subagent" ||
+    lower === "spawn_subagent" ||
+    lower === "delegate_agent" ||
+    lower === "dispatch_agent" ||
+    lower === "run_subagent" ||
+    lower === "task" ||
+    lower.includes("subagent");
+  const hasRoleField = Boolean(parsed && (parsed.agent_role || parsed.subagent_type || parsed.delegate_role));
+  if (!isNamedSubagent && !hasRoleField) return null;
+
+  const role =
+    (parsed && (parsed.agent_role || parsed.subagent_type || parsed.delegate_role || parsed.role)) || "specialist";
+  const model = (parsed && (parsed.model || parsed.model_override)) || resolveConfiguredRoleModel(role);
+  const goal =
+    (parsed && (parsed.prompt || parsed.goal || parsed.task || parsed.description)) || formatJSONSafe(rawInput);
+  const childSessionId = (parsed && (parsed.session_id || parsed.child_session_id)) || "";
+  return { name, role, model, goal: String(goal || ""), childSessionId };
+}
+
+function resolveConfiguredRoleModel(roleId) {
+  if (state.config && state.config.agents && state.config.agents[roleId]) {
+    const prof = state.config.agents[roleId];
+    return `${prof.provider}/${prof.model}`;
+  }
+  return "";
+}
+
+function renderSubagentToolCardHTML(sub, pairedResult, openByDefault = false) {
+  const isErr = Boolean(pairedResult && pairedResult.is_error);
+  const statusLabel = pairedResult ? (isErr ? "ERROR" : "COMPLETED") : "RUNNING";
+  const badgeText = sub.model ? `${sub.role} · ${sub.model}` : sub.role;
+  const jumpBtn = sub.childSessionId
+    ? `<button class="ghost-xs-btn" type="button" data-select-session="${esc(sub.childSessionId)}">${esc(t("jumpSessionBtn"))}</button>`
+    : "";
+  return `<details class="subagent-card ${isErr ? "is-error" : ""}" ${openByDefault ? "open" : ""}>
+    <summary>
+      <span class="subagent-summary-left">
+        <span>↳ ${esc(t("subagentLabel"))}</span>
+        <span class="subagent-role-pill">${esc(badgeText)}</span>
+        <span class="mono" style="color:var(--ink-secondary);font-weight:400;">${esc(sub.goal.slice(0, 64))}</span>
+      </span>
+      <span class="row-actions">
+        <span class="meta-chip mono">${esc(statusLabel)}</span>
+        ${jumpBtn}
+      </span>
+    </summary>
+    <div class="subagent-body">
+      <div><strong>Task:</strong> ${esc(sub.goal)}</div>
+      ${pairedResult ? `<pre class="mono" style="margin:0;white-space:pre-wrap;">${esc(pairedResult.text || pairedResult.output || "")}</pre>` : ""}
+    </div>
+  </details>`;
+}
+
+function renderForkedChildCardHTML(child) {
+  const role = child.agent_role || "coder";
+  const model = child.model_override || resolveConfiguredRoleModel(role);
+  const badge = model ? `${role} · ${model}` : role;
+  return `<details class="subagent-card" data-child-session-card="${esc(child.id)}">
+    <summary>
+      <span class="subagent-summary-left">
+        <span>⑂ ${esc(t("forkedChildLabel"))}</span>
+        <span class="subagent-role-pill">${esc(badge)}</span>
+        <span>${esc(child.title || child.id)}</span>
+      </span>
+      <span class="row-actions">
+        <span class="meta-chip mono">seq #${Number(child.forked_at_seq || 0)} → #${Number(child.head_seq || 0)}</span>
+        <button class="ghost-xs-btn" type="button" data-select-session="${esc(child.id)}">${esc(t("jumpSessionBtn"))}</button>
+      </span>
+    </summary>
+    <div class="subagent-body mono">
+      <span>ID: ${esc(child.id)} · ${Number(child.total_tokens || 0)} tok · $${Number(child.total_cost_usd || 0).toFixed(4)}</span>
+    </div>
+  </details>`;
+}
+
+function renderWorkspaceFleetSubagentsHTML() {
+  if (!state.activeWorkspaceId) return "";
+  const wsMissions = (state.missions || []).filter((m) => m.workspace_id === state.activeWorkspaceId);
+  if (wsMissions.length === 0) return "";
+
+  return wsMissions
+    .slice(0, 3)
+    .map((msn) => {
+      const workersHTML = (msn.nodes || [])
+        .map((n) => {
+          const jump = n.session_id
+            ? `<button class="ghost-xs-btn" type="button" data-select-session="${esc(n.session_id)}">${esc(t("jumpSessionBtn"))}</button>`
+            : "";
+          return `<div class="subagent-worker-row">
+            <span class="subagent-summary-left">
+              <strong>${esc(n.label || n.id)}</strong>
+              <span class="subagent-role-pill">${esc(n.role_id)} · ${esc(n.provider_id)}/${esc(n.model_id)}</span>
+            </span>
+            <span class="row-actions">
+              <span class="meta-chip mono">${esc(n.status)} · ${Number(n.tokens || 0)}t</span>
+              ${jump}
+            </span>
+          </div>`;
+        })
+        .join("");
+
+      return `<details class="subagent-card fleet-subagents-card" ${msn.status === "running" ? "open" : ""}>
+        <summary>
+          <span class="subagent-summary-left">
+            <span>❖ ${esc(t("fleetWorkersLabel"))}</span>
+            <span class="subagent-role-pill">${esc(msn.topology)}</span>
+            <span>${esc(String(msn.goal || "").slice(0, 56))}</span>
+          </span>
+          <span class="row-actions">
+            <span class="status-pill ${esc(msn.status)}">${esc(msn.status)}</span>
+            <button class="ghost-xs-btn" type="button" data-open-fleet-mission="${esc(msn.id)}">${esc(t("openFleetBtn"))}</button>
+          </span>
+        </summary>
+        <div class="subagent-body">${workersHTML}</div>
+      </details>`;
+    })
+    .join("");
+}
+
+export function renderChatHistory() {
   const host = document.getElementById("chat-history-entries");
   const timeline = document.getElementById("chat-timeline");
   if (!host || !timeline) return;
 
   const wasNearBottom = timeline.scrollHeight - timeline.scrollTop - timeline.clientHeight < 90;
 
-  if (!state.sessionEntries || state.sessionEntries.length === 0) {
-    host.innerHTML = `<div class="msg-card"><div class="msg-text" style="color:var(--ink-secondary);">${esc(t("emptyChatHint"))}</div></div>`;
-    return;
+  const toolResultsByCallId = new Map();
+  for (const ent of state.sessionEntries || []) {
+    for (const blk of ent.blocks || []) {
+      if (blk.type === "tool_result" && blk.tool_call_id) {
+        toolResultsByCallId.set(blk.tool_call_id, blk);
+      }
+    }
+  }
+  const consumedSubagentCallIds = new Set();
+
+  const childSessions = state.activeSessionId
+    ? (state.sessions || []).filter((s) => s.parent_session_id === state.activeSessionId)
+    : [];
+  const childrenBySeq = new Map();
+  const entrySeqSet = new Set((state.sessionEntries || []).map((e) => Number(e.seq || 0)));
+  const trailingChildren = [];
+  for (const ch of childSessions) {
+    const fSeq = Number(ch.forked_at_seq || 0);
+    if (entrySeqSet.has(fSeq)) {
+      if (!childrenBySeq.has(fSeq)) childrenBySeq.set(fSeq, []);
+      childrenBySeq.get(fSeq).push(ch);
+    } else {
+      trailingChildren.push(ch);
+    }
   }
 
   let html = "";
-  for (const entry of state.sessionEntries) {
-    const roleCls = `role-${esc(entry.role || "assistant")}`;
-    const metaRight = [entry.agent_role, entry.model_id, `seq #${Number(entry.seq || 0)}`]
-      .filter(Boolean)
-      .map(esc)
-      .join(" · ");
+  if (!state.sessionEntries || state.sessionEntries.length === 0) {
+    html += `<div class="msg-card"><div class="msg-text" style="color:var(--ink-secondary);">${esc(t("emptyChatHint"))}</div></div>`;
+  } else {
+    for (const entry of state.sessionEntries) {
+      const roleCls = `role-${esc(entry.role || "assistant")}`;
+      const metaRight = [entry.agent_role, entry.model_id, `seq #${Number(entry.seq || 0)}`]
+        .filter(Boolean)
+        .map(esc)
+        .join(" · ");
 
-    let bodyHTML = "";
-    for (const blk of entry.blocks || []) {
-      if (blk.type === "thinking" && blk.thinking) {
-        bodyHTML += `<details class="thinking-box"><summary>Adaptive Thinking</summary><pre>${esc(blk.thinking)}</pre></details>`;
-      } else if (blk.type === "tool_use") {
-        bodyHTML += `<div class="tool-block">
-          <div class="tool-block-head"><span>Tool Call · <code>${esc(blk.tool_name)}</code></span><span class="mono">${esc(blk.tool_call_id || "")}</span></div>
-          <pre>${esc(formatJSONSafe(blk.tool_input))}</pre>
-        </div>`;
-      } else if (blk.type === "tool_result") {
-        bodyHTML += `<div class="tool-block ${blk.is_error ? "is-error" : ""}">
-          <div class="tool-block-head"><span>Tool Result · <code>${esc(blk.tool_name || blk.tool_call_id || "tool")}</code></span><span>${blk.is_error ? "ERROR" : "OK"}</span></div>
-          <pre>${esc(blk.text || "")}</pre>
-        </div>`;
-      } else if (blk.text) {
-        bodyHTML += `<div class="msg-text">${esc(blk.text)}</div>`;
+      let bodyHTML = "";
+      let renderedVisibleBlock = false;
+      for (const blk of entry.blocks || []) {
+        if (blk.type === "thinking" && blk.thinking) {
+          renderedVisibleBlock = true;
+          bodyHTML += `<details class="thinking-box"><summary>Adaptive Thinking</summary><pre>${esc(blk.thinking)}</pre></details>`;
+        } else if (blk.type === "tool_use") {
+          renderedVisibleBlock = true;
+          const sub = parseSubagentDelegation(blk.tool_name, blk.tool_input);
+          if (sub) {
+            const paired = blk.tool_call_id ? toolResultsByCallId.get(blk.tool_call_id) : null;
+            if (blk.tool_call_id && paired) consumedSubagentCallIds.add(blk.tool_call_id);
+            bodyHTML += renderSubagentToolCardHTML(sub, paired, false);
+          } else {
+            bodyHTML += `<div class="tool-block">
+              <div class="tool-block-head"><span>Tool Call · <code>${esc(blk.tool_name)}</code></span><span class="mono">${esc(blk.tool_call_id || "")}</span></div>
+              <pre>${esc(formatJSONSafe(blk.tool_input))}</pre>
+            </div>`;
+          }
+        } else if (blk.type === "tool_result") {
+          if (blk.tool_call_id && consumedSubagentCallIds.has(blk.tool_call_id)) {
+            continue;
+          }
+          renderedVisibleBlock = true;
+          bodyHTML += `<div class="tool-block ${blk.is_error ? "is-error" : ""}">
+            <div class="tool-block-head"><span>Tool Result · <code>${esc(blk.tool_name || blk.tool_call_id || "tool")}</code></span><span>${blk.is_error ? "ERROR" : "OK"}</span></div>
+            <pre>${esc(blk.text || "")}</pre>
+          </div>`;
+        } else if (blk.text) {
+          renderedVisibleBlock = true;
+          bodyHTML += `<div class="msg-text">${esc(blk.text)}</div>`;
+        }
+      }
+
+      const seqChildren = childrenBySeq.get(Number(entry.seq || 0)) || [];
+      for (const ch of seqChildren) {
+        renderedVisibleBlock = true;
+        bodyHTML += renderForkedChildCardHTML(ch);
+      }
+
+      if (renderedVisibleBlock) {
+        html += `<article class="msg-card ${roleCls}">
+          <div class="msg-head">
+            <span class="msg-role-badge">${esc(entry.role)}</span>
+            <span class="mono">${metaRight}</span>
+          </div>
+          ${bodyHTML}
+        </article>`;
       }
     }
+  }
 
-    html += `<article class="msg-card ${roleCls}">
-      <div class="msg-head">
-        <span class="msg-role-badge">${esc(entry.role)}</span>
-        <span class="mono">${metaRight}</span>
-      </div>
-      ${bodyHTML}
+  for (const ch of trailingChildren) {
+    html += `<article class="msg-card">${renderForkedChildCardHTML(ch)}</article>`;
+  }
+
+  const fleetSubHTML = renderWorkspaceFleetSubagentsHTML();
+  if (fleetSubHTML) {
+    html += `<article class="msg-card">${fleetSubHTML}</article>`;
+  }
+
+  if (state.lastRunError) {
+    html += `<article class="msg-card chat-error-card" data-run-error-card="1">
+      <div class="msg-head"><span class="msg-role-badge">${esc(t("runErrorTitle"))}</span></div>
+      <div class="msg-text mono">${esc(state.lastRunError)}</div>
     </article>`;
   }
 
@@ -764,10 +1024,19 @@ function renderLiveStreamCard() {
     inner += `<div class="msg-text">${esc(state.liveStreamText)}</div>`;
   }
   for (const tc of state.liveStreamTools) {
-    inner += `<div class="tool-block">
-      <div class="tool-block-head"><span>Running · <code>${esc(tc.name)}</code></span><span class="mono">${esc(tc.status)}</span></div>
-      <pre>${esc(tc.preview || "")}</pre>
-    </div>`;
+    const sub = parseSubagentDelegation(tc.name, tc.rawArgs);
+    if (sub) {
+      inner += renderSubagentToolCardHTML(
+        sub,
+        tc.status !== "running" ? { is_error: tc.status === "error", text: tc.preview } : null,
+        true
+      );
+    } else {
+      inner += `<div class="tool-block">
+        <div class="tool-block-head"><span>Running · <code>${esc(tc.name)}</code></span><span class="mono">${esc(tc.status)}</span></div>
+        <pre>${esc(tc.preview || "")}</pre>
+      </div>`;
+    }
   }
 
   liveHost.innerHTML = `<article class="msg-card role-assistant">
@@ -888,29 +1157,40 @@ function updateSettleProgressInPlace() {
   if (stillSettling) setTimeout(updateSettleProgressInPlace, 55);
 }
 
-async function sendPromptOrSteer() {
+export async function sendPromptOrSteer() {
   const composer = document.getElementById("composer-input");
   if (!composer) return;
   const text = composer.value.trim();
   if (!text) return;
 
+  clearRunError();
+
   if (text.startsWith("/")) {
-    const handled = await tryExecuteSlashCommand(text);
-    if (handled) {
-      composer.value = "";
-      saveDraftLocally();
+    try {
+      const handled = await tryExecuteSlashCommand(text);
+      if (handled) {
+        composer.value = "";
+        saveDraftLocally();
+        return;
+      }
+    } catch (err) {
+      surfaceRunError(err.message || "Slash command failed");
       return;
     }
   }
 
   const activeRun = activeRunForCurrentSession();
   if (activeRun) {
-    await apiJSON(`/api/runs/${encodeURIComponent(activeRun.run_id)}/steer`, {
-      method: "POST",
-      body: JSON.stringify({ message: text })
-    });
-    composer.value = "";
-    saveDraftLocally();
+    try {
+      await apiJSON(`/api/runs/${encodeURIComponent(activeRun.run_id)}/steer`, {
+        method: "POST",
+        body: JSON.stringify({ message: text })
+      });
+      composer.value = "";
+      saveDraftLocally();
+    } catch (err) {
+      surfaceRunError(err.message || "Failed to inject Steer");
+    }
     return;
   }
 
@@ -923,26 +1203,47 @@ async function sendPromptOrSteer() {
   const permMode = document.getElementById("perm-mode-select")?.value || "auto";
   const modelOverride = document.getElementById("model-override-input")?.value.trim() || "";
 
+  let resp;
+  try {
+    resp = await fetch("/api/runs/stream", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        workspace_id: state.activeWorkspaceId,
+        session_id: state.activeSessionId || "",
+        prompt: text,
+        agent_role: role,
+        model_override: modelOverride,
+        perm_mode: permMode
+      })
+    });
+  } catch (netErr) {
+    surfaceRunError(netErr.message || "Network error starting run");
+    return;
+  }
+
+  if (!resp.ok || !resp.body) {
+    let errMsg = `HTTP ${resp.status}`;
+    try {
+      const rawErr = await resp.text();
+      if (rawErr) {
+        const parsed = JSON.parse(rawErr);
+        errMsg = (parsed && parsed.error) || rawErr;
+      }
+    } catch {
+      // keep fallback HTTP status message
+    }
+    // Preserve composer.value & persisted draft when /api/runs/stream fails
+    surfaceRunError(errMsg);
+    return;
+  }
+
+  // Stream established cleanly — now clear composer and persist empty draft
   composer.value = "";
   saveDraftLocally();
   state.liveStreamThinking = "";
   state.liveStreamText = "";
   state.liveStreamTools = [];
-
-  const resp = await fetch("/api/runs/stream", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      workspace_id: state.activeWorkspaceId,
-      session_id: state.activeSessionId || "",
-      prompt: text,
-      agent_role: role,
-      model_override: modelOverride,
-      perm_mode: permMode
-    })
-  });
-
-  if (!resp.ok || !resp.body) return;
 
   const reader = resp.body.getReader();
   const decoder = new TextDecoder();
@@ -977,7 +1278,7 @@ async function sendPromptOrSteer() {
   await refreshActiveStatusQuietly();
 }
 
-function handleRunStreamEvent(ev) {
+export function handleRunStreamEvent(ev) {
   if (ev.session_id && !state.activeSessionId) state.activeSessionId = ev.session_id;
   switch (ev.type) {
     case "step_reset":
@@ -1003,6 +1304,7 @@ function handleRunStreamEvent(ev) {
         state.liveStreamTools.push({
           id: ev.payload.tool_call_id,
           name: ev.payload.tool_name,
+          rawArgs: ev.payload.args,
           status: "running",
           preview: formatJSONSafe(ev.payload.args)
         });
@@ -1029,6 +1331,17 @@ function handleRunStreamEvent(ev) {
         renderApprovalBanners();
       }
       break;
+    case "doom_loop":
+      if (ev.payload && ev.payload.tool_name) {
+        surfaceRunError(`Doom loop halted on ${ev.payload.tool_name} (${ev.payload.consecutive_failures || 3} consecutive failures)`);
+      }
+      break;
+    case "run_failed": {
+      const msg = (ev.payload && (ev.payload.message || ev.payload.error)) || "Agent run failed";
+      const code = ev.payload && ev.payload.code ? `[${ev.payload.code}] ` : "";
+      surfaceRunError(`${code}${msg}`);
+      break;
+    }
   }
 }
 
@@ -2220,6 +2533,16 @@ function bindWorkbenchEvents() {
       return;
     }
 
+    const openFleetBtn = target.closest("[data-open-fleet-mission]");
+    if (openFleetBtn) {
+      const msnId = openFleetBtn.getAttribute("data-open-fleet-mission");
+      if (msnId) {
+        state.activeMissionId = msnId;
+        setCenterMode("fleet");
+      }
+      return;
+    }
+
     const saveAgentBtn = target.closest("[data-save-agent]");
     if (saveAgentBtn) {
       const id = saveAgentBtn.getAttribute("data-save-agent");
@@ -2251,8 +2574,8 @@ function bindWorkbenchEvents() {
   });
 }
 
-// Boot Workbench when running inside browser DOM
-if (typeof document !== "undefined") {
+// Boot Workbench when running inside browser DOM (unless imported under Node test harness)
+if (typeof document !== "undefined" && !globalThis.__GORNESS_TEST_NO_AUTOBOOT__) {
   applyTheme(state.theme, false);
   applyI18nInPlace();
   setupResizableSplitters();
