@@ -1414,3 +1414,129 @@ func TestMultiMegabyteSSEAndRetryCancelBoundaries(t *testing.T) {
 		t.Fatalf("expected ErrCmdSecretDisallowed for untrusted header cmd:, got %v", err)
 	}
 }
+
+func TestFixRound1FailClosedEmptySourceAndCancelDeterminism(t *testing.T) {
+	t.Parallel()
+
+	vaultRoot := filepath.Join(t.TempDir(), ".gorness")
+	var cmdExecutions atomic.Int32
+	mgr, err := config.NewManager(config.Options{
+		VaultRoot: vaultRoot,
+		CmdRunner: func(ctx context.Context, shellCmd string) (string, error) {
+			cmdExecutions.Add(1)
+			return "should-never-run-token\n", nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("NewManager: %v", err)
+	}
+
+	noopStreamer := StreamerFunc(func(ctx context.Context, req Request) (<-chan StreamEvent, error) {
+		ch := make(chan StreamEvent, 1)
+		ch <- StreamEvent{Type: StreamDone, StopReason: "end_turn"}
+		close(ch)
+		return ch, nil
+	})
+	router := NewRouter(mgr, mgr.Secrets(), noopStreamer)
+
+	// 1a. Deserialized / synthetic ProviderConfig with empty SourceFile MUST fail closed on cmd:
+	emptySourceRoute := ResolvedRoute{
+		RoleID:     "coder",
+		ProviderID: "synthetic",
+		ModelID:    "gpt-5.5",
+		Provider: config.ProviderConfig{
+			ID:         "synthetic",
+			Protocol:   "openai-compat",
+			BaseURL:    "http://127.0.0.1:1",
+			APIKeyRef:  "cmd:whoami",
+			SourceFile: "", // empty SourceFile (e.g., JSON/API deserialized)
+		},
+	}
+	if _, err := router.StreamWithRetry(context.Background(), emptySourceRoute, Request{}); !errors.Is(err, config.ErrCmdSecretDisallowed) {
+		t.Fatalf("expected ErrCmdSecretDisallowed when ProviderConfig.SourceFile is empty, got %v", err)
+	}
+
+	// 1b. Router with nil *config.Manager MUST also fail closed on cmd:
+	nilCfgRouter := NewRouter(nil, mgr.Secrets(), noopStreamer)
+	if _, err := nilCfgRouter.StreamWithRetry(context.Background(), emptySourceRoute, Request{}); !errors.Is(err, config.ErrCmdSecretDisallowed) {
+		t.Fatalf("expected ErrCmdSecretDisallowed when Router cfg is nil, got %v", err)
+	}
+
+	// 1c. Synthetic AgentProfile with empty SourceFile overriding APIKeyRef on a global provider MUST fail closed on cmd:
+	snap := mgr.Current().Clone()
+	snap.Agents["synthetic_agent"] = config.AgentProfile{
+		ID:         "synthetic_agent",
+		Provider:   "anthropic",
+		Model:      "claude-sonnet-5-5",
+		APIKeyRef:  "cmd:whoami",
+		SourceFile: "", // empty SourceFile on profile override
+	}
+	profRoute, err := router.Resolve("synthetic_agent", "", "", snap)
+	if err != nil {
+		t.Fatalf("Resolve synthetic_agent: %v", err)
+	}
+	if _, err := router.StreamWithRetry(context.Background(), profRoute, Request{}); !errors.Is(err, config.ErrCmdSecretDisallowed) {
+		t.Fatalf("expected ErrCmdSecretDisallowed when AgentProfile.SourceFile is empty, got %v", err)
+	}
+	if got := cmdExecutions.Load(); got != 0 {
+		t.Fatalf("cmd: runner must NEVER execute for empty SourceFile, executed %d times", got)
+	}
+
+	// 2. Deterministic terminal StreamError delivery across 100 cancelled runs (zero 50/50 select drops)
+	for iter := 0; iter < 100; iter++ {
+		ctx, cancel := context.WithCancel(context.Background())
+		cancelMidAttempt := StreamerFunc(func(callCtx context.Context, req Request) (<-chan StreamEvent, error) {
+			cancel()
+			return nil, callCtx.Err()
+		})
+		r := NewRouter(mgr, mgr.Secrets(), cancelMidAttempt)
+		safeRoute := ResolvedRoute{
+			RoleID:     "coder",
+			ProviderID: "local",
+			ModelID:    "qwen3-coder",
+			Provider: config.ProviderConfig{
+				ID:       "local",
+				Protocol: "openai-compat",
+				BaseURL:  "http://127.0.0.1:1",
+			},
+		}
+		ch, err := r.StreamWithRetry(ctx, safeRoute, Request{})
+		if err != nil {
+			t.Fatalf("iter %d StreamWithRetry error: %v", iter, err)
+		}
+		evs := collectStreamEvents(t, ch)
+		if len(evs) != 1 || evs[0].Type != StreamError || !errors.Is(evs[0].Err, context.Canceled) {
+			t.Fatalf("iter %d dropped terminal StreamError on cancelled ctx: got %#v", iter, evs)
+		}
+	}
+
+	// 3. Full output buffer on StreamDone must NOT deadlock when parent ctx is cancelled without draining out
+	started := make(chan struct{})
+	burstStreamer := StreamerFunc(func(callCtx context.Context, req Request) (<-chan StreamEvent, error) {
+		up := make(chan StreamEvent, 1)
+		up <- StreamEvent{Type: StreamDone, StopReason: "end_turn"}
+		close(up)
+		close(started)
+		return up, nil
+	})
+	burstRouter := NewRouter(mgr, mgr.Secrets(), burstStreamer)
+	parentCtx, cancelParent := context.WithCancel(context.Background())
+	fullOut := make(chan StreamEvent, 64)
+	for i := 0; i < cap(fullOut); i++ {
+		fullOut <- StreamEvent{Type: StreamTextDelta, Text: "x"}
+	}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		_, _, _ = burstRouter.runSingleAttempt(parentCtx, parentCtx, Request{}, 1, fullOut)
+	}()
+
+	<-started
+	cancelParent()
+
+	select {
+	case <-done:
+	case <-time.After(500 * time.Millisecond):
+		t.Fatalf("runSingleAttempt deadlocked sending StreamDone to full channel after parent ctx cancellation")
+	}
+}

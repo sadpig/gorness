@@ -240,6 +240,14 @@ func readHTTPError(resp *http.Response, providerID string, secrets ...string) er
 }
 
 func emitEvent(ctx context.Context, ch chan<- StreamEvent, ev StreamEvent) bool {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	select {
+	case ch <- ev:
+		return true
+	default:
+	}
 	select {
 	case ch <- ev:
 		return true

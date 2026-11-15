@@ -21,14 +21,15 @@ const (
 )
 
 type ResolvedRoute struct {
-	RoleID           string
-	ProviderID       string
-	ModelID          string
-	Effort           string
-	Provider         config.ProviderConfig
-	Spec             config.ModelSpec
-	Fallback         *ResolvedRoute
-	apiKeySourceFile string
+	RoleID            string
+	ProviderID        string
+	ModelID           string
+	Effort            string
+	Provider          config.ProviderConfig
+	Spec              config.ModelSpec
+	Fallback          *ResolvedRoute
+	hasAPIKeyOverride bool
+	apiKeySourceFile  string
 }
 
 // Router 负责异构 Agent 角色的四级优先级路由、受控凭据解析、1.5x 超时退避重试、中途断流步重置与跨模型平滑回退。
@@ -111,6 +112,7 @@ func (r *Router) Resolve(roleID, wsModelOverride, runModelOverride string, snap 
 	// 若角色 Profile 自身显式声明了 api_key 覆盖，独立记录其来源路径以确保 key 与 provider headers 各自遵循严密 cmd: 信任边界。
 	if hasProf && strings.TrimSpace(prof.APIKeyRef) != "" && (usedRoleModel || primary.ProviderID == strings.TrimSpace(prof.Provider)) {
 		primary.Provider.APIKeyRef = prof.APIKeyRef
+		primary.hasAPIKeyOverride = true
 		primary.apiKeySourceFile = prof.SourceFile
 	}
 
@@ -389,7 +391,7 @@ func (r *Router) StreamWithRetry(ctx context.Context, route ResolvedRoute, req R
 					attemptReq.Effort = cur.Effort
 				}
 
-				emittedPartial, completed, attemptErr := r.runSingleAttempt(attemptCtx, attemptReq, totalAttempt, out)
+				emittedPartial, completed, attemptErr := r.runSingleAttempt(ctx, attemptCtx, attemptReq, totalAttempt, out)
 				cancel()
 
 				if completed {
@@ -467,6 +469,7 @@ func (r *Router) StreamWithRetry(ctx context.Context, route ResolvedRoute, req R
 }
 
 func (r *Router) runSingleAttempt(
+	parentCtx context.Context,
 	attemptCtx context.Context,
 	attemptReq Request,
 	attemptNum int,
@@ -491,7 +494,12 @@ func (r *Router) runSingleAttempt(
 				return emittedPartial, false, context.Canceled
 			}
 		case StreamDone:
-			emitEvent(context.Background(), out, ev)
+			if !emitEvent(parentCtx, out, ev) {
+				if parentCtx.Err() != nil {
+					return emittedPartial, false, parentCtx.Err()
+				}
+				return emittedPartial, false, context.Canceled
+			}
 			return emittedPartial, true, nil
 		case StreamError:
 			if ev.Err != nil {
@@ -514,7 +522,7 @@ func (r *Router) prepareRouteCredentials(
 ) (config.ProviderConfig, string, []string, error) {
 	prov := cloneProviderConfig(route.Provider)
 	keySource := prov.SourceFile
-	if route.apiKeySourceFile != "" {
+	if route.hasAPIKeyOverride {
 		keySource = route.apiKeySourceFile
 	}
 	allowCmdKey := r.isTrustedGlobalSource(keySource)
@@ -559,13 +567,10 @@ func (r *Router) prepareRouteCredentials(
 	return prov, apiKey, secretsList, nil
 }
 
-// isTrustedGlobalSource 严格校验配置来源是否位于全局 ~/.gorness/ 保险库内部（或内存默认配置），阻断外部项目覆盖层执行 cmd:。
+// isTrustedGlobalSource 严格默认拒绝（fail-closed）：仅当 r.cfg 存在且非空 sourceFile 解析后严格位于全局 ~/.gorness/ 保险库内部时才放行 cmd:。
 func (r *Router) isTrustedGlobalSource(sourceFile string) bool {
 	trimmed := strings.TrimSpace(sourceFile)
-	if trimmed == "" {
-		return true
-	}
-	if r == nil || r.cfg == nil {
+	if trimmed == "" || r == nil || r.cfg == nil {
 		return false
 	}
 
