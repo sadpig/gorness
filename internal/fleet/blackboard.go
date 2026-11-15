@@ -28,12 +28,23 @@ type missionFrontmatter struct {
 	ID           string       `toml:"id"`
 	WorkspaceID  string       `toml:"workspace_id"`
 	WorkflowID   string       `toml:"workflow_id"`
+	Goal         string       `toml:"goal"`
 	Topology     TopologyKind `toml:"topology"`
 	Status       string       `toml:"status"`
+	Nodes        []FleetNode  `toml:"nodes,omitempty"`
+	Edges        []FleetEdge  `toml:"edges,omitempty"`
+	MergeQueue   []string     `toml:"merge_queue,omitempty"`
 	TotalCostUSD float64      `toml:"total_cost_usd"`
 	BudgetUSD    float64      `toml:"budget_usd,omitempty"`
+	Summary      string       `toml:"summary,omitempty"`
+	Error        string       `toml:"error,omitempty"`
 	CreatedAt    time.Time    `toml:"created_at"`
 	UpdatedAt    time.Time    `toml:"updated_at"`
+}
+
+type diffFrontmatter struct {
+	NodeID    string    `toml:"node_id"`
+	UpdatedAt time.Time `toml:"updated_at"`
 }
 
 type noteFrontmatter struct {
@@ -49,7 +60,7 @@ type noteSeqState struct {
 }
 
 // MarkdownBlackboard 管理 ~/.gorness/workspaces/<wsID>/missions/<missionID>/ 下的纯文件多 Agent 协同黑板：
-// 包含 MISSION.md、tasks/<id>.md（Flock 排他抢单与深度 <=3 动态拆树）、notes/<seq>-<node>.md、diffs/<node>.diff 与 events.jsonl。
+// 包含 MISSION.md、snapshot.toml、tasks/<id>.md（Flock 排他抢单与深度 <=3 动态拆树）、notes/<seq>-<node>.md、diffs/<node>.md 与 events.jsonl。
 type MarkdownBlackboard struct {
 	paths     config.VaultPaths
 	wsID      string
@@ -108,7 +119,7 @@ func (b *MarkdownBlackboard) TasksDir() string     { return filepath.Join(b.dir,
 func (b *MarkdownBlackboard) NotesDir() string     { return filepath.Join(b.dir, "notes") }
 func (b *MarkdownBlackboard) DiffsDir() string     { return filepath.Join(b.dir, "diffs") }
 func (b *MarkdownBlackboard) MissionMD() string    { return filepath.Join(b.dir, "MISSION.md") }
-func (b *MarkdownBlackboard) SnapshotFile() string { return filepath.Join(b.dir, "snapshot.json") }
+func (b *MarkdownBlackboard) SnapshotFile() string { return filepath.Join(b.dir, "snapshot.toml") }
 func (b *MarkdownBlackboard) EventsFile() string   { return filepath.Join(b.dir, "events.jsonl") }
 
 func (b *MarkdownBlackboard) taskFilePath(taskID string) (string, error) {
@@ -162,10 +173,16 @@ func (b *MarkdownBlackboard) SaveSnapshot(snap *MissionSnapshot) error {
 			ID:           snap.ID,
 			WorkspaceID:  snap.WorkspaceID,
 			WorkflowID:   snap.WorkflowID,
+			Goal:         snap.Goal,
 			Topology:     snap.Topology,
 			Status:       snap.Status,
+			Nodes:        snap.Nodes,
+			Edges:        snap.Edges,
+			MergeQueue:   snap.MergeQueue,
 			TotalCostUSD: snap.TotalCostUSD,
 			BudgetUSD:    snap.BudgetUSD,
+			Summary:      snap.Summary,
+			Error:        snap.Error,
 			CreatedAt:    snap.CreatedAt,
 			UpdatedAt:    snap.UpdatedAt,
 		}
@@ -197,24 +214,46 @@ func (b *MarkdownBlackboard) SaveSnapshot(snap *MissionSnapshot) error {
 			return err
 		}
 
-		rawJSON, err := marshalJSONNoEscape(snap)
+		rawTOML, err := toml.Marshal(snap)
 		if err != nil {
-			return fmt.Errorf("marshal snapshot.json: %w", err)
+			return fmt.Errorf("marshal snapshot.toml: %w", err)
 		}
-		return store.AtomicWriteFile(b.SnapshotFile(), rawJSON, 0o600)
+		return store.AtomicWriteFile(b.SnapshotFile(), rawTOML, 0o600)
 	})
+}
+
+func normalizeSnapshotSlices(snap *MissionSnapshot) {
+	if snap == nil {
+		return
+	}
+	if snap.Nodes == nil {
+		snap.Nodes = []FleetNode{}
+	}
+	if snap.Edges == nil {
+		snap.Edges = []FleetEdge{}
+	}
+	if snap.Tasks == nil {
+		snap.Tasks = []BlackboardTask{}
+	}
+	if snap.Notes == nil {
+		snap.Notes = []BlackboardNote{}
+	}
+	if snap.MergeQueue == nil {
+		snap.MergeQueue = []string{}
+	}
 }
 
 func (b *MarkdownBlackboard) LoadSnapshot() (*MissionSnapshot, error) {
 	if raw, err := os.ReadFile(b.SnapshotFile()); err == nil {
 		var snap MissionSnapshot
-		if uErr := json.Unmarshal(raw, &snap); uErr == nil {
-			if tasks, tErr := b.ListTasks(); tErr == nil {
+		if uErr := toml.Unmarshal(raw, &snap); uErr == nil {
+			if tasks, tErr := b.ListTasks(); tErr == nil && tasks != nil {
 				snap.Tasks = tasks
 			}
-			if notes, nErr := b.ListNotes(); nErr == nil {
+			if notes, nErr := b.ListNotes(); nErr == nil && notes != nil {
 				snap.Notes = notes
 			}
+			normalizeSnapshotSlices(&snap)
 			return &snap, nil
 		}
 	}
@@ -238,25 +277,33 @@ func (b *MarkdownBlackboard) LoadSnapshot() (*MissionSnapshot, error) {
 	if err := toml.Unmarshal(encoded, &fm); err != nil {
 		return nil, err
 	}
+	goal := fm.Goal
+	if goal == "" {
+		goal = strings.TrimSpace(body)
+	}
 	tasks, _ := b.ListTasks()
 	notes, _ := b.ListNotes()
-	return &MissionSnapshot{
+	snap := &MissionSnapshot{
 		ID:           fm.ID,
 		WorkspaceID:  fm.WorkspaceID,
 		WorkflowID:   fm.WorkflowID,
-		Goal:         strings.TrimSpace(body),
+		Goal:         goal,
 		Topology:     fm.Topology,
 		Status:       fm.Status,
-		Nodes:        []FleetNode{},
-		Edges:        []FleetEdge{},
+		Nodes:        fm.Nodes,
+		Edges:        fm.Edges,
 		Tasks:        tasks,
 		Notes:        notes,
-		MergeQueue:   []string{},
+		MergeQueue:   fm.MergeQueue,
 		TotalCostUSD: fm.TotalCostUSD,
 		BudgetUSD:    fm.BudgetUSD,
+		Summary:      fm.Summary,
+		Error:        fm.Error,
 		CreatedAt:    fm.CreatedAt,
 		UpdatedAt:    fm.UpdatedAt,
-	}, nil
+	}
+	normalizeSnapshotSlices(snap)
+	return snap, nil
 }
 
 func (b *MarkdownBlackboard) CreateTask(id, parentID, title, description string, depth int) (BlackboardTask, error) {
@@ -746,18 +793,33 @@ func (b *MarkdownBlackboard) SaveNodeDiff(nodeID, diff string) error {
 	if err := ValidateID(nodeID); err != nil {
 		return fmt.Errorf("invalid node id: %w", err)
 	}
-	diffPath := filepath.Join(b.DiffsDir(), nodeID+".diff")
+	diffPath := filepath.Join(b.DiffsDir(), nodeID+".md")
 	if err := ensureStrictSubpath(b.DiffsDir(), diffPath); err != nil {
 		return err
 	}
-	return store.AtomicWriteFile(diffPath, []byte(diff), 0o600)
+	fmBytes, err := toml.Marshal(diffFrontmatter{
+		NodeID:    nodeID,
+		UpdatedAt: b.now().UTC(),
+	})
+	if err != nil {
+		return fmt.Errorf("marshal diff frontmatter: %w", err)
+	}
+	var buf bytes.Buffer
+	buf.WriteString("+++\n")
+	buf.Write(fmBytes)
+	if !bytes.HasSuffix(fmBytes, []byte("\n")) {
+		buf.WriteByte('\n')
+	}
+	buf.WriteString("+++\n")
+	buf.WriteString(diff)
+	return store.AtomicWriteFile(diffPath, buf.Bytes(), 0o600)
 }
 
 func (b *MarkdownBlackboard) ReadNodeDiff(nodeID string) (string, error) {
 	if err := ValidateID(nodeID); err != nil {
 		return "", fmt.Errorf("invalid node id: %w", err)
 	}
-	diffPath := filepath.Join(b.DiffsDir(), nodeID+".diff")
+	diffPath := filepath.Join(b.DiffsDir(), nodeID+".md")
 	if err := ensureStrictSubpath(b.DiffsDir(), diffPath); err != nil {
 		return "", err
 	}
@@ -768,7 +830,11 @@ func (b *MarkdownBlackboard) ReadNodeDiff(nodeID string) (string, error) {
 		}
 		return "", err
 	}
-	return string(raw), nil
+	_, body, pErr := config.ParseFrontmatterMD(raw)
+	if pErr != nil {
+		return string(raw), nil
+	}
+	return body, nil
 }
 
 func (b *MarkdownBlackboard) AppendEvent(ev MissionEvent) error {

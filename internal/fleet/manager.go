@@ -213,7 +213,7 @@ func (m *Manager) StartMission(ctx context.Context, req MissionRequest) (*Missio
 	if req.MaxRounds > 0 {
 		maxRounds = req.MaxRounds
 	}
-	if maxRounds <= 0 {
+	if maxRounds <= 0 && topo != TopoSharedBoard {
 		maxRounds = DefaultMaxRounds
 	}
 
@@ -791,6 +791,9 @@ func (rt *missionRuntime) shouldUseWorktree(nodeID string) bool {
 	if !rt.isGitRepo {
 		return false
 	}
+	if rt.req.UseWorktrees != nil && !*rt.req.UseWorktrees {
+		return false
+	}
 	if specWT, exists := rt.nodeWorktreeSpec[nodeID]; exists && specWT {
 		return true
 	}
@@ -1099,44 +1102,7 @@ func (rt *missionRuntime) verifyAndMaybeLand(
 		}
 	}
 
-	// 若未使用独立 Git Worktree（例如非 Git 目录），直接在主工作区执行验收命令与盲审
-	if lease == nil {
-		var verifyOut string
-		if strings.TrimSpace(rt.verifyCommand) != "" {
-			vRes, vErr := rt.mgr.refinery.RunVerify(ctx, rt.verifyCommand, rt.ws.RootPath, rt.sandboxMode, rt.allowedDomains)
-			verifyOut = strings.TrimSpace(vRes.Combined)
-			if vErr != nil {
-				return nil, vErr
-			}
-			if vRes.ExitCode != 0 {
-				return &LandResult{
-					Accepted:     false,
-					Stage:        "verify",
-					VerifyOutput: verifyOut,
-					Reason:       fmt.Sprintf("verify_command exited %d: %s", vRes.ExitCode, verifyOut),
-				}, nil
-			}
-		}
-		if blindFn != nil {
-			acc, fb, bErr := blindFn(ctx, "", verifyOut)
-			if bErr != nil {
-				return nil, bErr
-			}
-			if !acc {
-				return &LandResult{
-					Accepted:     false,
-					Stage:        "verifier",
-					VerifyOutput: verifyOut,
-					ReviewNotes:  fb,
-					Reason:       fb,
-				}, nil
-			}
-			return &LandResult{Accepted: true, Stage: "landed", VerifyOutput: verifyOut, ReviewNotes: fb}, nil
-		}
-		return &LandResult{Accepted: true, Stage: "landed", VerifyOutput: verifyOut}, nil
-	}
-
-	landRes, err := rt.mgr.refinery.Land(ctx, LandRequest{
+	landReq := LandRequest{
 		Lease:          lease,
 		TargetBranch:   rt.targetBranch,
 		CommitMessage:  commitMsg,
@@ -1150,7 +1116,18 @@ func (rt *missionRuntime) verifyAndMaybeLand(
 		OnQueueExit: func(item string) {
 			rt.popMergeQueue(item)
 		},
-	})
+	}
+
+	var (
+		landRes *LandResult
+		err     error
+	)
+	if lease == nil {
+		// 未使用独立 Git Worktree 时仍通过 Refinery 互斥锁严格串行化验收与盲审，防止并发争用同一 Verifier 会话
+		landRes, err = rt.mgr.refinery.VerifyInPlace(ctx, authorNodeID, rt.ws.RootPath, rt.isGitRepo, landReq)
+	} else {
+		landRes, err = rt.mgr.refinery.Land(ctx, landReq)
+	}
 	if err != nil {
 		return nil, err
 	}

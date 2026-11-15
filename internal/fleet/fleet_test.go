@@ -1084,3 +1084,352 @@ func TestRefineryVerifyGateRejectionAndBudgetGuard(t *testing.T) {
 		t.Fatalf("expected budget failure, got %+v (err=%v)", bFinal, err)
 	}
 }
+
+func TestVaultFileFormatsAndLosslessMissionMDFallback(t *testing.T) {
+	baseDir := t.TempDir()
+	paths := config.VaultPaths{Root: filepath.Join(baseDir, "vault")}
+	bb, err := NewMarkdownBlackboard(paths, "ws-fmt", "msn-fmt")
+	if err != nil {
+		t.Fatalf("NewMarkdownBlackboard: %v", err)
+	}
+
+	now := time.Now().UTC().Truncate(time.Millisecond)
+	orig := &MissionSnapshot{
+		ID:          "msn-fmt",
+		WorkspaceID: "ws-fmt",
+		WorkflowID:  "hybrid-fleet",
+		Goal:        "Preserve exact multi-line goal\nwithout heading corruption",
+		Topology:    TopoHybridFleet,
+		Status:      MissionFailed,
+		Nodes: []FleetNode{
+			{
+				ID:         "coder",
+				Label:      "Worktree Coder",
+				RoleID:     "coder",
+				ProviderID: "anthropic",
+				ModelID:    "claude-sonnet-5-5",
+				Effort:     "high",
+				Status:     NodeCompleted,
+				Tokens:     320,
+				CostUSD:    0.0125,
+				DiffStat:   "1 file changed",
+				UpdatedAt:  now,
+			},
+		},
+		Edges: []FleetEdge{
+			{From: "coder", To: "verifier", Label: "audit", Kind: "gate", PulseSeq: 2},
+		},
+		MergeQueue:   []string{"coder"},
+		TotalCostUSD: 0.0125,
+		BudgetUSD:    1.5,
+		Summary:      "Partial summary text",
+		Error:        "verifier rejected patch",
+		CreatedAt:    now,
+		UpdatedAt:    now,
+	}
+	if err := bb.InitMission(orig); err != nil {
+		t.Fatalf("InitMission: %v", err)
+	}
+	if _, err := bb.CreateTask("task-1", "", "Task One", "Body", 0); err != nil {
+		t.Fatalf("CreateTask: %v", err)
+	}
+	if _, err := bb.AddNote("coder", "Note One", "Detailed note"); err != nil {
+		t.Fatalf("AddNote: %v", err)
+	}
+
+	rawDiff := "diff --git a/pkg.go b/pkg.go\n--- a/pkg.go\n+++ b/pkg.go\n@@ -1,2 +1,2 @@\n context line with leading space\n-old\n+new\n"
+	if err := bb.SaveNodeDiff("coder", rawDiff); err != nil {
+		t.Fatalf("SaveNodeDiff: %v", err)
+	}
+	gotDiff, err := bb.ReadNodeDiff("coder")
+	if err != nil || gotDiff != rawDiff {
+		t.Fatalf("ReadNodeDiff mismatch:\ngot:  %q\nwant: %q\nerr:  %v", gotDiff, rawDiff, err)
+	}
+
+	// Walk entire vault and assert zero .json or .diff files exist!
+	err = filepath.WalkDir(paths.Root, func(path string, d os.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		if d.IsDir() {
+			return nil
+		}
+		ext := strings.ToLower(filepath.Ext(d.Name()))
+		switch ext {
+		case ".toml", ".md", ".jsonl", ".lock":
+			return nil
+		default:
+			t.Fatalf("disallowed file extension %q found under vault: %s", ext, path)
+			return nil
+		}
+	})
+	if err != nil {
+		t.Fatalf("WalkDir vault: %v", err)
+	}
+
+	// Delete snapshot.toml to exercise MISSION.md fallback and verify 100% lossless round-trip!
+	if err := os.Remove(bb.SnapshotFile()); err != nil {
+		t.Fatalf("Remove snapshot.toml: %v", err)
+	}
+	fallbackSnap, err := bb.LoadSnapshot()
+	if err != nil {
+		t.Fatalf("LoadSnapshot via MISSION.md fallback: %v", err)
+	}
+	if fallbackSnap.Goal != orig.Goal {
+		t.Fatalf("fallback Goal corrupted:\ngot:  %q\nwant: %q", fallbackSnap.Goal, orig.Goal)
+	}
+	if fallbackSnap.Summary != orig.Summary || fallbackSnap.Error != orig.Error {
+		t.Fatalf("fallback Summary/Error mismatch: summary=%q error=%q", fallbackSnap.Summary, fallbackSnap.Error)
+	}
+	if len(fallbackSnap.Nodes) != 1 || fallbackSnap.Nodes[0].ID != "coder" || fallbackSnap.Nodes[0].ModelID != "claude-sonnet-5-5" {
+		t.Fatalf("fallback Nodes lost: %+v", fallbackSnap.Nodes)
+	}
+	if len(fallbackSnap.Edges) != 1 || fallbackSnap.Edges[0].PulseSeq != 2 {
+		t.Fatalf("fallback Edges lost: %+v", fallbackSnap.Edges)
+	}
+	if len(fallbackSnap.MergeQueue) != 1 || fallbackSnap.MergeQueue[0] != "coder" {
+		t.Fatalf("fallback MergeQueue lost: %+v", fallbackSnap.MergeQueue)
+	}
+	if len(fallbackSnap.Tasks) != 1 || len(fallbackSnap.Notes) != 1 {
+		t.Fatalf("fallback Tasks/Notes mismatch: tasks=%d notes=%d", len(fallbackSnap.Tasks), len(fallbackSnap.Notes))
+	}
+}
+
+func TestConcurrentVerifierSerializedWithoutWorktrees(t *testing.T) {
+	var arrived atomic.Int32
+	bothDone := make(chan struct{})
+	var once sync.Once
+	var verifierCalls atomic.Int32
+
+	streamer := llm.StreamerFunc(func(ctx context.Context, req llm.Request) (<-chan llm.StreamEvent, error) {
+		if strings.Contains(req.StaticSystem, "Adversarial Verifier") || req.Provider.ID == "openai" {
+			verifierCalls.Add(1)
+			time.Sleep(25 * time.Millisecond)
+			return emitTextTurn("**VERDICT**: **ACCEPT**\nSerialized in-place audit passed.", 80, 20)
+		}
+		if arrived.Add(1) == 2 {
+			once.Do(func() { close(bothDone) })
+		}
+		select {
+		case <-bothDone:
+		case <-time.After(5 * time.Second):
+			return nil, errors.New("timed out waiting for sibling coder")
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+		return emitTextTurn("Completed in-place specialist check.", 60, 20)
+	})
+
+	fastVerify := func(ctx context.Context, cmdStr, workDir string) (tools.CommandResult, error) {
+		return tools.CommandResult{Stdout: "ok", Combined: "ok", ExitCode: 0}, nil
+	}
+
+	mgr, _, _, ws, _ := setupTestFleet(t, streamer, fastVerify)
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	disableWT := false
+	snap, stream, err := mgr.StartMission(ctx, MissionRequest{
+		WorkspaceID:  ws.ID,
+		WorkflowID:   "worktree-team",
+		Topology:     TopoWorktreeTeam,
+		Goal:         "Concurrent specialists with UseWorktrees=false must serialize verifier session",
+		UseWorktrees: &disableWT,
+	})
+	if err != nil {
+		t.Fatalf("StartMission: %v", err)
+	}
+	_ = collectMissionEvents(stream)
+
+	finalSnap, err := mgr.GetMission(ws.ID, snap.ID)
+	if err != nil {
+		t.Fatalf("GetMission: %v", err)
+	}
+	if finalSnap.Status != MissionCompleted {
+		t.Fatalf("expected MissionCompleted without ErrSessionBusy when UseWorktrees=false, got status=%q err=%q", finalSnap.Status, finalSnap.Error)
+	}
+	if got := verifierCalls.Load(); got != 2 {
+		t.Fatalf("expected 2 serialized verifier calls, got %d", got)
+	}
+}
+
+func TestSharedBoardMaxIdleRoundsDefaultAndIncompleteMaxRoundsFailure(t *testing.T) {
+	// 1. Default shared-board (MaxRounds unset, max_idle_rounds = 3 from shared-board.toml)
+	// runs 3+ productive rounds (via multi-level splits) and still halts via max_idle_rounds (3), NOT DefaultMaxRounds!
+	streamer := llm.StreamerFunc(func(ctx context.Context, req llm.Request) (<-chan llm.StreamEvent, error) {
+		promptText := flattenHistoryText(req.History)
+		if strings.Contains(req.StaticSystem, "Lead Architect") {
+			return emitTextTurn("TASK: Root task A\nTASK: Root task B\nTASK: Root task C\nTASK: Root task D", 80, 30)
+		}
+		if strings.Contains(req.StaticSystem, "Adversarial Verifier") || req.Provider.ID == "openai" {
+			return emitTextTurn("VERDICT: ACCEPT\nVerified.", 60, 15)
+		}
+		if strings.Contains(promptText, "Root task A") && strings.Contains(promptText, "depth=0") {
+			return emitTextTurn("SPLIT_TASK: Subtask A1\nSPLIT_TASK: Subtask A2", 70, 20)
+		}
+		if strings.Contains(promptText, "Subtask A1") && strings.Contains(promptText, "depth=1") {
+			return emitTextTurn("SPLIT_TASK: Subtask A1a", 70, 20)
+		}
+		return emitTextTurn("Finished board leaf task.", 70, 20)
+	})
+	fastVerify := func(ctx context.Context, cmdStr, workDir string) (tools.CommandResult, error) {
+		return tools.CommandResult{Stdout: "ok", Combined: "ok", ExitCode: 0}, nil
+	}
+
+	mgr, _, _, ws, _ := setupTestFleet(t, streamer, fastVerify)
+	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Second)
+	defer cancel()
+
+	disableWT := false
+	snap, stream, err := mgr.StartMission(ctx, MissionRequest{
+		WorkspaceID:  ws.ID,
+		WorkflowID:   "shared-board",
+		Topology:     TopoSharedBoard,
+		Goal:         "Exercise >3 productive rounds then converge on default max_idle_rounds=3",
+		UseWorktrees: &disableWT,
+	})
+	if err != nil {
+		t.Fatalf("StartMission(shared-board default): %v", err)
+	}
+	_ = collectMissionEvents(stream)
+
+	finalSnap, err := mgr.GetMission(ws.ID, snap.ID)
+	if err != nil {
+		t.Fatalf("GetMission: %v", err)
+	}
+	if finalSnap.Status != MissionCompleted {
+		t.Fatalf("expected shared-board completed after >3 productive rounds, got status=%q err=%q", finalSnap.Status, finalSnap.Error)
+	}
+	if !strings.Contains(finalSnap.Summary, "max_idle_rounds reached (3)") {
+		t.Fatalf("expected convergence via max_idle_rounds reached (3), got summary=%q", finalSnap.Summary)
+	}
+
+	// 2. Explicit MaxRounds = 1 while 4 tasks exist for 2 workers leaves 2 open tasks -> must fail (incomplete convergence)!
+	incSnap, incStream, err := mgr.StartMission(ctx, MissionRequest{
+		WorkspaceID:  ws.ID,
+		WorkflowID:   "shared-board",
+		Topology:     TopoSharedBoard,
+		Goal:         "Cap at MaxRounds=1 with remaining open tasks",
+		MaxRounds:    1,
+		UseWorktrees: &disableWT,
+	})
+	if err != nil {
+		t.Fatalf("StartMission(shared-board MaxRounds=1): %v", err)
+	}
+	_ = collectMissionEvents(incStream)
+
+	incFinal, err := mgr.GetMission(ws.ID, incSnap.ID)
+	if err != nil {
+		t.Fatalf("GetMission(incomplete): %v", err)
+	}
+	if incFinal.Status != MissionFailed || !strings.Contains(incFinal.Error, "unfinished") {
+		t.Fatalf("expected MissionFailed for incomplete convergence at MaxRounds=1, got status=%q err=%q", incFinal.Status, incFinal.Error)
+	}
+}
+
+func TestParseVerifierVerdictMarkdownEmphasisAndFailClosed(t *testing.T) {
+	cases := []struct {
+		name string
+		raw  string
+		want bool
+	}{
+		{
+			name: "markdown bold fail after prose mentioning pass",
+			raw:  "Unit tests pass, but error handling is unsafe.\n**VERDICT**: **FAIL**",
+			want: false,
+		},
+		{
+			name: "markdown list colon inside bold reject",
+			raw:  "- **VERDICT:** `REJECT` — race condition on map",
+			want: false,
+		},
+		{
+			name: "status italic failed",
+			raw:  "### Status: _failed_",
+			want: false,
+		},
+		{
+			name: "ambiguous commentary without explicit verdict fails closed",
+			raw:  "I reviewed the diff and left some observations on error wrapping.",
+			want: false,
+		},
+		{
+			name: "prose mentioning pass mid-sentence without verdict fails closed",
+			raw:  "Unit tests pass, please double check edge cases in parser.",
+			want: false,
+		},
+		{
+			name: "markdown bold accept",
+			raw:  "All invariants verified.\n**VERDICT**: **ACCEPT**",
+			want: true,
+		},
+		{
+			name: "heading backtick pass",
+			raw:  "### Verdict: `PASS`",
+			want: true,
+		},
+	}
+
+	for _, tc := range cases {
+		got, _ := parseVerifierVerdict(tc.raw)
+		if got != tc.want {
+			t.Fatalf("%s: parseVerifierVerdict(%q) = %v, want %v", tc.name, tc.raw, got, tc.want)
+		}
+	}
+}
+
+func TestWorktreeDiffUntrackedSymlinkZeroByteAndBinarySafety(t *testing.T) {
+	repoDir := initTestGitRepo(t)
+	outsideDir := t.TempDir()
+	secretFile := filepath.Join(outsideDir, "id_rsa")
+	if err := os.WriteFile(secretFile, []byte("TOP_SECRET_PRIVATE_KEY_MATERIAL\n"), 0o600); err != nil {
+		t.Fatalf("write secretFile: %v", err)
+	}
+
+	vaultDir := filepath.Join(t.TempDir(), "vault")
+	pool := NewWorktreePool(config.VaultPaths{Root: vaultDir})
+	ctx := context.Background()
+
+	lease, err := pool.Acquire(ctx, repoDir, "msn-diff-sec", "coder_1", "main")
+	if err != nil {
+		t.Fatalf("Acquire worktree: %v", err)
+	}
+	defer func() { _ = pool.Release(ctx, lease, true) }()
+
+	// 1. Untracked symlink pointing to outside secret file
+	if err := os.Symlink(secretFile, filepath.Join(lease.Path, "stolen_key.pem")); err != nil {
+		t.Fatalf("symlink file: %v", err)
+	}
+	// 2. Untracked symlinked directory pointing outside
+	if err := os.Symlink(outsideDir, filepath.Join(lease.Path, "linked_outside")); err != nil {
+		t.Fatalf("symlink dir: %v", err)
+	}
+	// 3. 0-byte empty untracked file
+	if err := os.WriteFile(filepath.Join(lease.Path, "empty.txt"), nil, 0o644); err != nil {
+		t.Fatalf("write empty.txt: %v", err)
+	}
+	// 4. Binary untracked file containing NUL bytes
+	if err := os.WriteFile(filepath.Join(lease.Path, "icon.bin"), []byte{0x89, 0x50, 0x00, 0x47}, 0o644); err != nil {
+		t.Fatalf("write icon.bin: %v", err)
+	}
+
+	diffOut, err := pool.Diff(ctx, lease.Path, "main")
+	if err != nil {
+		t.Fatalf("pool.Diff: %v", err)
+	}
+
+	if strings.Contains(diffOut, "TOP_SECRET_PRIVATE_KEY_MATERIAL") {
+		t.Fatalf("SECURITY VIOLATION: untracked symlink leaked target file contents into diff:\n%s", diffOut)
+	}
+	if !strings.Contains(diffOut, "new file mode 120000") {
+		t.Fatalf("expected symlink mode 120000 header without target file body, got:\n%s", diffOut)
+	}
+	// Empty file must NOT emit a spurious @@ -0,0 +1,1 @@ hunk!
+	emptySection := "diff --git a/empty.txt b/empty.txt\nnew file mode 100644\n"
+	if !strings.Contains(diffOut, emptySection) || strings.Contains(diffOut, "+++ b/empty.txt") {
+		t.Fatalf("expected clean 0-byte header for empty.txt without spurious hunk, got:\n%s", diffOut)
+	}
+	if !strings.Contains(diffOut, "Binary files /dev/null and b/icon.bin differ") {
+		t.Fatalf("expected binary notice for NUL-containing file icon.bin, got:\n%s", diffOut)
+	}
+}

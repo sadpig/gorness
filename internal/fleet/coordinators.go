@@ -12,11 +12,20 @@ import (
 )
 
 var (
-	reVerdictReject = regexp.MustCompile(`(?i)\b(?:verdict|status)\s*:\s*(reject|rejected|fail|failed)\b`)
-	reVerdictAccept = regexp.MustCompile(`(?i)\b(?:verdict|status)\s*:\s*(accept|accepted|pass|passed|approve|approved|lgtm)\b`)
-	reWordReject    = regexp.MustCompile(`(?i)\b(reject|rejected|check_failed)\b`)
-	reWordAccept    = regexp.MustCompile(`(?i)\b(accept|accepted|pass|passed|approve|approved|lgtm)\b`)
+	reVerdictReject    = regexp.MustCompile(`(?i)\b(?:verdict|status|decision|result)\s*:\s*(reject|rejected|fail|failed)\b`)
+	reVerdictAccept    = regexp.MustCompile(`(?i)\b(?:verdict|status|decision|result)\s*:\s*(accept|accepted|pass|passed|approve|approved|lgtm)\b`)
+	reWordReject       = regexp.MustCompile(`(?i)\b(reject|rejected|fail|failed|check_failed)\b`)
+	reStandaloneAccept = regexp.MustCompile(`(?i)^(?:accept|accepted|pass|passed|approve|approved|lgtm)(?:\b|[.!:,;\s—-]|$)`)
+	reMarkdownEmphasis = strings.NewReplacer("*", "", "_", "", "`", "", "~", "")
 )
+
+func stripMarkdownVerdictLine(line string) string {
+	s := reMarkdownEmphasis.Replace(line)
+	s = strings.TrimSpace(s)
+	s = strings.TrimLeft(s, "#>-+[] ")
+	s = strings.TrimRight(s, "[] ")
+	return strings.TrimSpace(s)
+}
 
 func parseVerifierVerdict(raw string) (accepted bool, feedback string) {
 	trimmed := strings.TrimSpace(raw)
@@ -24,22 +33,32 @@ func parseVerifierVerdict(raw string) (accepted bool, feedback string) {
 		return false, "empty verifier output"
 	}
 	lines := strings.Split(trimmed, "\n")
+	cleanedLines := make([]string, 0, len(lines))
 	for i := len(lines) - 1; i >= 0; i-- {
-		line := strings.TrimSpace(lines[i])
-		if reVerdictReject.MatchString(line) {
+		cleanLine := stripMarkdownVerdictLine(lines[i])
+		if cleanLine == "" {
+			continue
+		}
+		cleanedLines = append(cleanedLines, cleanLine)
+		if reVerdictReject.MatchString(cleanLine) {
 			return false, trimmed
 		}
-		if reVerdictAccept.MatchString(line) {
+		if reVerdictAccept.MatchString(cleanLine) {
 			return true, trimmed
 		}
 	}
-	if reWordReject.MatchString(trimmed) {
+
+	cleanedAll := reMarkdownEmphasis.Replace(trimmed)
+	if reWordReject.MatchString(cleanedAll) {
 		return false, trimmed
 	}
-	if reWordAccept.MatchString(trimmed) {
-		return true, trimmed
+	for _, cleanLine := range cleanedLines {
+		if reStandaloneAccept.MatchString(cleanLine) {
+			return true, trimmed
+		}
 	}
-	return true, trimmed
+	// 对抗验证官默认拒绝（fail-closed）：未给出明确通过裁决一律视为未通过
+	return false, trimmed
 }
 
 func parseStructuredDirectiveLines(text, prefix string) []string {
@@ -613,97 +632,97 @@ func (rt *missionRuntime) runSharedBoard(ctx context.Context) error {
 			wg.Add(1)
 			go func() {
 				defer wg.Done()
-				for {
-					if ctx.Err() != nil {
-						return
-					}
-					claimed, won, cErr := rt.bb.ClaimNextOpenTask(worker.ID, "")
-					if cErr != nil {
-						errCh <- cErr
-						return
-					}
-					if !won || claimed == nil {
-						return
-					}
-					roundProgressed.Store(true)
-					rt.syncBlackboardState(EventTaskUpdated, worker.ID, claimed.ID, fmt.Sprintf("%s claimed %s", worker.ID, claimed.ID))
-
-					select {
-					case sem <- struct{}{}:
-					case <-ctx.Done():
-						errCh <- ctx.Err()
-						return
-					}
-
-					_, taskBody, _ := rt.bb.GetTaskWithBody(claimed.ID)
-					var lease *WorktreeLease
-					wtPath := ""
-					if rt.shouldUseWorktree(worker.ID) {
-						l, lErr := rt.acquireNodeWorktree(ctx, worker.ID, worker.ID)
-						if lErr != nil {
-							<-sem
-							errCh <- lErr
-							return
-						}
-						lease = l
-						wtPath = l.Path
-					}
-
-					workerPrompt := fmt.Sprintf(
-						"Shared Blackboard Task [id=%s, depth=%d, max_depth=%d, node=%s]:\nTitle: %s\nDetails: %s\nMission Goal: %s\nIf this task should be decomposed further (and depth < %d), reply with `SPLIT_TASK: <subtask>` lines; otherwise implement/complete it.",
-						claimed.ID, claimed.Depth, MaxTaskSplitDepth, worker.ID, claimed.Title, taskBody, rt.snap.Goal, MaxTaskSplitDepth,
-					)
-					wOut, wErr := rt.runNode(ctx, worker.ID, workerPrompt, wtPath, nil)
-					<-sem
-					if wErr != nil {
-						if lease != nil {
-							rt.releaseWorktree(context.Background(), worker.ID, lease, true)
-						}
-						errCh <- wErr
-						return
-					}
-
-					splitDirectives := parseStructuredDirectiveLines(wOut.FinalText, "SPLIT_TASK:")
-					if len(splitDirectives) > 0 && claimed.Depth < MaxTaskSplitDepth {
-						specs := make([]SubtaskSpec, len(splitDirectives))
-						for idx, st := range splitDirectives {
-							specs[idx] = SubtaskSpec{
-								ID:          fmt.Sprintf("%s-%d", claimed.ID, idx+1),
-								Title:       st,
-								Description: rt.snap.Goal,
-							}
-						}
-						if _, sErr := rt.bb.SplitTask(claimed.ID, worker.ID, specs); sErr == nil {
-							if lease != nil {
-								rt.releaseWorktree(ctx, worker.ID, lease, true)
-							}
-							_, _ = rt.recordNote(worker.ID, "Split "+claimed.ID, wOut.FinalText)
-							rt.syncBlackboardState(EventTaskUpdated, worker.ID, claimed.ID, fmt.Sprintf("split %s into %d subtasks", claimed.ID, len(specs)))
-							continue
-						}
-					}
-
-					_, _ = rt.recordNote(worker.ID, "Completed "+claimed.ID, wOut.FinalText)
-					landedSHA := ""
-					if lease != nil {
-						if verifier != nil {
-							rt.pulseEdge(worker.ID, verifier.ID, "land "+claimed.ID)
-						}
-						landRes, lErr := rt.verifyAndMaybeLand(ctx, worker.ID, verifier, lease, fmt.Sprintf("feat(board): %s complete %s", worker.ID, claimed.ID))
-						rt.releaseWorktree(ctx, worker.ID, lease, true)
-						if lErr != nil {
-							errCh <- lErr
-							return
-						}
-						if !landRes.Accepted {
-							errCh <- fmt.Errorf("shared-board refinery rejected %s (%s): %s", claimed.ID, worker.ID, landRes.Reason)
-							return
-						}
-						landedSHA = landRes.LandedCommit
-					}
-					_, _ = rt.bb.CompleteTask(claimed.ID, worker.ID, landedSHA)
-					rt.syncBlackboardState(EventTaskUpdated, worker.ID, claimed.ID, "completed "+claimed.ID)
+				if ctx.Err() != nil {
+					return
 				}
+				claimed, won, cErr := rt.bb.ClaimNextOpenTask(worker.ID, "")
+				if cErr != nil {
+					errCh <- cErr
+					return
+				}
+				if !won || claimed == nil {
+					return
+				}
+				roundProgressed.Store(true)
+				rt.syncBlackboardState(EventTaskUpdated, worker.ID, claimed.ID, fmt.Sprintf("%s claimed %s", worker.ID, claimed.ID))
+
+				select {
+				case sem <- struct{}{}:
+				case <-ctx.Done():
+					errCh <- ctx.Err()
+					return
+				}
+
+				_, taskBody, _ := rt.bb.GetTaskWithBody(claimed.ID)
+				var lease *WorktreeLease
+				wtPath := ""
+				if rt.shouldUseWorktree(worker.ID) {
+					l, lErr := rt.acquireNodeWorktree(ctx, worker.ID, worker.ID)
+					if lErr != nil {
+						<-sem
+						errCh <- lErr
+						return
+					}
+					lease = l
+					wtPath = l.Path
+				}
+
+				workerPrompt := fmt.Sprintf(
+					"Shared Blackboard Task [id=%s, depth=%d, max_depth=%d, node=%s]:\nTitle: %s\nDetails: %s\nMission Goal: %s\nIf this task should be decomposed further (and depth < %d), reply with `SPLIT_TASK: <subtask>` lines; otherwise implement/complete it.",
+					claimed.ID, claimed.Depth, MaxTaskSplitDepth, worker.ID, claimed.Title, taskBody, rt.snap.Goal, MaxTaskSplitDepth,
+				)
+				wOut, wErr := rt.runNode(ctx, worker.ID, workerPrompt, wtPath, nil)
+				<-sem
+				if wErr != nil {
+					if lease != nil {
+						rt.releaseWorktree(context.Background(), worker.ID, lease, true)
+					}
+					errCh <- wErr
+					return
+				}
+
+				splitDirectives := parseStructuredDirectiveLines(wOut.FinalText, "SPLIT_TASK:")
+				if len(splitDirectives) > 0 && claimed.Depth < MaxTaskSplitDepth {
+					specs := make([]SubtaskSpec, len(splitDirectives))
+					for idx, st := range splitDirectives {
+						specs[idx] = SubtaskSpec{
+							ID:          fmt.Sprintf("%s-%d", claimed.ID, idx+1),
+							Title:       st,
+							Description: rt.snap.Goal,
+						}
+					}
+					if _, sErr := rt.bb.SplitTask(claimed.ID, worker.ID, specs); sErr == nil {
+						if lease != nil {
+							rt.releaseWorktree(ctx, worker.ID, lease, true)
+						}
+						_, _ = rt.recordNote(worker.ID, "Split "+claimed.ID, wOut.FinalText)
+						rt.syncBlackboardState(EventTaskUpdated, worker.ID, claimed.ID, fmt.Sprintf("split %s into %d subtasks", claimed.ID, len(specs)))
+						return
+					}
+				}
+
+				_, _ = rt.recordNote(worker.ID, "Completed "+claimed.ID, wOut.FinalText)
+				landedSHA := ""
+				if lease != nil || verifier != nil || strings.TrimSpace(rt.verifyCommand) != "" {
+					if verifier != nil {
+						rt.pulseEdge(worker.ID, verifier.ID, "land "+claimed.ID)
+					}
+					landRes, lErr := rt.verifyAndMaybeLand(ctx, worker.ID, verifier, lease, fmt.Sprintf("feat(board): %s complete %s", worker.ID, claimed.ID))
+					if lease != nil {
+						rt.releaseWorktree(ctx, worker.ID, lease, true)
+					}
+					if lErr != nil {
+						errCh <- lErr
+						return
+					}
+					if !landRes.Accepted {
+						errCh <- fmt.Errorf("shared-board refinery rejected %s (%s): %s", claimed.ID, worker.ID, landRes.Reason)
+						return
+					}
+					landedSHA = landRes.LandedCommit
+				}
+				_, _ = rt.bb.CompleteTask(claimed.ID, worker.ID, landedSHA)
+				rt.syncBlackboardState(EventTaskUpdated, worker.ID, claimed.ID, "completed "+claimed.ID)
 			}()
 		}
 
@@ -718,10 +737,26 @@ func (rt *missionRuntime) runSharedBoard(ctx context.Context) error {
 		halt, reason := guard.ObserveRound(roundProgressed.Load())
 		if halt {
 			tasks, _ := rt.bb.ListTasks()
+			unfinished := countUnfinishedBoardTasks(tasks)
+			if unfinished > 0 {
+				return fmt.Errorf("shared-board halted (%s) before convergence: %d task(s) remain unfinished", reason, unfinished)
+			}
 			rt.setSummary(fmt.Sprintf("Shared blackboard converged (%s) with %d total tasks.", reason, len(tasks)))
 			return nil
 		}
 	}
+}
+
+func countUnfinishedBoardTasks(tasks []BlackboardTask) int {
+	n := 0
+	for _, t := range tasks {
+		switch t.Status {
+		case TaskCompleted, TaskMerged, TaskSplit:
+		default:
+			n++
+		}
+	}
+	return n
 }
 
 // 6. TopoHybridFleet: 默认旗舰混合舰队（Lead 架构拆解 -> Explorer 并发侦察 -> Worktree Coder 隔离实现 -> Verifier 对抗门控合入）

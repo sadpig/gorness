@@ -213,20 +213,78 @@ func (p *WorktreePool) Diff(ctx context.Context, wtPath, baseRef string) (string
 		}
 	}
 	for _, rel := range untracked {
-		raw, rErr := os.ReadFile(filepath.Join(wtPath, filepath.FromSlash(rel)))
-		if rErr != nil {
-			continue
-		}
-		fmt.Fprintf(&buf, "diff --git a/%s b/%s\nnew file mode 100644\n--- /dev/null\n+++ b/%s\n", rel, rel, rel)
-		lines := strings.Split(strings.TrimRight(string(raw), "\n"), "\n")
-		fmt.Fprintf(&buf, "@@ -0,0 +1,%d @@\n", len(lines))
-		for _, l := range lines {
-			buf.WriteByte('+')
-			buf.WriteString(l)
-			buf.WriteByte('\n')
-		}
+		appendUntrackedFileDiff(&buf, wtPath, rel)
 	}
 	return buf.String(), nil
+}
+
+func appendUntrackedFileDiff(buf *strings.Builder, wtPath, rel string) {
+	cleanRel := filepath.ToSlash(strings.TrimPrefix(strings.TrimSpace(rel), "./"))
+	if cleanRel == "" || cleanRel == "." || cleanRel == ".." ||
+		strings.HasPrefix(cleanRel, "../") || strings.Contains(cleanRel, "/../") {
+		return
+	}
+	fullPath := filepath.Join(wtPath, filepath.FromSlash(cleanRel))
+	if err := ensureStrictSubpath(wtPath, fullPath); err != nil {
+		return
+	}
+
+	// 逐级 Lstat 校验中间目录，严禁穿过工作树内的符号链接目录跳出沙箱
+	segs := strings.Split(cleanRel, "/")
+	cur := wtPath
+	for i := 0; i < len(segs)-1; i++ {
+		cur = filepath.Join(cur, segs[i])
+		dirSt, err := os.Lstat(cur)
+		if err != nil || dirSt.Mode()&os.ModeSymlink != 0 || !dirSt.IsDir() {
+			return
+		}
+	}
+
+	st, err := os.Lstat(fullPath)
+	if err != nil {
+		return
+	}
+	if st.Mode()&os.ModeSymlink != 0 {
+		// 仅读取符号链接字面指向（Readlink），绝不跟随打开目标文件，防止窃取宿主机机密（如 ~/.ssh/id_rsa）
+		linkTarget, lErr := os.Readlink(fullPath)
+		if lErr != nil {
+			return
+		}
+		fmt.Fprintf(
+			buf,
+			"diff --git a/%s b/%s\nnew file mode 120000\n--- /dev/null\n+++ b/%s\n@@ -0,0 +1,1 @@\n+%s\n\\ No newline at end of file\n",
+			cleanRel, cleanRel, cleanRel, linkTarget,
+		)
+		return
+	}
+	if !st.Mode().IsRegular() {
+		return
+	}
+
+	raw, rErr := os.ReadFile(fullPath)
+	if rErr != nil {
+		return
+	}
+	if len(raw) == 0 {
+		fmt.Fprintf(buf, "diff --git a/%s b/%s\nnew file mode 100644\n", cleanRel, cleanRel)
+		return
+	}
+	if bytes.IndexByte(raw, 0) >= 0 {
+		fmt.Fprintf(buf, "diff --git a/%s b/%s\nnew file mode 100644\nBinary files /dev/null and b/%s differ\n", cleanRel, cleanRel, cleanRel)
+		return
+	}
+
+	text := strings.TrimSuffix(string(raw), "\n")
+	lines := strings.Split(text, "\n")
+	fmt.Fprintf(buf, "diff --git a/%s b/%s\nnew file mode 100644\n--- /dev/null\n+++ b/%s\n@@ -0,0 +1,%d @@\n", cleanRel, cleanRel, cleanRel, len(lines))
+	for _, l := range lines {
+		buf.WriteByte('+')
+		buf.WriteString(l)
+		buf.WriteByte('\n')
+	}
+	if !bytes.HasSuffix(raw, []byte("\n")) {
+		buf.WriteString("\\ No newline at end of file\n")
+	}
 }
 
 func (p *WorktreePool) Release(ctx context.Context, lease *WorktreeLease, deleteBranch bool) error {

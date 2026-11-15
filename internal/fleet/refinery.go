@@ -78,6 +78,89 @@ func (r *Refinery) RunVerify(
 	return r.seatbelt.Run(ctx, trimmed, workDir, sbMode, allowedDomains)
 }
 
+// VerifyInPlace 在未启用独立 Git Worktree（UseWorktrees=false 或非 Git 目录）时，
+// 通过与 Land 共享的互斥锁严格串行执行验收命令与 Verifier 盲审，杜绝多并发节点争抢同一 Verifier 会话（ErrSessionBusy）。
+func (r *Refinery) VerifyInPlace(ctx context.Context, nodeID, workDir string, isGitRepo bool, req LandRequest) (*LandResult, error) {
+	queueItem := strings.TrimSpace(nodeID)
+	if req.OnQueueEnter != nil && queueItem != "" {
+		req.OnQueueEnter(queueItem)
+	}
+	if req.OnQueueExit != nil && queueItem != "" {
+		defer req.OnQueueExit(queueItem)
+	}
+
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	if ctx.Err() != nil {
+		return nil, ctx.Err()
+	}
+
+	var diffText, diffStat string
+	if isGitRepo && r.pool != nil && strings.TrimSpace(workDir) != "" {
+		diffText, _ = r.pool.Diff(ctx, workDir, "")
+		diffStat, _ = r.pool.DiffStat(ctx, workDir, "")
+	}
+
+	var verifyOut string
+	if strings.TrimSpace(req.VerifyCommand) != "" {
+		vRes, vErr := r.RunVerify(ctx, req.VerifyCommand, workDir, req.SandboxMode, req.AllowedDomains)
+		verifyOut = strings.TrimSpace(vRes.Combined)
+		if vErr != nil {
+			if ctx.Err() != nil {
+				return nil, ctx.Err()
+			}
+			return &LandResult{
+				Accepted:     false,
+				Stage:        "verify",
+				Diff:         diffText,
+				DiffStat:     diffStat,
+				VerifyOutput: verifyOut,
+				Reason:       fmt.Sprintf("verify_command %q execution error: %v", req.VerifyCommand, vErr),
+			}, nil
+		}
+		if vRes.ExitCode != 0 {
+			return &LandResult{
+				Accepted:     false,
+				Stage:        "verify",
+				Diff:         diffText,
+				DiffStat:     diffStat,
+				VerifyOutput: verifyOut,
+				Reason:       fmt.Sprintf("verify_command %q exited with code %d:\n%s", req.VerifyCommand, vRes.ExitCode, verifyOut),
+			}, nil
+		}
+	}
+
+	var reviewNotes string
+	if req.BlindReview != nil {
+		accepted, feedback, bErr := req.BlindReview(ctx, diffText, verifyOut)
+		if bErr != nil {
+			return nil, bErr
+		}
+		reviewNotes = strings.TrimSpace(feedback)
+		if !accepted {
+			return &LandResult{
+				Accepted:     false,
+				Stage:        "verifier",
+				Diff:         diffText,
+				DiffStat:     diffStat,
+				VerifyOutput: verifyOut,
+				ReviewNotes:  reviewNotes,
+				Reason:       reviewNotes,
+			}, nil
+		}
+	}
+
+	return &LandResult{
+		Accepted:     true,
+		Stage:        "landed",
+		Diff:         diffText,
+		DiffStat:     diffStat,
+		VerifyOutput: verifyOut,
+		ReviewNotes:  reviewNotes,
+	}, nil
+}
+
 func (r *Refinery) Land(ctx context.Context, req LandRequest) (*LandResult, error) {
 	if req.Lease == nil {
 		return nil, errors.New("refinery: nil WorktreeLease")
