@@ -889,3 +889,428 @@ func TestTimersAndDreamerCandidateSkill(t *testing.T) {
 		t.Fatalf("expected model set_followup tool to persist enabled followup timer, got %+v", svc.StateSnapshot().Timers)
 	}
 }
+
+func TestSessionBusyBackoffNoSpinAndNoHeadOfLineStarvation(t *testing.T) {
+	var siblingDone atomic.Bool
+	var busyCompleted atomic.Bool
+
+	env := setupAlwaysOnEnv(t, 10, &scriptedStreamer{
+		fn: func(ctx context.Context, req llm.Request) (<-chan llm.StreamEvent, error) {
+			if strings.Contains(req.StaticSystem, "Housekeeping Utility") {
+				return makeTextStream("Session Busy Test"), nil
+			}
+			prompt := lastPromptText(req)
+			if strings.Contains(prompt, "ready-sibling-task") {
+				siblingDone.Store(true)
+				return makeTextStream("Sibling finished cleanly."), nil
+			}
+			busyCompleted.Store(true)
+			return makeTextStream("Busy session resumed and finished."), nil
+		},
+	})
+
+	busySess, err := env.engine.Sessions().Create(env.ws.ID, "Interactive Active Session", "coder")
+	if err != nil {
+		t.Fatalf("Create busySess: %v", err)
+	}
+
+	// Simulate an active interactive run holding the target session's TryFlock lock.
+	unlockBusy, ok, err := store.TryFlock(env.engine.Sessions().RunLockPath(busySess.ID))
+	if err != nil || !ok {
+		t.Fatalf("TryFlock busySess: ok=%v err=%v", ok, err)
+	}
+	released := false
+	defer func() {
+		if !released {
+			unlockBusy()
+		}
+	}()
+
+	svc, err := NewService(ServiceOptions{
+		Config:       env.cfgMgr,
+		Engine:       env.engine,
+		Notifier:     env.notifier,
+		TickInterval: 25 * time.Millisecond,
+		RetryBackoff: 80 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatalf("NewService: %v", err)
+	}
+
+	// Enqueue both a high-priority deferred_resume and a regular event targeting busySess,
+	// followed by a ready sibling event on another InboxKey.
+	resumeJSON, _ := json.Marshal(core.DeferredResume{
+		DeferredID: "def_busy_1",
+		ToolCallID: "call_noop",
+		ToolName:   "read_file",
+		Args:       json.RawMessage(`{"path":"."}`),
+		Approved:   false,
+	})
+	if _, err := svc.Enqueue(InboxEvent{
+		ID:          "ev_busy_resume",
+		InboxKey:    "resume:" + env.ws.ID + ":def_busy_1",
+		Source:      SourceDeferredResume,
+		SourceID:    "def_busy_1",
+		WorkspaceID: env.ws.ID,
+		SessionID:   busySess.ID,
+		Payload:     map[string]any{"resume_approval_json": string(resumeJSON)},
+		CreatedAt:   time.Now().UTC().Add(-time.Second),
+	}); err != nil {
+		t.Fatalf("Enqueue ev_busy_resume: %v", err)
+	}
+
+	if _, err := svc.Enqueue(InboxEvent{
+		ID:          "ev_busy_regular",
+		InboxKey:    env.ws.ID + ":" + busySess.ID,
+		Source:      "webhook",
+		SourceID:    "busy-reg-1",
+		WorkspaceID: env.ws.ID,
+		SessionID:   busySess.ID,
+		Payload:     map[string]any{"text": "follow-up-on-busy-session"},
+		CreatedAt:   time.Now().UTC().Add(-time.Second),
+	}); err != nil {
+		t.Fatalf("Enqueue ev_busy_regular: %v", err)
+	}
+
+	if _, err := svc.Enqueue(InboxEvent{
+		ID:          "ev_ready_sibling",
+		InboxKey:    env.ws.ID + ":sibling",
+		Source:      "webhook",
+		SourceID:    "sib-1",
+		WorkspaceID: env.ws.ID,
+		Payload:     map[string]any{"text": "ready-sibling-task"},
+		CreatedAt:   time.Now().UTC().Add(-time.Second),
+	}); err != nil {
+		t.Fatalf("Enqueue ev_ready_sibling: %v", err)
+	}
+
+	// 1. Deterministic cooldown verification on inboxStore (zero wall-clock jitter):
+	baseNow := time.Date(2026, 11, 16, 12, 0, 0, 0, time.UTC)
+	probeInbox := newInboxStore(config.VaultPaths{Root: filepath.Join(t.TempDir(), "probe-vault")})
+	if _, _, err := probeInbox.enqueue(InboxEvent{
+		ID:          "probe_resume",
+		Source:      SourceDeferredResume,
+		SourceID:    "probe_def_1",
+		WorkspaceID: env.ws.ID,
+		SessionID:   busySess.ID,
+		CreatedAt:   baseNow.Add(-time.Second),
+	}, baseNow); err != nil {
+		t.Fatalf("probe enqueue: %v", err)
+	}
+	claimedProbe, _, err := probeInbox.claimNextBatch(baseNow, 10*time.Millisecond, 500*time.Millisecond)
+	if err != nil || len(claimedProbe) != 1 {
+		t.Fatalf("expected initial claim of probe_resume, got len=%d err=%v", len(claimedProbe), err)
+	}
+	if err := probeInbox.requeueBusyBatch([]string{"probe_resume"}, 500*time.Millisecond, baseNow); err != nil {
+		t.Fatalf("probe requeueBusyBatch: %v", err)
+	}
+	claimedDuringCooldown, nextWake, err := probeInbox.claimNextBatch(baseNow.Add(100*time.Millisecond), 10*time.Millisecond, 500*time.Millisecond)
+	if err != nil {
+		t.Fatalf("probe claimNextBatch during cooldown: %v", err)
+	}
+	if len(claimedDuringCooldown) != 0 || nextWake != 400*time.Millisecond {
+		t.Fatalf("expected cooldown to block claim (claimed=0, nextWake=400ms), got claimed=%d nextWake=%s", len(claimedDuringCooldown), nextWake)
+	}
+	claimedAfterCooldown, _, err := probeInbox.claimNextBatch(baseNow.Add(500*time.Millisecond), 10*time.Millisecond, 500*time.Millisecond)
+	if err != nil || len(claimedAfterCooldown) != 1 || claimedAfterCooldown[0].Attempts != 1 {
+		t.Fatalf("expected claim after cooldown with Attempts=1, got %+v err=%v", claimedAfterCooldown, err)
+	}
+
+	// 2. Live worker verification: sibling key runs immediately without head-of-line starvation or unthrottled spin!
+	ctx, cancel := context.WithCancel(context.Background())
+	defer func() {
+		cancel()
+		_ = svc.Close()
+	}()
+	if err := svc.Start(ctx); err != nil {
+		t.Fatalf("svc.Start: %v", err)
+	}
+
+	waitForCondition(t, 2*time.Second, "ready sibling key to complete while earlier session is busy", func() bool {
+		return siblingDone.Load()
+	})
+
+	// Hold busySess for 120ms with RetryBackoff=80ms: Attempts must remain 0 (not burning retries or spinning).
+	time.Sleep(120 * time.Millisecond)
+	for _, item := range svc.StateSnapshot().Inbox {
+		if (item.ID == "ev_busy_resume" || item.ID == "ev_busy_regular") && item.Status == StatusFailed {
+			t.Fatalf("busy session contention must not fail item %s: %+v", item.ID, item)
+		}
+	}
+
+	// Release the interactive session lock -> cooled-down items must wake and complete with Attempts == 1.
+	unlockBusy()
+	released = true
+
+	waitForCondition(t, 3*time.Second, "cooled-down busy events to complete after session lock release", func() bool {
+		snap := svc.StateSnapshot()
+		doneCnt := 0
+		for _, item := range snap.Inbox {
+			if (item.ID == "ev_busy_resume" || item.ID == "ev_busy_regular") && item.Status == StatusDone && item.Attempts == 1 {
+				doneCnt++
+			}
+		}
+		return doneCnt == 2 && busyCompleted.Load()
+	})
+}
+
+func TestReportedDeduplicationWorkspaceScopeAndPrefixBoundary(t *testing.T) {
+	env := setupAlwaysOnEnv(t, 20, &scriptedStreamer{
+		fn: func(ctx context.Context, req llm.Request) (<-chan llm.StreamEvent, error) {
+			return makeTextStream("ok"), nil
+		},
+	})
+
+	wsBetaDir := t.TempDir()
+	wsBeta, err := env.engine.Workspaces().Register(wsBetaDir, "project-beta")
+	if err != nil {
+		t.Fatalf("Register wsBeta: %v", err)
+	}
+
+	mem := newMemoryStore(env.cfgMgr.Paths())
+	now := time.Now().UTC()
+
+	// 1. Initial alert in wsAlpha -> recorded (already == false).
+	already, err := mem.checkAndRecordReported(env.ws.ID, "Disk Alert", "Disk full on host-10", now)
+	if err != nil || already {
+		t.Fatalf("expected initial alert in wsAlpha to be new, got already=%v err=%v", already, err)
+	}
+
+	// 2. Exact repeat in wsAlpha -> suppressed (already == true).
+	already, err = mem.checkAndRecordReported(env.ws.ID, "Disk Alert", "Disk full on host-10", now)
+	if err != nil || !already {
+		t.Fatalf("expected repeat alert in wsAlpha to be suppressed, got already=%v err=%v", already, err)
+	}
+
+	// 3. Identical (title, body) in wsBeta -> MUST NOT be suppressed across workspaces!
+	already, err = mem.checkAndRecordReported(wsBeta.ID, "Disk Alert", "Disk full on host-10", now)
+	if err != nil || already {
+		t.Fatalf("expected identical alert in distinct workspace wsBeta NOT to be suppressed, got already=%v err=%v", already, err)
+	}
+
+	// 4. Shorter body that is a prefix of "Disk full on host-10" in wsAlpha -> MUST NOT false-match!
+	already, err = mem.checkAndRecordReported(env.ws.ID, "Disk Alert", "Disk full on host-1", now)
+	if err != nil || already {
+		t.Fatalf("expected prefix body 'Disk full on host-1' NOT to collide with 'Disk full on host-10', got already=%v err=%v", already, err)
+	}
+
+	// 5. Hand-edited line without [fp:...] in REPORTED.md must respect [ws:...] and full-line boundary.
+	rawRep, err := os.ReadFile(mem.reportedPath())
+	if err != nil {
+		t.Fatalf("read REPORTED.md: %v", err)
+	}
+	handEdited := string(rawRep) + "- [ws:" + env.ws.ID + "] **PR Triage**: Needs review on PR #123\n"
+	if err := store.AtomicWriteFile(mem.reportedPath(), []byte(handEdited), 0o600); err != nil {
+		t.Fatalf("write hand-edited REPORTED.md: %v", err)
+	}
+
+	if already, err := mem.checkAndRecordReported(env.ws.ID, "PR Triage", "Needs review on PR #12", now); err != nil || already {
+		t.Fatalf("expected hand-edited PR #123 NOT to suppress PR #12, got already=%v err=%v", already, err)
+	}
+	if already, err := mem.checkAndRecordReported(wsBeta.ID, "PR Triage", "Needs review on PR #123", now); err != nil || already {
+		t.Fatalf("expected wsAlpha hand-edited line NOT to suppress wsBeta, got already=%v err=%v", already, err)
+	}
+	if already, err := mem.checkAndRecordReported(env.ws.ID, "PR Triage", "Needs review on PR #123", now); err != nil || !already {
+		t.Fatalf("expected exact wsAlpha hand-edited line to suppress exact repeat, got already=%v err=%v", already, err)
+	}
+}
+
+func TestFailedMultiStepAutoSessionPreservesAuditAndFollowUp(t *testing.T) {
+	var firstRunFailed atomic.Bool
+
+	env := setupAlwaysOnEnv(t, 15, &scriptedStreamer{
+		fn: func(ctx context.Context, req llm.Request) (<-chan llm.StreamEvent, error) {
+			if strings.Contains(req.StaticSystem, "Housekeeping Utility") {
+				return makeTextStream("Canary Monitor"), nil
+			}
+			// Step 3 after both notify_user and set_followup ran: fail on attempt #1 (including fallback), succeed on attempt #2!
+			if _, hasFollowUp := hasToolResultInHistory(req, "set_followup"); hasFollowUp {
+				if !firstRunFailed.Load() {
+					return makeErrorStream(&llm.APIError{
+						ProviderID: req.Provider.ID,
+						StatusCode: 400,
+						Message:    "simulated step-3 failure after side effects",
+						Retryable:  false,
+					}), nil
+				}
+				return makeTextStream("Recovered cleanly on retry."), nil
+			}
+			// Step 2: schedule a follow-up referencing this auto-created session.
+			if _, hasNotify := hasToolResultInHistory(req, "notify_user"); hasNotify {
+				return makeToolCallStream("call_fup_audit", "set_followup", map[string]any{
+					"after_seconds": 120,
+					"note":          "verify canary rollback",
+				}), nil
+			}
+			// Step 1: emit an alert to Outbox.
+			return makeToolCallStream("call_notify_audit", "notify_user", map[string]any{
+				"title": "Canary Error Spike",
+				"body":  "5xx rate exceeded 2% threshold",
+			}), nil
+		},
+	})
+
+	evCh, unsub := env.engine.SubscribeGlobal()
+	defer unsub()
+	go func() {
+		for ev := range evCh {
+			if ev.Type == core.EventRunFailed {
+				firstRunFailed.Store(true)
+			}
+		}
+	}()
+
+	svc, err := NewService(ServiceOptions{
+		Config:       env.cfgMgr,
+		Engine:       env.engine,
+		Notifier:     env.notifier,
+		TickInterval: 15 * time.Millisecond,
+		RetryBackoff: 20 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatalf("NewService: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer func() {
+		cancel()
+		_ = svc.Close()
+	}()
+	if err := svc.Start(ctx); err != nil {
+		t.Fatalf("svc.Start: %v", err)
+	}
+
+	if _, err := svc.Enqueue(InboxEvent{
+		ID:          "ev_multistep_fail",
+		Source:      "webhook",
+		SourceID:    "ms-1",
+		WorkspaceID: env.ws.ID,
+		Payload:     map[string]any{"text": "check canary health"},
+	}); err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+
+	waitForCondition(t, 4*time.Second, "event to fail attempt 1 after side effects and succeed on attempt 2", func() bool {
+		snap := svc.StateSnapshot()
+		for _, item := range snap.Inbox {
+			if item.ID == "ev_multistep_fail" && item.Status == StatusDone && item.Attempts == 2 {
+				return true
+			}
+		}
+		return false
+	})
+
+	snap := svc.StateSnapshot()
+	if len(snap.Outbox) == 0 {
+		t.Fatalf("expected Outbox entry from attempt 1")
+	}
+	attempt1SessionID := snap.Outbox[0].SessionID
+	if attempt1SessionID == "" {
+		t.Fatalf("expected non-empty SessionID in Outbox")
+	}
+
+	// Attempt 1's auto-created session MUST still exist on disk with its audit transcript and valid follow-up reference!
+	if _, err := env.engine.Sessions().GetMeta(attempt1SessionID); err != nil {
+		t.Fatalf("expected failed multi-step session %s to be preserved for audit & follow-up, got error: %v", attempt1SessionID, err)
+	}
+	branch, err := env.engine.Sessions().LoadActiveBranch(attempt1SessionID)
+	if err != nil || len(branch) < 3 {
+		t.Fatalf("expected preserved forensic branch in %s, got len=%d err=%v", attempt1SessionID, len(branch), err)
+	}
+
+	foundTimerRef := false
+	for _, tm := range snap.Timers {
+		if tm.SessionID == attempt1SessionID {
+			foundTimerRef = true
+			break
+		}
+	}
+	if !foundTimerRef {
+		t.Fatalf("expected set_followup timer referencing preserved session %s, got %+v", attempt1SessionID, snap.Timers)
+	}
+}
+
+func TestResolveDeferredEnqueueBeforeRemoveAndDreamPassWorkspaceValidation(t *testing.T) {
+	env := setupAlwaysOnEnv(t, 20, &scriptedStreamer{
+		fn: func(ctx context.Context, req llm.Request) (<-chan llm.StreamEvent, error) {
+			return makeTextStream("---\nname: safe-dream\ndescription: Validated dream pass.\n---\n\n# Safe Dream\n"), nil
+		},
+	})
+
+	svc, err := NewService(ServiceOptions{
+		Config:   env.cfgMgr,
+		Engine:   env.engine,
+		Notifier: env.notifier,
+	})
+	if err != nil {
+		t.Fatalf("NewService: %v", err)
+	}
+
+	// Part A: If Inbox enqueue fails during ResolveDeferred, the pending deferred card must NOT be deleted!
+	sess, err := env.engine.Sessions().Create(env.ws.ID, "Deferred Safety Session", "coder")
+	if err != nil {
+		t.Fatalf("Create session: %v", err)
+	}
+	card, err := svc.persistDeferredCard(core.DeferredToolPayload{
+		ID:          "def_safe_order_1",
+		RunID:       "run_1",
+		WorkspaceID: env.ws.ID,
+		SessionID:   sess.ID,
+		ToolCallID:  "call_1",
+		ToolName:    "run_command",
+		ReasonCode:  "risky-command",
+		Reason:      "requires confirmation",
+		Args:        json.RawMessage(`{"command":"git push"}`),
+	}, "coder")
+	if err != nil {
+		t.Fatalf("persistDeferredCard: %v", err)
+	}
+
+	// Block inbox.jsonl writes by placing a directory at inbox.jsonl path.
+	inboxJSONL := filepath.Join(env.cfgMgr.Paths().AlwaysOnDir(), "inbox.jsonl")
+	if err := os.MkdirAll(inboxJSONL, 0o700); err != nil {
+		t.Fatalf("mkdir blocker at inbox.jsonl: %v", err)
+	}
+
+	if err := svc.ResolveDeferred(card.ID, true, nil); err == nil {
+		t.Fatalf("expected ResolveDeferred to fail when inbox.jsonl cannot be written")
+	}
+
+	// Pending card MUST still be present in ListDeferred()!
+	pending, err := svc.ListDeferred()
+	if err != nil {
+		t.Fatalf("ListDeferred: %v", err)
+	}
+	if len(pending) != 1 || pending[0].ID != card.ID {
+		t.Fatalf("expected pending deferred card %s to survive failed Enqueue, got %+v", card.ID, pending)
+	}
+
+	// Remove blocker -> ResolveDeferred now succeeds cleanly!
+	if err := os.RemoveAll(inboxJSONL); err != nil {
+		t.Fatalf("remove blocker: %v", err)
+	}
+	if err := svc.ResolveDeferred(card.ID, true, nil); err != nil {
+		t.Fatalf("ResolveDeferred after restoring inbox: %v", err)
+	}
+	pendingAfter, err := svc.ListDeferred()
+	if err != nil || len(pendingAfter) != 0 {
+		t.Fatalf("expected 0 pending cards after successful ResolveDeferred, got %+v (err=%v)", pendingAfter, err)
+	}
+
+	// Part B: RunDreamPass and writeWorkspaceProgress must reject unknown or path-traversing wsIDs.
+	escapePath := filepath.Join(env.cfgMgr.Paths().Root, "escaped-progress")
+	if _, err := svc.RunDreamPass(context.Background(), "../../escaped-progress"); err == nil {
+		t.Fatalf("expected RunDreamPass to reject path-traversing wsID")
+	}
+	if _, err := os.Stat(escapePath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("path traversal escaped WorkspacesDir to %s", escapePath)
+	}
+
+	if _, err := svc.RunDreamPass(context.Background(), "missing-workspace-id"); !errors.Is(err, store.ErrWorkspaceNotFound) {
+		t.Fatalf("expected ErrWorkspaceNotFound for unknown wsID in RunDreamPass, got %v", err)
+	}
+
+	if _, err := svc.memory.writeWorkspaceProgress("../escaped", "dream-latest", "bad"); err == nil {
+		t.Fatalf("expected writeWorkspaceProgress to reject traversal wsID")
+	}
+}

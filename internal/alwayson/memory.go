@@ -42,12 +42,38 @@ func (m *memoryStore) notesDir() string {
 	return filepath.Join(m.paths.MemoryDir(), "notes")
 }
 
-func (m *memoryStore) workspaceMemoryDir(wsID string) string {
-	return filepath.Join(m.paths.WorkspacesDir(), wsID, "memory")
+func validateSafeWorkspaceID(wsID string) (string, error) {
+	trimmed := strings.TrimSpace(wsID)
+	if trimmed == "" || trimmed != wsID || wsID == "." || wsID == ".." {
+		return "", fmt.Errorf("%w: %q", store.ErrInvalidID, wsID)
+	}
+	for _, r := range wsID {
+		if r == '/' || r == '\\' || r < 0x20 || r == 0x7f {
+			return "", fmt.Errorf("%w: %q", store.ErrInvalidID, wsID)
+		}
+	}
+	return trimmed, nil
 }
 
-func (m *memoryStore) workspaceProgressDir(wsID string) string {
-	return filepath.Join(m.workspaceMemoryDir(wsID), "progress")
+func (m *memoryStore) workspaceMemoryDir(wsID string) (string, error) {
+	safeWS, err := validateSafeWorkspaceID(wsID)
+	if err != nil {
+		return "", err
+	}
+	wsRoot := filepath.Clean(m.paths.WorkspacesDir())
+	dir := filepath.Join(wsRoot, safeWS, "memory")
+	if !strings.HasPrefix(dir, wsRoot+string(filepath.Separator)) {
+		return "", fmt.Errorf("%w: workspace memory path escapes %s", store.ErrInvalidPath, wsRoot)
+	}
+	return dir, nil
+}
+
+func (m *memoryStore) workspaceProgressDir(wsID string) (string, error) {
+	memDir, err := m.workspaceMemoryDir(wsID)
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(memDir, "progress"), nil
 }
 
 // buildDynamicReminders 组装 Always-On 唤醒时的四层指针记忆摘要（INDEX.md、REPORTED.md 与项目专属 progress 指针）：
@@ -75,18 +101,19 @@ func (m *memoryStore) buildDynamicReminders(wsID string) []string {
 	}
 
 	if cleanWS := strings.TrimSpace(wsID); cleanWS != "" {
-		progDir := m.workspaceProgressDir(cleanWS)
-		if entries, err := os.ReadDir(progDir); err == nil && len(entries) > 0 {
-			var names []string
-			for _, ent := range entries {
-				if !ent.IsDir() && strings.HasSuffix(ent.Name(), ".md") {
-					names = append(names, ent.Name())
+		if progDir, pErr := m.workspaceProgressDir(cleanWS); pErr == nil {
+			if entries, err := os.ReadDir(progDir); err == nil && len(entries) > 0 {
+				var names []string
+				for _, ent := range entries {
+					if !ent.IsDir() && strings.HasSuffix(ent.Name(), ".md") {
+						names = append(names, ent.Name())
+					}
 				}
-			}
-			sort.Strings(names)
-			if len(names) > 0 {
-				sections = append(sections, fmt.Sprintf("<workspace_progress_pointers workspace=%q>\n%s\n</workspace_progress_pointers>",
-					cleanWS, strings.Join(names, "\n")))
+				sort.Strings(names)
+				if len(names) > 0 {
+					sections = append(sections, fmt.Sprintf("<workspace_progress_pointers workspace=%q>\n%s\n</workspace_progress_pointers>",
+						cleanWS, strings.Join(names, "\n")))
+				}
 			}
 		}
 	}
@@ -97,7 +124,11 @@ func (m *memoryStore) buildDynamicReminders(wsID string) []string {
 // checkAndRecordReported 在排他文件锁下检查 REPORTED.md 是否已播报过相同事项；
 // 若已播报则返回 alreadyReported=true 予以静默抑制；若为新发现则原子追加至 REPORTED.md。
 func (m *memoryStore) checkAndRecordReported(wsID, title, body string, now time.Time) (bool, error) {
-	fp := reportedFingerprint(wsID, title, body)
+	wsTag := strings.TrimSpace(wsID)
+	if wsTag == "" {
+		wsTag = "global"
+	}
+	fp := reportedFingerprint(wsTag, title, body)
 	fpMarker := "[fp:" + fp + "]"
 	oneLineTitle := collapseWhitespace(title)
 	oneLineBody := collapseWhitespace(body)
@@ -112,7 +143,7 @@ func (m *memoryStore) checkAndRecordReported(wsID, title, body string, now time.
 			return fmt.Errorf("read REPORTED.md: %w", err)
 		}
 
-		if strings.Contains(existing, fpMarker) || (oneLineTitle != "" && oneLineBody != "" && strings.Contains(existing, exactSignature)) {
+		if matchesReportedLedger(existing, wsTag, fpMarker, exactSignature) {
 			already = true
 			return nil
 		}
@@ -120,10 +151,6 @@ func (m *memoryStore) checkAndRecordReported(wsID, title, body string, now time.
 		var b strings.Builder
 		b.WriteString(strings.TrimRight(existing, "\n"))
 		b.WriteString("\n")
-		wsTag := strings.TrimSpace(wsID)
-		if wsTag == "" {
-			wsTag = "global"
-		}
 		fmt.Fprintf(&b, "- [%s] [ws:%s] %s %s\n",
 			now.UTC().Format(time.RFC3339),
 			wsTag,
@@ -133,6 +160,31 @@ func (m *memoryStore) checkAndRecordReported(wsID, title, body string, now time.
 		return store.AtomicWriteFile(m.reportedPath(), []byte(b.String()), 0o600)
 	})
 	return already, err
+}
+
+func matchesReportedLedger(existing, wsTag, fpMarker, exactSignature string) bool {
+	wantWSTag := "[ws:" + wsTag + "]"
+	for _, rawLine := range strings.Split(existing, "\n") {
+		line := strings.TrimSpace(rawLine)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		if strings.Contains(line, fpMarker) {
+			return true
+		}
+		// Support hand-edited lines without [fp:...]: enforce [ws:<wsTag>] scope (when [ws:...] is present)
+		// and exact full-line suffix boundary so prefixes never collide.
+		if !strings.Contains(line, "[fp:") && exactSignature != "****: " {
+			if strings.Contains(line, "[ws:") && !strings.Contains(line, wantWSTag) {
+				continue
+			}
+			normLine := collapseWhitespace(line)
+			if normLine == exactSignature || normLine == "- "+exactSignature || strings.HasSuffix(normLine, " "+exactSignature) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func (m *memoryStore) upsertNote(slug, title, summary, body string, now time.Time) (string, error) {
@@ -191,15 +243,15 @@ func (m *memoryStore) upsertNote(slug, title, summary, body string, now time.Tim
 }
 
 func (m *memoryStore) writeWorkspaceProgress(wsID, slug, content string) (string, error) {
-	cleanWS := strings.TrimSpace(wsID)
-	if cleanWS == "" {
-		return "", errors.New("workspace_id is required")
+	progDir, err := m.workspaceProgressDir(wsID)
+	if err != nil {
+		return "", err
 	}
 	safeSlug := sanitizeSlug(slug)
 	if safeSlug == "" {
 		safeSlug = "latest"
 	}
-	target := filepath.Join(m.workspaceProgressDir(cleanWS), safeSlug+".md")
+	target := filepath.Join(progDir, safeSlug+".md")
 	if err := store.AtomicWriteFile(target, []byte(strings.TrimSpace(content)+"\n"), 0o600); err != nil {
 		return "", err
 	}

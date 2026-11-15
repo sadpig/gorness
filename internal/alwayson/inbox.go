@@ -59,6 +59,7 @@ type inboxItemState struct {
 	Status      string    `toml:"status" json:"status"`
 	Attempts    int       `toml:"attempts" json:"attempts"`
 	LastError   string    `toml:"last_error,omitempty" json:"last_error,omitempty"`
+	NotBefore   time.Time `toml:"not_before,omitempty" json:"not_before,omitempty"`
 	CreatedAt   time.Time `toml:"created_at" json:"created_at"`
 	UpdatedAt   time.Time `toml:"updated_at" json:"updated_at"`
 }
@@ -71,6 +72,7 @@ type inboxStateDoc struct {
 type syncedInboxRecord struct {
 	event     InboxEvent
 	updatedAt time.Time
+	notBefore time.Time
 	lastError string
 }
 
@@ -112,6 +114,7 @@ func (s *inboxStore) recoverOnStart(now time.Time) ([]InboxEvent, error) {
 				} else {
 					records[i].event.Status = StatusQueued
 				}
+				records[i].notBefore = time.Time{}
 				records[i].updatedAt = now.UTC()
 			}
 		}
@@ -207,7 +210,20 @@ func (s *inboxStore) claimNextBatch(
 			}
 		}
 
-		// 1. High-priority pass: deferred_resume events bypass debounce.
+		var minWait time.Duration
+		haveWait := false
+		noteWait := func(readyAt time.Time) {
+			wait := readyAt.Sub(now)
+			if wait <= 0 {
+				return
+			}
+			if !haveWait || wait < minWait {
+				minWait = wait
+				haveWait = true
+			}
+		}
+
+		// 1. High-priority pass: deferred_resume events bypass debounce unless cooling down from ErrSessionBusy / retry.
 		for i := range records {
 			if records[i].event.Status != StatusQueued || records[i].event.Source != SourceDeferredResume {
 				continue
@@ -215,8 +231,13 @@ func (s *inboxStore) claimNextBatch(
 			if runningKeys[records[i].event.InboxKey] {
 				continue
 			}
+			if !records[i].notBefore.IsZero() && now.Before(records[i].notBefore) {
+				noteWait(records[i].notBefore)
+				continue
+			}
 			records[i].event.Status = StatusRunning
 			records[i].event.Attempts++
+			records[i].notBefore = time.Time{}
 			records[i].updatedAt = now.UTC()
 			if err := s.writeStateUnlocked(records, now); err != nil {
 				return err
@@ -227,18 +248,19 @@ func (s *inboxStore) claimNextBatch(
 
 		// 2. Group queued items by InboxKey preserving FIFO key discovery order.
 		type keyGroup struct {
-			key        string
-			indices    []int
-			firstAt    time.Time
-			latestAt   time.Time
-			lastUpdAt  time.Time
-			allRetries bool
+			key          string
+			indices      []int
+			firstAt      time.Time
+			latestAt     time.Time
+			lastUpdAt    time.Time
+			maxNotBefore time.Time
+			allRetries   bool
 		}
 		var orderedKeys []string
 		byKey := make(map[string]*keyGroup)
 
 		for i, r := range records {
-			if r.event.Status != StatusQueued {
+			if r.event.Status != StatusQueued || r.event.Source == SourceDeferredResume {
 				continue
 			}
 			k := r.event.InboxKey
@@ -248,11 +270,12 @@ func (s *inboxStore) claimNextBatch(
 			g, ok := byKey[k]
 			if !ok {
 				g = &keyGroup{
-					key:        k,
-					firstAt:    r.event.CreatedAt,
-					latestAt:   r.event.CreatedAt,
-					lastUpdAt:  r.updatedAt,
-					allRetries: true,
+					key:          k,
+					firstAt:      r.event.CreatedAt,
+					latestAt:     r.event.CreatedAt,
+					lastUpdAt:    r.updatedAt,
+					maxNotBefore: r.notBefore,
+					allRetries:   true,
 				}
 				byKey[k] = g
 				orderedKeys = append(orderedKeys, k)
@@ -267,13 +290,13 @@ func (s *inboxStore) claimNextBatch(
 			if r.updatedAt.After(g.lastUpdAt) {
 				g.lastUpdAt = r.updatedAt
 			}
+			if r.notBefore.After(g.maxNotBefore) {
+				g.maxNotBefore = r.notBefore
+			}
 			if r.event.Attempts == 0 {
 				g.allRetries = false
 			}
 		}
-
-		var minWait time.Duration
-		haveWait := false
 
 		for _, k := range orderedKeys {
 			g := byKey[k]
@@ -292,23 +315,23 @@ func (s *inboxStore) claimNextBatch(
 					readyAt = maxWindow
 				}
 			}
+			if g.maxNotBefore.After(readyAt) {
+				readyAt = g.maxNotBefore
+			}
 
 			if !now.Before(readyAt) {
 				claimed = make([]InboxEvent, 0, len(g.indices))
 				for _, idx := range g.indices {
 					records[idx].event.Status = StatusRunning
 					records[idx].event.Attempts++
+					records[idx].notBefore = time.Time{}
 					records[idx].updatedAt = now.UTC()
 					claimed = append(claimed, cloneInboxEvent(records[idx].event))
 				}
 				return s.writeStateUnlocked(records, now)
 			}
 
-			wait := readyAt.Sub(now)
-			if !haveWait || wait < minWait {
-				minWait = wait
-				haveWait = true
-			}
+			noteWait(readyAt)
 		}
 
 		if haveWait {
@@ -320,9 +343,17 @@ func (s *inboxStore) claimNextBatch(
 	return claimed, nextWake, err
 }
 
-func (s *inboxStore) completeBatch(ids []string, sessionID, outcomeStatus, errMsg string, now time.Time) error {
+func (s *inboxStore) completeBatch(
+	ids []string,
+	sessionID, outcomeStatus, errMsg string,
+	retryBackoff time.Duration,
+	now time.Time,
+) error {
 	if len(ids) == 0 {
 		return nil
+	}
+	if retryBackoff <= 0 {
+		retryBackoff = 15 * time.Millisecond
 	}
 	idSet := make(map[string]bool, len(ids))
 	for _, id := range ids {
@@ -347,20 +378,26 @@ func (s *inboxStore) completeBatch(ids []string, sessionID, outcomeStatus, errMs
 			if outcomeStatus == StatusFailed {
 				if records[i].event.Attempts >= MaxAttempts {
 					records[i].event.Status = StatusFailed
+					records[i].notBefore = time.Time{}
 				} else {
 					records[i].event.Status = StatusQueued
+					records[i].notBefore = now.UTC().Add(retryBackoff)
 				}
 			} else {
 				records[i].event.Status = outcomeStatus
+				records[i].notBefore = time.Time{}
 			}
 		}
 		return s.writeStateUnlocked(records, now)
 	})
 }
 
-func (s *inboxStore) requeueBusyBatch(ids []string, now time.Time) error {
+func (s *inboxStore) requeueBusyBatch(ids []string, cooldown time.Duration, now time.Time) error {
 	if len(ids) == 0 {
 		return nil
+	}
+	if cooldown <= 0 {
+		cooldown = 25 * time.Millisecond
 	}
 	idSet := make(map[string]bool, len(ids))
 	for _, id := range ids {
@@ -381,6 +418,7 @@ func (s *inboxStore) requeueBusyBatch(ids []string, now time.Time) error {
 			}
 			records[i].event.Status = StatusQueued
 			records[i].updatedAt = now.UTC()
+			records[i].notBefore = now.UTC().Add(cooldown)
 		}
 		return s.writeStateUnlocked(records, now)
 	})
@@ -491,6 +529,9 @@ func (s *inboxStore) loadUnlocked(now time.Time) ([]syncedInboxRecord, map[strin
 			if !st.UpdatedAt.IsZero() {
 				records[i].updatedAt = st.UpdatedAt
 			}
+			if !st.NotBefore.IsZero() {
+				records[i].notBefore = st.NotBefore
+			}
 			records[i].lastError = st.LastError
 		}
 	}
@@ -519,6 +560,7 @@ func (s *inboxStore) writeStateUnlocked(records []syncedInboxRecord, now time.Ti
 			Status:      r.event.Status,
 			Attempts:    r.event.Attempts,
 			LastError:   r.lastError,
+			NotBefore:   r.notBefore,
 			CreatedAt:   r.event.CreatedAt,
 			UpdatedAt:   upd,
 		}

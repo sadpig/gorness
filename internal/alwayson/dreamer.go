@@ -49,11 +49,16 @@ func (s *Service) RunDreamPass(ctx context.Context, wsID string) ([]string, erro
 	snap := s.cfg.Current()
 	var wsRoleModel string
 	if cleanWS != "" {
-		if ws, err := s.engine.Workspaces().Get(cleanWS); err == nil && ws != nil {
-			wsRoleModel = ws.RoleModels["dreamer"]
-			if wsSnap, _, fErr := s.cfg.ForWorkspace(ws.RootPath, ws.TrustedHashes); fErr == nil && wsSnap != nil {
-				snap = wsSnap
-			}
+		if _, vErr := validateSafeWorkspaceID(cleanWS); vErr != nil {
+			return nil, vErr
+		}
+		ws, err := s.engine.Workspaces().Get(cleanWS)
+		if err != nil {
+			return nil, err
+		}
+		wsRoleModel = ws.RoleModels["dreamer"]
+		if wsSnap, _, fErr := s.cfg.ForWorkspace(ws.RootPath, ws.TrustedHashes); fErr == nil && wsSnap != nil {
+			snap = wsSnap
 		}
 	}
 

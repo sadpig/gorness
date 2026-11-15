@@ -103,11 +103,12 @@ type ServiceOptions struct {
 }
 
 type runNotificationCapture struct {
-	wsID            string
-	sessionID       string
-	notifiedCount   int
-	suppressedCount int
-	lastSuppressed  string
+	wsID                   string
+	sessionID              string
+	notifiedCount          int
+	suppressedCount        int
+	scheduledFollowUpCount int
+	lastSuppressed         string
 }
 
 type Service struct {
@@ -272,6 +273,13 @@ func (s *Service) makeSetFollowUpTool() tools.Tool {
 			entry, err := s.ScheduleFollowUp(wsID, call.SessionID, delay, in.Note)
 			if err != nil {
 				return tools.ToolResult{}, err
+			}
+			if strings.TrimSpace(call.SessionID) != "" {
+				s.captureMu.Lock()
+				if capState := s.captures[call.SessionID]; capState != nil {
+					capState.scheduledFollowUpCount++
+				}
+				s.captureMu.Unlock()
 			}
 			out, _ := json.Marshal(entry)
 			return tools.ToolResult{Output: string(out)}, nil
@@ -510,9 +518,10 @@ func (s *Service) ResolveDeferred(id string, approved bool, selectedHunks []stri
 
 	var card DeferredCard
 	now := s.now().UTC()
+	cardPath := filepath.Join(s.deferredDir(), safeID+".md")
 
-	err := store.WithFlock(s.deferredLockPath(), true, func() error {
-		cardPath := filepath.Join(s.deferredDir(), safeID+".md")
+	// Step 1: Read and validate pending deferred card WITHOUT removing it yet.
+	err := store.WithFlock(s.deferredLockPath(), false, func() error {
 		raw, rErr := os.ReadFile(cardPath)
 		if rErr != nil {
 			if errors.Is(rErr, os.ErrNotExist) {
@@ -524,25 +533,6 @@ func (s *Service) ResolveDeferred(id string, approved bool, selectedHunks []stri
 		if pErr != nil {
 			return fmt.Errorf("parse deferred card %s: %w", safeID, pErr)
 		}
-
-		status := "denied"
-		if approved {
-			status = "approved"
-		}
-		parsed.Status = status
-		parsed.ResolvedAt = &now
-
-		resolvedMD, fErr := formatDeferredCardMD(parsed, selectedHunks)
-		if fErr != nil {
-			return fErr
-		}
-		resolvedPath := filepath.Join(s.deferredResolvedDir(), safeID+".md")
-		if wErr := store.AtomicWriteFile(resolvedPath, resolvedMD, 0o600); wErr != nil {
-			return wErr
-		}
-		if rmErr := os.Remove(cardPath); rmErr != nil && !errors.Is(rmErr, os.ErrNotExist) {
-			return rmErr
-		}
 		card = parsed
 		return nil
 	})
@@ -550,6 +540,7 @@ func (s *Service) ResolveDeferred(id string, approved bool, selectedHunks []stri
 		return err
 	}
 
+	// Step 2: Enqueue idempotent deferred_resume event FIRST (no nested locks) so a failed enqueue never loses the pending card.
 	resume := core.DeferredResume{
 		DeferredID:      card.ID,
 		ToolCallID:      card.ToolCallID,
@@ -566,7 +557,7 @@ func (s *Service) ResolveDeferred(id string, approved bool, selectedHunks []stri
 	var resumeMap map[string]any
 	_ = json.Unmarshal(resumeJSON, &resumeMap)
 
-	_, err = s.Enqueue(InboxEvent{
+	_, _, err = s.inbox.enqueue(InboxEvent{
 		InboxKey:    fmt.Sprintf("resume:%s:%s", card.WorkspaceID, card.ID),
 		Source:      SourceDeferredResume,
 		SourceID:    card.ID,
@@ -580,8 +571,39 @@ func (s *Service) ResolveDeferred(id string, approved bool, selectedHunks []stri
 			"resume_approval_json": string(resumeJSON),
 		},
 		CreatedAt: now,
+	}, now)
+	if err != nil {
+		return err
+	}
+
+	// Step 3: Atomically archive resolved card to deferred/resolved/<id>.md, remove pending file, and wake worker.
+	err = store.WithFlock(s.deferredLockPath(), true, func() error {
+		status := "denied"
+		if approved {
+			status = "approved"
+		}
+		card.Status = status
+		card.ResolvedAt = &now
+
+		resolvedMD, fErr := formatDeferredCardMD(card, selectedHunks)
+		if fErr != nil {
+			return fErr
+		}
+		resolvedPath := filepath.Join(s.deferredResolvedDir(), safeID+".md")
+		if wErr := store.AtomicWriteFile(resolvedPath, resolvedMD, 0o600); wErr != nil {
+			return wErr
+		}
+		if rmErr := os.Remove(cardPath); rmErr != nil && !errors.Is(rmErr, os.ErrNotExist) {
+			return rmErr
+		}
+		return nil
 	})
-	return err
+	if err != nil {
+		return err
+	}
+
+	s.signalWake()
+	return nil
 }
 
 func (s *Service) persistDeferredCard(def core.DeferredToolPayload, agentRole string) (DeferredCard, error) {
@@ -819,7 +841,7 @@ func (s *Service) executeClaimedBatch(ctx context.Context, batch []InboxEvent) {
 	if sessionID == "" {
 		meta, cErr := s.engine.Sessions().Create(wsID, "Always-On Session", agentRole)
 		if cErr != nil {
-			_ = s.inbox.completeBatch(ids, "", StatusFailed, cErr.Error(), s.now())
+			_ = s.inbox.completeBatch(ids, "", StatusFailed, cErr.Error(), s.retryBackoff, s.now())
 			return
 		}
 		sessionID = meta.ID
@@ -859,10 +881,13 @@ func (s *Service) executeClaimedBatch(ctx context.Context, batch []InboxEvent) {
 	})
 	if startErr != nil {
 		if errors.Is(startErr, core.ErrSessionBusy) {
-			_ = s.inbox.requeueBusyBatch(ids, s.now())
+			_ = s.inbox.requeueBusyBatch(ids, s.retryBackoff, s.now())
 			return
 		}
-		_ = s.inbox.completeBatch(ids, sessionID, StatusFailed, startErr.Error(), s.now())
+		if autoCreatedSession && s.isTrivialFailedAutoSession(sessionID) {
+			_ = s.engine.Sessions().Delete(sessionID)
+		}
+		_ = s.inbox.completeBatch(ids, "", StatusFailed, startErr.Error(), s.retryBackoff, s.now())
 		return
 	}
 
@@ -891,7 +916,7 @@ func (s *Service) executeClaimedBatch(ctx context.Context, batch []InboxEvent) {
 		case core.EventRunCancelled:
 			if ctx.Err() != nil {
 				// Daemon shutting down: restore queued state without burning attempts.
-				_ = s.inbox.requeueBusyBatch(ids, s.now())
+				_ = s.inbox.requeueBusyBatch(ids, s.retryBackoff, s.now())
 				return
 			}
 			runFailedErr = "run cancelled"
@@ -909,7 +934,7 @@ func (s *Service) executeClaimedBatch(ctx context.Context, batch []InboxEvent) {
 	if deferredPayload != nil {
 		card, dErr := s.persistDeferredCard(*deferredPayload, agentRole)
 		if dErr != nil {
-			_ = s.inbox.completeBatch(ids, sessionID, StatusFailed, dErr.Error(), s.now())
+			_ = s.inbox.completeBatch(ids, sessionID, StatusFailed, dErr.Error(), s.retryBackoff, s.now())
 			return
 		}
 
@@ -930,17 +955,33 @@ func (s *Service) executeClaimedBatch(ctx context.Context, batch []InboxEvent) {
 			Delivered:   delivered,
 		}, s.now())
 
-		_ = s.inbox.completeBatch(ids, sessionID, StatusDeferred, "", s.now())
+		_ = s.inbox.completeBatch(ids, sessionID, StatusDeferred, "", s.retryBackoff, s.now())
 		return
 	}
 
 	if runFailedErr != "" {
-		recordedSession := sessionID
-		if autoCreatedSession {
-			recordedSession = ""
-			_ = s.engine.Sessions().Delete(sessionID)
+		s.captureMu.Lock()
+		hasSideEffects := capState.notifiedCount > 0 || capState.suppressedCount > 0 || capState.scheduledFollowUpCount > 0
+		s.captureMu.Unlock()
+
+		willRetry := false
+		for _, ev := range batch {
+			if ev.Attempts < MaxAttempts {
+				willRetry = true
+				break
+			}
 		}
-		_ = s.inbox.completeBatch(ids, recordedSession, StatusFailed, runFailedErr, s.now())
+
+		recordedSession := sessionID
+		if autoCreatedSession && willRetry {
+			// Clear recordedSession so retry creates a fresh session rather than re-appending the prompt.
+			recordedSession = ""
+			// Only garbage-collect the failed session if no assistant/tool entries or side effects occurred.
+			if !hasSideEffects && s.isTrivialFailedAutoSession(sessionID) {
+				_ = s.engine.Sessions().Delete(sessionID)
+			}
+		}
+		_ = s.inbox.completeBatch(ids, recordedSession, StatusFailed, runFailedErr, s.retryBackoff, s.now())
 		return
 	}
 
@@ -963,7 +1004,21 @@ func (s *Service) executeClaimedBatch(ctx context.Context, batch []InboxEvent) {
 		}, s.now())
 	}
 
-	_ = s.inbox.completeBatch(ids, sessionID, StatusDone, "", s.now())
+	_ = s.inbox.completeBatch(ids, sessionID, StatusDone, "", s.retryBackoff, s.now())
+}
+
+func (s *Service) isTrivialFailedAutoSession(sessionID string) bool {
+	branch, err := s.engine.Sessions().LoadActiveBranch(sessionID)
+	if err != nil {
+		return false
+	}
+	if len(branch) == 0 {
+		return true
+	}
+	if len(branch) == 1 && branch[0].Role == "user" {
+		return true
+	}
+	return false
 }
 
 func extractDeferredResume(ev InboxEvent) (*core.DeferredResume, bool) {
