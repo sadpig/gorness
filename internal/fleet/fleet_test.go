@@ -1359,6 +1359,46 @@ func TestParseVerifierVerdictMarkdownEmphasisAndFailClosed(t *testing.T) {
 			want: false,
 		},
 		{
+			name: "subcase 1a: imperative bullet starting with Pass fails closed",
+			raw:  "Please address before landing:\n- Pass ctx to exec.CommandContext instead of context.Background().",
+			want: false,
+		},
+		{
+			name: "subcase 1b: sentence starting with Passed without explicit verdict fails closed",
+			raw:  "Passed compilation, however input validation is missing.",
+			want: false,
+		},
+		{
+			name: "subcase 1c: bullet item '- Pass' is not a standalone verdict",
+			raw:  "Checklist:\n- Pass",
+			want: false,
+		},
+		{
+			name: "subcase 2a: LGTM with snake_case check_failed rejects",
+			raw:  "LGTM on formatting, but check_failed on race test",
+			want: false,
+		},
+		{
+			name: "subcase 2b: trailing standalone LGTM overridden by earlier check_failed",
+			raw:  "check_failed on unit suite\nLGTM",
+			want: false,
+		},
+		{
+			name: "subcase 2c: underscore-wrapped __CHECK_FAILED__ verdict rejects",
+			raw:  "__VERDICT__: __CHECK_FAILED__",
+			want: false,
+		},
+		{
+			name: "subcase 3a: mid-sentence status: pass-through fails closed",
+			raw:  "When checking status: pass-through headers are dropped",
+			want: false,
+		},
+		{
+			name: "subcase 3b: line-start Status: pass-through hyphenated word fails closed",
+			raw:  "Status: pass-through headers are dropped",
+			want: false,
+		},
+		{
 			name: "markdown bold accept",
 			raw:  "All invariants verified.\n**VERDICT**: **ACCEPT**",
 			want: true,
@@ -1366,6 +1406,11 @@ func TestParseVerifierVerdictMarkdownEmphasisAndFailClosed(t *testing.T) {
 		{
 			name: "heading backtick pass",
 			raw:  "### Verdict: `PASS`",
+			want: true,
+		},
+		{
+			name: "clean standalone final LGTM line accepts when zero reject cues exist",
+			raw:  "All invariants and race checks verified.\n**LGTM!**",
 			want: true,
 		},
 	}

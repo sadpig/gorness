@@ -12,18 +12,30 @@ import (
 )
 
 var (
-	reVerdictReject    = regexp.MustCompile(`(?i)\b(?:verdict|status|decision|result)\s*:\s*(reject|rejected|fail|failed)\b`)
-	reVerdictAccept    = regexp.MustCompile(`(?i)\b(?:verdict|status|decision|result)\s*:\s*(accept|accepted|pass|passed|approve|approved|lgtm)\b`)
-	reWordReject       = regexp.MustCompile(`(?i)\b(reject|rejected|fail|failed|check_failed)\b`)
-	reStandaloneAccept = regexp.MustCompile(`(?i)^(?:accept|accepted|pass|passed|approve|approved|lgtm)(?:\b|[.!:,;\s—-]|$)`)
-	reMarkdownEmphasis = strings.NewReplacer("*", "", "_", "", "`", "", "~", "")
+	reLinePrefix         = regexp.MustCompile(`^(?:#{1,6}\s+|>\s+|[-*+]\s+)+`)
+	reVerdictReject      = regexp.MustCompile(`(?i)^(?:verdict|status|decision|result)\s*:\s*(?:reject|rejected|fail|failed|check_failed)(?:\s*$|[\s.!,:;\)\]]|\s+[-—])`)
+	reVerdictAccept      = regexp.MustCompile(`(?i)^(?:verdict|status|decision|result)\s*:\s*(?:accept|accepted|pass|passed|approve|approved|lgtm)(?:\s*$|[\s.!,:;\)\]]|\s+[-—])`)
+	reWordReject         = regexp.MustCompile(`(?i)\b(?:reject|rejected|fail|failed|check_failed)\b`)
+	reStandaloneAccept   = regexp.MustCompile(`(?i)^\[?(?:accept|accepted|pass|passed|approve|approved|lgtm)\]?[.!]*$`)
+	reInlineCodeOrBold   = strings.NewReplacer("*", "", "`", "", "~", "")
+	reWordSplitDelims    = strings.NewReplacer("*", " ", "_", " ", "`", " ", "~", " ")
+	reLeadingUnderscores = regexp.MustCompile(`(^|[^a-zA-Z0-9])_+`)
+	reTrailingUnderscore = regexp.MustCompile(`_+([^a-zA-Z0-9]|$)`)
 )
 
+func stripInlineEmphasisPreserveSnake(s string) string {
+	s = reInlineCodeOrBold.Replace(s)
+	s = reLeadingUnderscores.ReplaceAllString(s, "$1")
+	s = reTrailingUnderscore.ReplaceAllString(s, "$1")
+	return s
+}
+
 func stripMarkdownVerdictLine(line string) string {
-	s := reMarkdownEmphasis.Replace(line)
+	s := strings.TrimSpace(line)
+	s = reLinePrefix.ReplaceAllString(s, "")
+	s = stripInlineEmphasisPreserveSnake(s)
 	s = strings.TrimSpace(s)
-	s = strings.TrimLeft(s, "#>-+[] ")
-	s = strings.TrimRight(s, "[] ")
+	s = strings.Trim(s, "[] ")
 	return strings.TrimSpace(s)
 }
 
@@ -33,13 +45,19 @@ func parseVerifierVerdict(raw string) (accepted bool, feedback string) {
 		return false, "empty verifier output"
 	}
 	lines := strings.Split(trimmed, "\n")
-	cleanedLines := make([]string, 0, len(lines))
+	lastNonEmptyRaw := ""
 	for i := len(lines) - 1; i >= 0; i-- {
-		cleanLine := stripMarkdownVerdictLine(lines[i])
+		rawLine := strings.TrimSpace(lines[i])
+		if rawLine == "" {
+			continue
+		}
+		if lastNonEmptyRaw == "" {
+			lastNonEmptyRaw = rawLine
+		}
+		cleanLine := stripMarkdownVerdictLine(rawLine)
 		if cleanLine == "" {
 			continue
 		}
-		cleanedLines = append(cleanedLines, cleanLine)
 		if reVerdictReject.MatchString(cleanLine) {
 			return false, trimmed
 		}
@@ -48,12 +66,12 @@ func parseVerifierVerdict(raw string) (accepted bool, feedback string) {
 		}
 	}
 
-	cleanedAll := reMarkdownEmphasis.Replace(trimmed)
-	if reWordReject.MatchString(cleanedAll) {
+	if reWordReject.MatchString(trimmed) || reWordReject.MatchString(reWordSplitDelims.Replace(trimmed)) {
 		return false, trimmed
 	}
-	for _, cleanLine := range cleanedLines {
-		if reStandaloneAccept.MatchString(cleanLine) {
+	if lastNonEmptyRaw != "" {
+		cleanFinal := strings.TrimSpace(stripInlineEmphasisPreserveSnake(lastNonEmptyRaw))
+		if reStandaloneAccept.MatchString(cleanFinal) {
 			return true, trimmed
 		}
 	}
