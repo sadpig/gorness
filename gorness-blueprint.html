@@ -1,0 +1,3445 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Gorness — Go 语言全栈微内核 AI Harness 统一整体架构方案</title>
+<style>
+  :root {
+    --bg-canvas: #F5F5F7;
+    --bg-surface: #FFFFFF;
+    --bg-subtle: #EBEBF0;
+    --bg-obsidian: #0A0A0E;
+    --bg-obsidian-card: #14141A;
+    --bg-obsidian-elevated: #1D1D26;
+
+    --ink-primary: #1D1D1F;
+    --ink-secondary: #6E6E73;
+    --ink-tertiary: #86868B;
+    --ink-on-dark: #F5F5F7;
+    --ink-on-dark-muted: #98989D;
+
+    --accent-blue: #0071E3;
+    --accent-blue-hover: #0077ED;
+    --accent-blue-tint: rgba(0, 113, 227, 0.09);
+    --accent-blue-dark: #2997FF;
+
+    --signal-green: #1D9A50;
+    --signal-green-dark: #30D158;
+    --signal-amber: #D97706;
+    --signal-amber-dark: #FF9F0A;
+    --signal-red: #D93829;
+    --signal-red-dark: #FF453A;
+    --signal-cyan-dark: #64D2FF;
+
+    --hairline-light: rgba(0, 0, 0, 0.08);
+    --hairline-strong: rgba(0, 0, 0, 0.14);
+    --hairline-dark: rgba(255, 255, 255, 0.10);
+    --hairline-dark-strong: rgba(255, 255, 255, 0.18);
+
+    --radius-xl: 24px;
+    --radius-lg: 18px;
+    --radius-md: 12px;
+    --radius-sm: 8px;
+    --radius-pill: 999px;
+
+    --font-sans: -apple-system, BlinkMacSystemFont, "SF Pro Display", "SF Pro Text", "PingFang SC", "Hiragino Sans GB", "Noto Sans CJK SC", "Helvetica Neue", sans-serif;
+    --font-mono: ui-monospace, "SF Mono", Menlo, Monaco, Consolas, monospace;
+
+    --ease-apple: cubic-bezier(0.22, 1, 0.36, 1);
+    --container-max: 1280px;
+  }
+
+  *, *::before, *::after {
+    box-sizing: border-box;
+    margin: 0;
+    padding: 0;
+  }
+
+  html {
+    scroll-behavior: smooth;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+    text-rendering: optimizeLegibility;
+  }
+
+  body {
+    font-family: var(--font-sans);
+    background-color: var(--bg-canvas);
+    color: var(--ink-primary);
+    line-height: 1.58;
+    font-size: 15.5px;
+    overflow-x: hidden;
+  }
+
+  code {
+    font-family: var(--font-mono);
+    font-size: 0.87em;
+    padding: 1.5px 6px;
+    border-radius: 5px;
+    background: rgba(0, 0, 0, 0.055);
+    color: var(--ink-primary);
+  }
+
+  .chapter-obsidian code {
+    background: rgba(255, 255, 255, 0.12);
+    color: #E5E5EA;
+  }
+
+  /* Sticky Apple Global Navigation */
+  .global-nav {
+    position: sticky;
+    top: 0;
+    z-index: 120;
+    height: 52px;
+    background: rgba(245, 245, 247, 0.84);
+    backdrop-filter: saturate(180%) blur(20px);
+    -webkit-backdrop-filter: saturate(180%) blur(20px);
+    border-bottom: 1px solid var(--hairline-light);
+  }
+
+  .nav-inner {
+    max-width: var(--container-max);
+    margin: 0 auto;
+    height: 100%;
+    padding: 0 28px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 16px;
+  }
+
+  .brand-lockup {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    text-decoration: none;
+    color: var(--ink-primary);
+    font-weight: 650;
+    font-size: 17px;
+    letter-spacing: -0.02em;
+  }
+
+  .brand-glyph {
+    width: 25px;
+    height: 25px;
+    border-radius: 7px;
+    background: var(--ink-primary);
+    color: #fff;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    font-family: var(--font-mono);
+    font-size: 12.5px;
+    font-weight: 700;
+  }
+
+  .brand-tag {
+    font-size: 11px;
+    font-weight: 600;
+    color: var(--accent-blue);
+    padding: 2px 9px;
+    border-radius: var(--radius-pill);
+    background: var(--accent-blue-tint);
+  }
+
+  .nav-links {
+    display: flex;
+    align-items: center;
+    gap: 20px;
+    list-style: none;
+  }
+
+  .nav-links a {
+    color: var(--ink-secondary);
+    text-decoration: none;
+    font-size: 13px;
+    font-weight: 500;
+    transition: color 0.18s ease;
+  }
+
+  .nav-links a:hover {
+    color: var(--ink-primary);
+  }
+
+  .nav-cta {
+    background: var(--ink-primary);
+    color: #fff !important;
+    padding: 6px 14px;
+    border-radius: var(--radius-pill);
+    font-size: 12.5px !important;
+    font-weight: 500 !important;
+  }
+
+  /* Containers & Chapters */
+  .container {
+    max-width: var(--container-max);
+    margin: 0 auto;
+    padding: 0 28px;
+  }
+
+  .chapter-light {
+    padding: 96px 0;
+    background: var(--bg-canvas);
+  }
+
+  .chapter-white {
+    padding: 96px 0;
+    background: var(--bg-surface);
+    border-top: 1px solid var(--hairline-light);
+    border-bottom: 1px solid var(--hairline-light);
+  }
+
+  .chapter-obsidian {
+    padding: 104px 0;
+    background: var(--bg-obsidian);
+    color: var(--ink-on-dark);
+  }
+
+  .chapter-kicker {
+    font-size: 13px;
+    font-weight: 600;
+    color: var(--accent-blue);
+    margin-bottom: 10px;
+  }
+
+  .chapter-obsidian .chapter-kicker {
+    color: var(--accent-blue-dark);
+  }
+
+  .display-hero {
+    font-size: clamp(2.55rem, 4.7vw, 4.1rem);
+    font-weight: 700;
+    line-height: 1.07;
+    letter-spacing: -0.035em;
+    color: var(--ink-primary);
+  }
+
+  .chapter-title {
+    font-size: clamp(1.9rem, 3.2vw, 2.75rem);
+    font-weight: 700;
+    line-height: 1.13;
+    letter-spacing: -0.028em;
+    margin-bottom: 14px;
+  }
+
+  .chapter-lead {
+    font-size: clamp(1.02rem, 1.38vw, 1.18rem);
+    line-height: 1.58;
+    color: var(--ink-secondary);
+    max-width: 820px;
+  }
+
+  .chapter-obsidian .chapter-lead {
+    color: var(--ink-on-dark-muted);
+  }
+
+  /* Hero Section */
+  .hero-section {
+    padding: 72px 0 84px;
+    background: var(--bg-surface);
+    border-bottom: 1px solid var(--hairline-light);
+  }
+
+  .hero-grid {
+    display: grid;
+    grid-template-columns: 1.08fr 0.92fr;
+    gap: 48px;
+    align-items: center;
+  }
+
+  .hero-sub {
+    margin-top: 20px;
+    font-size: 18px;
+    line-height: 1.56;
+    color: var(--ink-secondary);
+    max-width: 600px;
+  }
+
+  .hero-actions {
+    margin-top: 30px;
+    display: flex;
+    flex-wrap: wrap;
+    gap: 12px;
+  }
+
+  .btn-primary {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    padding: 11px 22px;
+    background: var(--accent-blue);
+    color: #fff;
+    border-radius: var(--radius-pill);
+    text-decoration: none;
+    font-size: 14.5px;
+    font-weight: 500;
+    border: none;
+    cursor: pointer;
+    transition: background 0.2s ease;
+  }
+
+  .btn-primary:hover { background: var(--accent-blue-hover); }
+
+  .btn-secondary {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    padding: 11px 20px;
+    background: var(--bg-canvas);
+    color: var(--ink-primary);
+    border-radius: var(--radius-pill);
+    text-decoration: none;
+    font-size: 14.5px;
+    font-weight: 500;
+    border: 1px solid var(--hairline-strong);
+    cursor: pointer;
+    transition: background 0.2s ease;
+  }
+
+  .btn-secondary:hover { background: var(--bg-subtle); }
+
+  .hero-metrics {
+    margin-top: 40px;
+    padding-top: 26px;
+    border-top: 1px solid var(--hairline-light);
+    display: grid;
+    grid-template-columns: repeat(4, 1fr);
+    gap: 18px;
+  }
+
+  .metric-val {
+    font-size: 26px;
+    font-weight: 700;
+    letter-spacing: -0.03em;
+    font-variant-numeric: tabular-nums;
+  }
+
+  .metric-lbl {
+    font-size: 12.5px;
+    color: var(--ink-secondary);
+    margin-top: 3px;
+    line-height: 1.38;
+  }
+
+  /* Right Hero: Unified Architecture Die */
+  .kernel-showcase {
+    background: var(--bg-obsidian);
+    color: var(--ink-on-dark);
+    border-radius: var(--radius-xl);
+    padding: 26px;
+    border: 1px solid rgba(0, 0, 0, 0.14);
+  }
+
+  .capsule-bar {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    background: var(--bg-obsidian-elevated);
+    padding: 9px 15px;
+    border-radius: var(--radius-pill);
+    border: 1px solid var(--hairline-dark);
+    margin-bottom: 18px;
+  }
+
+  .capsule-status {
+    display: flex;
+    align-items: center;
+    gap: 9px;
+    font-size: 12.5px;
+    font-weight: 500;
+  }
+
+  .pulse-dot {
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    background: var(--signal-green-dark);
+    position: relative;
+  }
+
+  .pulse-dot::after {
+    content: "";
+    position: absolute;
+    inset: -4px;
+    border-radius: 50%;
+    border: 1.5px solid var(--signal-green-dark);
+    animation: pulseRing 2.4s infinite var(--ease-apple);
+  }
+
+  @keyframes pulseRing {
+    0% { transform: scale(0.8); opacity: 0.9; }
+    100% { transform: scale(1.9); opacity: 0; }
+  }
+
+  .capsule-mono {
+    font-family: var(--font-mono);
+    font-size: 11px;
+    color: var(--ink-on-dark-muted);
+    font-variant-numeric: tabular-nums;
+  }
+
+  .chip-die {
+    background: var(--bg-obsidian-card);
+    border: 1px solid var(--hairline-dark);
+    border-radius: var(--radius-lg);
+    padding: 18px;
+  }
+
+  .die-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: baseline;
+    margin-bottom: 14px;
+  }
+
+  .die-name {
+    font-family: var(--font-mono);
+    font-size: 13px;
+    font-weight: 600;
+    color: #fff;
+  }
+
+  .die-spec {
+    font-family: var(--font-mono);
+    font-size: 11px;
+    color: var(--accent-blue-dark);
+  }
+
+  .die-layers {
+    display: flex;
+    flex-direction: column;
+    gap: 9px;
+  }
+
+  .die-row {
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    gap: 8px;
+  }
+
+  .die-cell {
+    background: var(--bg-obsidian-elevated);
+    border: 1px solid var(--hairline-dark);
+    border-radius: var(--radius-sm);
+    padding: 9px 11px;
+  }
+
+  .die-cell.core-spine {
+    grid-column: span 3;
+    background: rgba(41, 151, 255, 0.13);
+    border-color: rgba(41, 151, 255, 0.45);
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+  }
+
+  .die-cell-title {
+    font-size: 12px;
+    font-weight: 600;
+    color: #fff;
+  }
+
+  .die-cell-sub {
+    font-family: var(--font-mono);
+    font-size: 10px;
+    color: var(--ink-on-dark-muted);
+    margin-top: 2px;
+  }
+
+  /* Segmented Bar */
+  .segmented-bar {
+    display: inline-flex;
+    flex-wrap: wrap;
+    gap: 4px;
+    background: var(--bg-subtle);
+    padding: 4px;
+    border-radius: var(--radius-pill);
+    margin: 30px 0 22px;
+  }
+
+  .chapter-obsidian .segmented-bar {
+    background: var(--bg-obsidian-card);
+    border: 1px solid var(--hairline-dark);
+  }
+
+  .seg-btn {
+    border: none;
+    background: transparent;
+    color: var(--ink-secondary);
+    padding: 7px 15px;
+    border-radius: var(--radius-pill);
+    font-family: var(--font-sans);
+    font-size: 13px;
+    font-weight: 500;
+    cursor: pointer;
+    transition: all 0.18s var(--ease-apple);
+  }
+
+  .chapter-obsidian .seg-btn {
+    color: var(--ink-on-dark-muted);
+  }
+
+  .seg-btn.active {
+    background: var(--bg-surface);
+    color: var(--ink-primary);
+    font-weight: 600;
+    box-shadow: 0 1px 3px rgba(0, 0, 0, 0.08);
+  }
+
+  .chapter-obsidian .seg-btn.active {
+    background: var(--accent-blue);
+    color: #fff;
+    box-shadow: none;
+  }
+
+  /* Chapter 1: Research Findings & 14 Harnesses Matrix */
+  .findings-split {
+    margin-top: 40px;
+    display: grid;
+    grid-template-columns: 1.15fr 0.85fr;
+    gap: 22px;
+  }
+
+  .bento-card {
+    background: var(--bg-surface);
+    border: 1px solid var(--hairline-light);
+    border-radius: var(--radius-xl);
+    padding: 28px;
+  }
+
+  .bento-card h3 {
+    font-size: 20px;
+    font-weight: 700;
+    letter-spacing: -0.02em;
+    margin-bottom: 8px;
+  }
+
+  .bento-card p {
+    color: var(--ink-secondary);
+    font-size: 14.5px;
+  }
+
+  .absence-list {
+    margin-top: 18px;
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+  }
+
+  .absence-item {
+    background: var(--bg-canvas);
+    border-radius: var(--radius-md);
+    padding: 14px 16px;
+    display: grid;
+    grid-template-columns: 74px 1fr;
+    gap: 14px;
+    align-items: center;
+  }
+
+  .absence-stat {
+    font-family: var(--font-mono);
+    font-size: 21px;
+    font-weight: 700;
+    color: var(--accent-blue);
+    text-align: center;
+  }
+
+  .absence-body strong {
+    display: block;
+    font-size: 14px;
+    margin-bottom: 2px;
+  }
+
+  .absence-body span {
+    font-size: 13px;
+    color: var(--ink-secondary);
+  }
+
+  .gap-bars {
+    margin-top: 18px;
+    display: flex;
+    flex-direction: column;
+    gap: 14px;
+  }
+
+  .gap-row-top {
+    display: flex;
+    justify-content: space-between;
+    font-size: 12.5px;
+    font-weight: 600;
+    margin-bottom: 5px;
+  }
+
+  .gap-row-top span:last-child {
+    font-family: var(--font-mono);
+    color: var(--accent-blue);
+  }
+
+  .gap-track {
+    height: 9px;
+    background: var(--bg-canvas);
+    border-radius: var(--radius-pill);
+    position: relative;
+    overflow: hidden;
+  }
+
+  .gap-fill-low {
+    position: absolute;
+    left: 0; top: 0; bottom: 0;
+    background: #D2D2D7;
+    border-radius: var(--radius-pill);
+  }
+
+  .gap-fill-high {
+    position: absolute;
+    top: 0; bottom: 0;
+    background: var(--accent-blue);
+    border-radius: var(--radius-pill);
+  }
+
+  .gap-caption {
+    font-size: 11.5px;
+    color: var(--ink-tertiary);
+    margin-top: 3px;
+    display: flex;
+    justify-content: space-between;
+  }
+
+  .harness-explorer {
+    display: grid;
+    grid-template-columns: 1.36fr 0.64fr;
+    gap: 22px;
+    align-items: start;
+  }
+
+  .table-shell {
+    background: var(--bg-surface);
+    border: 1px solid var(--hairline-light);
+    border-radius: var(--radius-xl);
+    overflow: hidden;
+  }
+
+  .table-scroll { overflow-x: auto; }
+
+  table.apple-table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 13px;
+    text-align: left;
+  }
+
+  table.apple-table th {
+    padding: 13px 15px;
+    font-weight: 600;
+    color: var(--ink-secondary);
+    background: var(--bg-canvas);
+    border-bottom: 1px solid var(--hairline-light);
+    white-space: nowrap;
+    font-size: 12px;
+  }
+
+  table.apple-table td {
+    padding: 12px 15px;
+    border-bottom: 1px solid var(--hairline-light);
+    vertical-align: middle;
+  }
+
+  table.apple-table tbody tr {
+    cursor: pointer;
+    transition: background 0.15s ease;
+  }
+
+  table.apple-table tbody tr:hover { background: rgba(0, 113, 227, 0.04); }
+  table.apple-table tbody tr.selected-row { background: var(--accent-blue-tint); }
+  table.apple-table tbody tr:last-child td { border-bottom: none; }
+
+  .lang-pill {
+    font-family: var(--font-mono);
+    font-size: 11px;
+    font-weight: 600;
+    padding: 2px 7px;
+    border-radius: 5px;
+    background: var(--bg-canvas);
+    display: inline-block;
+  }
+
+  .lang-pill.go-lang {
+    background: rgba(0, 113, 227, 0.12);
+    color: var(--accent-blue);
+  }
+
+  .score-bar-inline {
+    display: flex;
+    align-items: center;
+    gap: 7px;
+    font-family: var(--font-mono);
+    font-weight: 600;
+    font-size: 12px;
+  }
+
+  .score-mini-track {
+    width: 50px;
+    height: 5px;
+    background: var(--bg-subtle);
+    border-radius: 99px;
+    overflow: hidden;
+  }
+
+  .score-mini-fill {
+    height: 100%;
+    background: var(--ink-primary);
+    border-radius: 99px;
+  }
+
+  .harness-inspector {
+    background: var(--bg-surface);
+    border: 1px solid var(--hairline-light);
+    border-radius: var(--radius-xl);
+    padding: 26px;
+    position: sticky;
+    top: 72px;
+  }
+
+  .inspector-head {
+    display: flex;
+    justify-content: space-between;
+    align-items: flex-start;
+    margin-bottom: 14px;
+  }
+
+  .inspector-name { font-size: 21px; font-weight: 700; letter-spacing: -0.02em; }
+  .inspector-maker { font-size: 12.5px; color: var(--ink-secondary); margin-top: 2px; }
+  .inspector-badge {
+    font-family: var(--font-mono);
+    font-size: 12px;
+    font-weight: 600;
+    padding: 4px 10px;
+    border-radius: var(--radius-pill);
+    background: var(--accent-blue-tint);
+    color: var(--accent-blue);
+  }
+
+  .dim-grid-mini {
+    display: grid;
+    grid-template-columns: repeat(2, 1fr);
+    gap: 7px 14px;
+    margin-top: 8px;
+  }
+
+  .dim-item-mini {
+    display: flex;
+    justify-content: space-between;
+    font-size: 12px;
+  }
+
+  .dim-item-mini span:last-child { font-family: var(--font-mono); font-weight: 600; }
+
+  .inspector-section {
+    margin-top: 15px;
+    padding-top: 14px;
+    border-top: 1px solid var(--hairline-light);
+  }
+
+  .inspector-label { font-size: 11.5px; font-weight: 600; color: var(--ink-tertiary); margin-bottom: 5px; }
+  .inspector-text { font-size: 13.5px; line-height: 1.54; }
+  .inspector-borrow {
+    background: var(--bg-canvas);
+    border-radius: var(--radius-md);
+    padding: 11px 13px;
+    margin-top: 6px;
+    font-size: 13px;
+    border-left: 3px solid var(--accent-blue);
+  }
+
+  /* Chapter 2: Unified Complete System Architecture (10 Subsystems All-In-One) */
+  .svg-frame {
+    width: 100%;
+    overflow-x: auto;
+    background: var(--bg-surface);
+    border: 1px solid var(--hairline-light);
+    border-radius: var(--radius-xl);
+    padding: 22px;
+    margin-top: 34px;
+  }
+
+  .svg-frame svg {
+    display: block;
+    width: 100%;
+    min-width: 960px;
+    height: auto;
+  }
+
+  .subsystems-bento {
+    margin-top: 26px;
+    display: grid;
+    grid-template-columns: repeat(2, 1fr);
+    gap: 18px;
+  }
+
+  .sys-spec-card {
+    background: var(--bg-canvas);
+    border: 1px solid var(--hairline-light);
+    border-radius: var(--radius-lg);
+    padding: 22px 24px;
+  }
+
+  .sys-spec-head {
+    display: flex;
+    justify-content: space-between;
+    align-items: baseline;
+    margin-bottom: 8px;
+  }
+
+  .sys-spec-pkg {
+    font-family: var(--font-mono);
+    font-size: 11.5px;
+    font-weight: 600;
+    color: var(--accent-blue);
+  }
+
+  .sys-spec-origin {
+    font-size: 11.5px;
+    color: var(--ink-tertiary);
+  }
+
+  .sys-spec-card h4 {
+    font-size: 17px;
+    font-weight: 700;
+    letter-spacing: -0.015em;
+    margin-bottom: 8px;
+  }
+
+  .sys-spec-card ul {
+    list-style: none;
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    font-size: 13.5px;
+    color: var(--ink-secondary);
+  }
+
+  .sys-spec-card ul li::before {
+    content: "• ";
+    color: var(--accent-blue);
+    font-weight: 700;
+  }
+
+  .sys-spec-card ul li strong {
+    color: var(--ink-primary);
+  }
+
+  /* Chapter 3: Always-On 5 Primitives Simulator */
+  .always-on-stage {
+    margin-top: 36px;
+    background: var(--bg-surface);
+    border: 1px solid var(--hairline-light);
+    border-radius: var(--radius-xl);
+    padding: 28px;
+  }
+
+  .sim-toolbar {
+    display: flex;
+    flex-wrap: wrap;
+    justify-content: space-between;
+    align-items: center;
+    gap: 14px;
+    margin-bottom: 20px;
+  }
+
+  .sim-triggers {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+  }
+
+  .trigger-btn {
+    padding: 8px 15px;
+    border-radius: var(--radius-pill);
+    border: 1px solid var(--hairline-strong);
+    background: var(--bg-canvas);
+    color: var(--ink-primary);
+    font-family: var(--font-sans);
+    font-size: 12.5px;
+    font-weight: 600;
+    cursor: pointer;
+    transition: all 0.18s var(--ease-apple);
+  }
+
+  .trigger-btn:hover { border-color: var(--accent-blue); color: var(--accent-blue); }
+  .trigger-btn.active-trig { background: var(--ink-primary); color: #fff; border-color: var(--ink-primary); }
+
+  .sleep-meter {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    background: var(--bg-canvas);
+    padding: 7px 14px;
+    border-radius: var(--radius-pill);
+    font-size: 12.5px;
+  }
+
+  .state-chip {
+    font-family: var(--font-mono);
+    font-size: 11px;
+    font-weight: 700;
+    padding: 3px 9px;
+    border-radius: var(--radius-pill);
+  }
+
+  .state-sleep { background: #E8F5E9; color: var(--signal-green); }
+  .state-run { background: rgba(0, 113, 227, 0.14); color: var(--accent-blue); }
+  .state-defer { background: #FEF3C7; color: var(--signal-amber); }
+
+  .sim-narration {
+    margin-top: 16px;
+    background: var(--bg-canvas);
+    border-radius: var(--radius-md);
+    padding: 14px 18px;
+    font-size: 13.5px;
+  }
+
+  .sim-narration strong { color: var(--accent-blue); }
+
+  .primitives-five-grid {
+    margin-top: 22px;
+    display: grid;
+    grid-template-columns: repeat(5, 1fr);
+    gap: 12px;
+  }
+
+  .prim-card {
+    background: var(--bg-canvas);
+    border: 1px solid var(--hairline-light);
+    border-radius: var(--radius-lg);
+    padding: 18px 16px;
+    transition: all 0.2s ease;
+  }
+
+  .prim-card.highlighted {
+    background: var(--bg-surface);
+    border-color: var(--accent-blue);
+    box-shadow: 0 0 0 2px rgba(0, 113, 227, 0.13);
+  }
+
+  .prim-sub { font-family: var(--font-mono); font-size: 10.5px; color: var(--accent-blue); margin-bottom: 6px; font-weight: 600; }
+  .prim-title { font-size: 15px; font-weight: 700; margin-bottom: 6px; }
+  .prim-desc { font-size: 12.5px; color: var(--ink-secondary); line-height: 1.5; }
+
+  /* Chapter 4: Interactive Multi-Agent Visual Orchestration Studio (Obsidian) */
+  @keyframes dashFlow {
+    to { stroke-dashoffset: -28; }
+  }
+  .flow-line-active {
+    stroke-dasharray: 6 8;
+    animation: dashFlow 1.05s linear infinite;
+  }
+
+  .orchestration-studio {
+    margin-top: 24px;
+    background: var(--bg-obsidian-card);
+    border: 1px solid var(--hairline-dark);
+    border-radius: var(--radius-xl);
+    padding: 26px;
+  }
+
+  .studio-top {
+    display: flex;
+    justify-content: space-between;
+    align-items: flex-start;
+    gap: 20px;
+    flex-wrap: wrap;
+    margin-bottom: 18px;
+  }
+
+  .pattern-headline { font-size: 21px; font-weight: 700; color: #fff; letter-spacing: -0.02em; }
+  .pattern-summary { font-size: 14px; color: var(--ink-on-dark-muted); margin-top: 5px; max-width: 700px; }
+
+  .studio-gauges { display: flex; gap: 10px; flex-wrap: wrap; }
+  .gauge-pill {
+    background: var(--bg-obsidian-elevated);
+    border: 1px solid var(--hairline-dark);
+    border-radius: var(--radius-md);
+    padding: 9px 13px;
+  }
+  .gauge-lbl { font-size: 11px; color: var(--ink-on-dark-muted); }
+  .gauge-val { font-family: var(--font-mono); font-size: 13.5px; font-weight: 700; color: #fff; margin-top: 2px; }
+
+  /* Interactive Node-Inspectable Live Fleet Stage */
+  .fleet-live-grid {
+    display: grid;
+    grid-template-columns: 1fr 330px;
+    gap: 18px;
+    align-items: stretch;
+  }
+
+  .dark-svg-wrapper {
+    width: 100%;
+    overflow-x: auto;
+    background: #0D0D12;
+    border: 1px solid var(--hairline-dark);
+    border-radius: var(--radius-lg);
+    padding: 14px;
+  }
+
+  .dark-svg-wrapper svg {
+    display: block;
+    width: 100%;
+    min-width: 780px;
+    height: auto;
+  }
+
+  .svg-agent-node {
+    cursor: pointer;
+    transition: opacity 0.18s ease;
+  }
+
+  .svg-agent-node:hover rect.node-box {
+    stroke: #64D2FF;
+    stroke-width: 2.4;
+  }
+
+  .node-inspector-dark {
+    background: var(--bg-obsidian-elevated);
+    border: 1px solid var(--hairline-dark);
+    border-radius: var(--radius-lg);
+    padding: 20px;
+    display: flex;
+    flex-direction: column;
+    justify-content: space-between;
+  }
+
+  .ni-badge {
+    display: inline-block;
+    font-family: var(--font-mono);
+    font-size: 10.5px;
+    font-weight: 600;
+    padding: 3px 8px;
+    border-radius: var(--radius-pill);
+    background: rgba(41, 151, 255, 0.18);
+    color: var(--signal-cyan-dark);
+    margin-bottom: 8px;
+  }
+
+  .ni-title { font-size: 17px; font-weight: 700; color: #fff; }
+  .ni-meta { font-family: var(--font-mono); font-size: 11.5px; color: var(--ink-on-dark-muted); margin-top: 4px; }
+
+  .ni-kv-list {
+    margin-top: 14px;
+    padding-top: 12px;
+    border-top: 1px solid var(--hairline-dark);
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    font-size: 12.5px;
+  }
+
+  .ni-kv {
+    display: flex;
+    justify-content: space-between;
+    gap: 8px;
+  }
+
+  .ni-kv span:first-child { color: var(--ink-on-dark-muted); }
+  .ni-kv span:last-child { font-family: var(--font-mono); color: #fff; text-align: right; }
+
+  .ni-log {
+    margin-top: 14px;
+    background: #0D0D12;
+    border: 1px solid var(--hairline-dark);
+    border-radius: 10px;
+    padding: 11px 12px;
+    font-family: var(--font-mono);
+    font-size: 11px;
+    color: #D1D1D6;
+    line-height: 1.55;
+  }
+
+  .steer-box {
+    margin-top: 14px;
+    display: flex;
+    gap: 6px;
+  }
+
+  .steer-input {
+    flex: 1;
+    background: #0D0D12;
+    border: 1px solid var(--hairline-dark-strong);
+    border-radius: 8px;
+    padding: 7px 10px;
+    color: #fff;
+    font-size: 12px;
+    font-family: var(--font-sans);
+  }
+
+  .steer-btn {
+    background: var(--accent-blue);
+    color: #fff;
+    border: none;
+    border-radius: 8px;
+    padding: 7px 12px;
+    font-size: 12px;
+    font-weight: 600;
+    cursor: pointer;
+    white-space: nowrap;
+  }
+
+  .studio-bottom {
+    margin-top: 18px;
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    gap: 14px;
+  }
+
+  .studio-note {
+    background: var(--bg-obsidian-elevated);
+    border: 1px solid var(--hairline-dark);
+    border-radius: var(--radius-md);
+    padding: 15px 17px;
+  }
+
+  .studio-note-title { font-size: 12px; font-weight: 600; color: var(--accent-blue-dark); margin-bottom: 5px; }
+  .studio-note-body { font-size: 13px; color: var(--ink-on-dark); line-height: 1.52; }
+
+  /* Chapter 5: Complete Engineering Contracts (Code, SQL Schema, HTTP/SSE API, Invariants) */
+  .spec-workbench {
+    margin-top: 34px;
+    display: grid;
+    grid-template-columns: 1.08fr 0.92fr;
+    gap: 24px;
+    align-items: start;
+  }
+
+  .code-window {
+    background: var(--bg-obsidian);
+    color: var(--ink-on-dark);
+    border-radius: var(--radius-xl);
+    border: 1px solid rgba(0, 0, 0, 0.16);
+    overflow: hidden;
+  }
+
+  .code-titlebar {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 11px 16px;
+    background: var(--bg-obsidian-card);
+    border-bottom: 1px solid var(--hairline-dark);
+    flex-wrap: wrap;
+    gap: 8px;
+  }
+
+  .mac-dots { display: flex; gap: 7px; }
+  .mac-dot { width: 11px; height: 11px; border-radius: 50%; }
+  .dot-close { background: #FF5F56; }
+  .dot-min { background: #FFBD2E; }
+  .dot-max { background: #27C93F; }
+
+  .code-tabs { display: flex; flex-wrap: wrap; gap: 4px; }
+  .code-tab {
+    background: transparent;
+    border: none;
+    color: var(--ink-on-dark-muted);
+    font-family: var(--font-mono);
+    font-size: 11.5px;
+    padding: 5px 10px;
+    border-radius: 6px;
+    cursor: pointer;
+  }
+  .code-tab.active {
+    background: rgba(255, 255, 255, 0.13);
+    color: #fff;
+  }
+
+  pre.go-code {
+    padding: 20px;
+    font-family: var(--font-mono);
+    font-size: 12px;
+    line-height: 1.6;
+    overflow-x: auto;
+    color: #E5E5EA;
+    margin: 0;
+    max-height: 580px;
+  }
+
+  .kw { color: #FF7AB2; }
+  .ty { color: #6BDFFF; }
+  .fn { color: #4EB0CC; }
+  .st { color: #FF8170; }
+  .cm { color: #7F8C98; }
+
+  .invariants-panel {
+    background: var(--bg-surface);
+    border: 1px solid var(--hairline-light);
+    border-radius: var(--radius-xl);
+    padding: 28px;
+  }
+
+  .invariants-panel h3 {
+    font-size: 19px;
+    font-weight: 700;
+    letter-spacing: -0.02em;
+    margin-bottom: 14px;
+  }
+
+  .inv-list {
+    display: flex;
+    flex-direction: column;
+    gap: 11px;
+  }
+
+  .inv-item {
+    background: var(--bg-canvas);
+    border-radius: 10px;
+    padding: 12px 14px;
+    font-size: 13px;
+    line-height: 1.5;
+  }
+
+  .inv-item strong {
+    display: block;
+    color: var(--ink-primary);
+    margin-bottom: 2px;
+  }
+
+  .inv-item span { color: var(--ink-secondary); }
+
+  /* Chapter 6: Apple HIG Three-Pane Workbench + Menu Bar Mockup */
+  .mac-studio-frame {
+    margin-top: 36px;
+    background: #FFFFFF;
+    border: 1px solid rgba(0, 0, 0, 0.13);
+    border-radius: 20px;
+    overflow: hidden;
+  }
+
+  .mac-window-bar {
+    height: 46px;
+    background: #F2F2F5;
+    border-bottom: 1px solid var(--hairline-light);
+    padding: 0 18px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+  }
+
+  .mac-view-switcher {
+    display: flex;
+    background: #E3E3E8;
+    padding: 3px;
+    border-radius: 9px;
+    gap: 3px;
+  }
+
+  .mac-view-btn {
+    border: none;
+    background: transparent;
+    padding: 5px 13px;
+    border-radius: 7px;
+    font-size: 12px;
+    font-weight: 500;
+    color: var(--ink-secondary);
+    cursor: pointer;
+  }
+
+  .mac-view-btn.active {
+    background: #FFFFFF;
+    color: var(--ink-primary);
+    font-weight: 600;
+  }
+
+  .mac-menubar-pill {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    background: #1D1D1F;
+    color: #fff;
+    padding: 5px 12px;
+    border-radius: var(--radius-pill);
+    font-size: 11.5px;
+    font-family: var(--font-mono);
+  }
+
+  .mac-body {
+    display: grid;
+    grid-template-columns: 245px 1fr 330px;
+    min-height: 500px;
+  }
+
+  .mac-sidebar {
+    background: #F7F7F9;
+    border-right: 1px solid var(--hairline-light);
+    padding: 16px 13px;
+    display: flex;
+    flex-direction: column;
+    gap: 16px;
+  }
+
+  .side-group-title {
+    font-size: 11px;
+    font-weight: 600;
+    color: var(--ink-tertiary);
+    padding: 0 8px;
+    margin-bottom: 5px;
+  }
+
+  .side-item {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 7px 10px;
+    border-radius: 8px;
+    font-size: 13px;
+    color: var(--ink-primary);
+  }
+
+  .side-item.active {
+    background: rgba(0, 113, 227, 0.11);
+    color: var(--accent-blue);
+    font-weight: 600;
+  }
+
+  .side-dot { width: 7px; height: 7px; border-radius: 50%; }
+
+  .mac-main {
+    padding: 22px 26px;
+    background: #FFFFFF;
+    display: flex;
+    flex-direction: column;
+    justify-content: space-between;
+  }
+
+  .mac-inspector {
+    background: #FAFAFC;
+    border-left: 1px solid var(--hairline-light);
+    padding: 18px 16px;
+    display: flex;
+    flex-direction: column;
+    justify-content: space-between;
+  }
+
+  .approval-card {
+    background: #FFFBEB;
+    border: 1px solid rgba(217, 119, 6, 0.32);
+    border-radius: 14px;
+    padding: 14px;
+    margin-top: 8px;
+  }
+
+  .hunk-check {
+    display: flex;
+    align-items: flex-start;
+    gap: 7px;
+    font-family: var(--font-mono);
+    font-size: 11px;
+    background: rgba(255, 255, 255, 0.85);
+    padding: 6px 8px;
+    border-radius: 6px;
+    margin-top: 6px;
+  }
+
+  .approval-actions {
+    display: flex;
+    gap: 8px;
+    margin-top: 10px;
+  }
+
+  .btn-approve {
+    background: var(--signal-green);
+    color: #fff;
+    border: none;
+    padding: 6px 12px;
+    border-radius: 8px;
+    font-size: 12px;
+    font-weight: 600;
+    cursor: pointer;
+  }
+
+  .btn-deny {
+    background: #fff;
+    color: var(--signal-red);
+    border: 1px solid rgba(217, 56, 41, 0.3);
+    padding: 6px 12px;
+    border-radius: 8px;
+    font-size: 12px;
+    font-weight: 600;
+    cursor: pointer;
+  }
+
+  footer.blueprint-footer {
+    padding: 48px 0 56px;
+    background: var(--bg-canvas);
+    border-top: 1px solid var(--hairline-light);
+    color: var(--ink-secondary);
+    font-size: 13px;
+  }
+
+  .footer-row {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 16px;
+  }
+
+  @media (max-width: 1060px) {
+    .hero-grid,
+    .findings-split,
+    .harness-explorer,
+    .subsystems-bento,
+    .fleet-live-grid,
+    .spec-workbench {
+      grid-template-columns: 1fr;
+    }
+    .primitives-five-grid { grid-template-columns: repeat(2, 1fr); }
+    .studio-bottom { grid-template-columns: 1fr; }
+    .mac-body { grid-template-columns: 1fr; }
+    .mac-sidebar, .mac-inspector { border: none; border-bottom: 1px solid var(--hairline-light); }
+    .harness-inspector { position: static; }
+  }
+
+  @media (max-width: 680px) {
+    .nav-links { display: none; }
+    .hero-metrics, .primitives-five-grid { grid-template-columns: 1fr; }
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    *, *::before, *::after {
+      animation-duration: 0.01ms !important;
+      animation-iteration-count: 1 !important;
+      transition-duration: 0.01ms !important;
+      scroll-behavior: auto !important;
+    }
+  }
+</style>
+</head>
+<body>
+
+<!-- Sticky Apple Navigation -->
+<nav class="global-nav" aria-label="主导航">
+  <div class="nav-inner">
+    <a href="#top" class="brand-lockup">
+      <span class="brand-glyph">G</span>
+      <span>Gorness</span>
+      <span class="brand-tag">1.0 全量一体架构方案</span>
+    </a>
+    <ul class="nav-links">
+      <li><a href="#landscape">40+ Harness 研究</a></li>
+      <li><a href="#unified-arch">十大子系统整体架构</a></li>
+      <li><a href="#always-on">Always-On 常驻引擎</a></li>
+      <li><a href="#orchestration">可视化多 Agent 编排</a></li>
+      <li><a href="#contracts">全量库表与代码契约</a></li>
+      <li><a href="#apple-ui" class="nav-cta">Apple 工作台预览</a></li>
+    </ul>
+  </div>
+</nav>
+
+<!-- Hero Section -->
+<header id="top" class="hero-section">
+  <div class="container">
+    <div class="hero-grid">
+      <div>
+        <div class="chapter-kicker">Complete Go-Native Agent Harness · 不拆阶段，一次成型</div>
+        <h1 class="display-hero">百家之长，一炉铸就。<br>纯 Go 全栈智能体底座。</h1>
+        <p class="hero-sub">
+          拒绝阉割版原型与渐进打补丁。Gorness 用一套零运行时依赖的 Go 微内核守护进程（<code>gornessd</code>）加原生 macOS Apple 宿主，将<strong>事务级代码编辑、OS 内核沙箱、Anthropic Always-On 五大常驻原语、以及可视化多 Agent 混合舰队编排</strong>一次性完整交付。
+        </p>
+        <div class="hero-actions">
+          <a href="#orchestration" class="btn-primary">交互体验可视化多 Agent 编排台</a>
+          <a href="#contracts" class="btn-secondary">审阅全量 Go 包、SQL 表与接口契约</a>
+        </div>
+        <div class="hero-metrics">
+          <div>
+            <div class="metric-val">1 Binary</div>
+            <div class="metric-lbl"><code>gornessd</code> 全功能静态引擎<br>TOML · MD · HTML + JSONL</div>
+          </div>
+          <div>
+            <div class="metric-val">&lt; 3.5 ms</div>
+            <div class="metric-lbl">微内核冷启动耗时<br>100 并发工具扇出 0.18ms</div>
+          </div>
+          <div>
+            <div class="metric-val">0 Database</div>
+            <div class="metric-lbl"><code>~/.gorness/</code> 全透明文件账本<br>崩溃自愈 · 任意点 Fork/Rewind</div>
+          </div>
+          <div>
+            <div class="metric-val">0 Secret</div>
+            <div class="metric-lbl">沙箱内零明文密钥<br>Seatbelt + 边界外凭证代理</div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Complete System Die Card -->
+      <div class="kernel-showcase" aria-label="Gorness 1.0 全量一体架构芯片图">
+        <div class="capsule-bar">
+          <div class="capsule-status">
+            <span class="pulse-dot"></span>
+            <span>gornessd · Complete 1.0 Unified Engine</span>
+          </div>
+          <span class="capsule-mono">127.0.0.1:3456 · UnixSocket · ACP</span>
+        </div>
+
+        <div class="chip-die">
+          <div class="die-header">
+            <span class="die-name">ALL 10 SUBSYSTEMS IN ONE UNIFIED BUILD</span>
+            <span class="die-spec">100% Pure Go · Zero DB</span>
+          </div>
+          <div class="die-layers">
+            <div class="die-row">
+              <div class="die-cell">
+                <div class="die-cell-title">~/.gorness/ Vault</div>
+                <div class="die-cell-sub">TOML · MD · JSONL · HTML</div>
+              </div>
+              <div class="die-cell">
+                <div class="die-cell-title">Apple Workbench UI</div>
+                <div class="die-cell-sub">DOM Morph · Fleet Canvas</div>
+              </div>
+              <div class="die-cell">
+                <div class="die-cell-title">CLI / TUI / ACP</div>
+                <div class="die-cell-sub">60fps Terminal · Headless</div>
+              </div>
+            </div>
+
+            <div class="die-row">
+              <div class="die-cell core-spine">
+                <div>
+                  <div class="die-cell-title">Zero-Privilege Go Microkernel (Context · Scope · Seam)</div>
+                  <div class="die-cell-sub">拓扑逆序自动卸载回滚 · 预编译零锁 Hook 切片 · 单源双语 SettingsRegistry</div>
+                </div>
+                <span class="capsule-mono" style="color:#64D2FF;">0 ns idle</span>
+              </div>
+            </div>
+
+            <div class="die-row">
+              <div class="die-cell">
+                <div class="die-cell-title">LLM &amp; Cache Engine</div>
+                <div class="die-cell-sub">4 原生协议 · 95% Prefix Hit</div>
+              </div>
+              <div class="die-cell">
+                <div class="die-cell-title">Transactional VFS</div>
+                <div class="die-cell-sub">BLAKE3 CAS · 按块部分审批</div>
+              </div>
+              <div class="die-cell">
+                <div class="die-cell-title">AST &amp; PTC Runner</div>
+                <div class="die-cell-sub">Tree-sitter · LSP · CodeMode</div>
+              </div>
+            </div>
+
+            <div class="die-row">
+              <div class="die-cell">
+                <div class="die-cell-title">Always-On 5 原语</div>
+                <div class="die-cell-sub">Inbox · Timer · Defer · Dream</div>
+              </div>
+              <div class="die-cell">
+                <div class="die-cell-title">Visual Fleet Engine</div>
+                <div class="die-cell-sub">5 拓扑 · Worktree · Refinery</div>
+              </div>
+              <div class="die-cell">
+                <div class="die-cell-title">Zero-Trust Sandbox</div>
+                <div class="die-cell-sub">Seatbelt · Landlock · Proxy</div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+</header>
+
+<!-- Chapter 1: Market Research of 40+ AI Harnesses -->
+<section id="landscape" class="chapter-light">
+  <div class="container">
+    <div class="chapter-kicker">01 · 市面 40+ 款主流 AI Harness 深度解剖与基因提取</div>
+    <h2 class="chapter-title">看清每一家的看家本领与硬伤，一次把天花板拉满</h2>
+    <p class="chapter-lead">
+      综合 2026 年 50 款 Harness 架构评分榜（Kendr Research）、11 款主流系统 400 万行源码解剖（arXiv:2609.00006）及 Terminal-Bench 实测数据：目前没有任何单一产品在全部十个维度拿满分。Gorness 的核心策略是<strong>用 Go 静态单二进制把各派系经过生产验证的最强机制一次性熔铸进同一套架构契约</strong>。
+    </p>
+
+    <div class="findings-split">
+      <div class="bento-card">
+        <h3>400 万行源码审计确立的三大设计铁律</h3>
+        <p>所有在真实复杂工程中胜出的顶级 Harness，无一例外遵守以下三条反直觉共识：</p>
+        <div class="absence-list">
+          <div class="absence-item">
+            <div class="absence-stat">0 / 11</div>
+            <div class="absence-body">
+              <strong>铁律一：严禁引入重型通用 Agent 框架（LangChain / LangGraph / AutoGen 全缺席）</strong>
+              <span>一旦引入黑盒框架，Prompt 字节布局、流式思维块（Preserved Thinking）回传与缓存断点立刻失控。Gorness 直接用 Go <code>context.Context</code> 与通道手写可插拔确定性主循环。</span>
+            </div>
+          </div>
+          <div class="absence-item">
+            <div class="absence-stat">0 / 11</div>
+            <div class="absence-body">
+              <strong>铁律二：严禁对活跃代码库搞向量数据库 RAG</strong>
+              <span>代码高频变动导致向量索引天然过期且丢失符号调用拓扑。Gorness 采用确定性检索黄金组合：<code>ripgrep</code> + <code>Tree-sitter</code> PageRank 符号地图 + 按需 <code>LSP</code> 诊断 + 子目录 <code>AGENTS.md</code> 动态挂载。</span>
+            </div>
+          </div>
+          <div class="absence-item">
+            <div class="absence-stat">4 + BM25</div>
+            <div class="absence-body">
+              <strong>铁律三：常驻核心工具极简化 + 扩展工具延迟检索 + PTC 脚本编排</strong>
+              <span>常驻仅保留 <code>read</code> / <code>edit</code> / <code>write</code> / <code>bash</code> / <code>search</code>；上百个 MCP 与企业连接器工具通过 BM25 <code>search_tools</code> 按需唤醒并支持 Code Mode 批量编排，节省 40%+ 上下文开销。</span>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div class="bento-card">
+        <h3>同模型更换 Harness 的真实胜率差距</h3>
+        <p>在容器化真实终端任务基准 Terminal-Bench 中，同一底座模型在不同 Harness 下的得分跨度：</p>
+        <div class="gap-bars">
+          <div>
+            <div class="gap-row-top">
+              <span>Gemini 3.1 Pro（最佳 vs 最差 Harness）</span>
+              <span>+18.8 pts</span>
+            </div>
+            <div class="gap-track">
+              <div class="gap-fill-low" style="width:61.4%"></div>
+              <div class="gap-fill-high" style="left:61.4%; width:18.8%"></div>
+            </div>
+            <div class="gap-caption"><span>61.4%</span><span>80.2%</span></div>
+          </div>
+
+          <div>
+            <div class="gap-row-top">
+              <span>GPT-5.5（最佳 vs 最差 Harness）</span>
+              <span>+18.6 pts</span>
+            </div>
+            <div class="gap-track">
+              <div class="gap-fill-low" style="width:66.1%"></div>
+              <div class="gap-fill-high" style="left:66.1%; width:18.6%"></div>
+            </div>
+            <div class="gap-caption"><span>66.1%</span><span>84.7%</span></div>
+          </div>
+
+          <div>
+            <div class="gap-row-top">
+              <span>Claude Opus 4.6（最佳 vs 最差 Harness）</span>
+              <span>+18.4 pts</span>
+            </div>
+            <div class="gap-track">
+              <div class="gap-fill-low" style="width:58.0%"></div>
+              <div class="gap-fill-high" style="left:58.0%; width:18.4%"></div>
+            </div>
+            <div class="gap-caption"><span>58.0%</span><span>76.4%</span></div>
+          </div>
+        </div>
+
+        <div class="inspector-borrow" style="margin-top:22px;">
+          <strong>为什么用 Go 重写是降维打击？</strong> TS/Node 阵营冷启动慢、多实例内存破百兆；Python 阵营打包分发脆弱；Rust 阵营百万行代码迭代笨重。Go 兼顾 <strong>3ms 静态二进制启动、2KB 协程万级扇出、纯静态交叉编译远端注入与清晰可读的接口组合</strong>。
+        </div>
+      </div>
+    </div>
+
+    <div class="segmented-bar" role="tablist" aria-label="按流派筛选主流 AI Harness">
+      <button class="seg-btn active" onclick="filterHarnesses('all', this)">全部标杆系统 (14)</button>
+      <button class="seg-btn" onclick="filterHarnesses('frontier', this)">原厂旗舰</button>
+      <button class="seg-btn" onclick="filterHarnesses('microkernel', this)">微内核与极速派</button>
+      <button class="seg-btn" onclick="filterHarnesses('agnostic', this)">多模型与 Go 先行者</button>
+      <button class="seg-btn" onclick="filterHarnesses('alwayson', this)">常驻自进化与集群编排</button>
+      <button class="seg-btn" onclick="filterHarnesses('durable', this)">事务安全与极简派</button>
+    </div>
+
+    <div class="harness-explorer">
+      <div class="table-shell">
+        <div class="table-scroll">
+          <table class="apple-table" aria-label="主流 AI Harness 优缺点与吸收映射表">
+            <thead>
+              <tr>
+                <th>产品名称</th>
+                <th>语言栈</th>
+                <th>流派定位</th>
+                <th>架构分</th>
+                <th>看家本领（点击任意行查看深度拆解与 Gorness 吸收方案）</th>
+              </tr>
+            </thead>
+            <tbody id="harness-tbody"></tbody>
+          </table>
+        </div>
+      </div>
+
+      <aside class="harness-inspector" aria-live="polite">
+        <div class="inspector-head">
+          <div>
+            <div class="inspector-name" id="det-name">Claude Code</div>
+            <div class="inspector-maker" id="det-maker"></div>
+          </div>
+          <span class="inspector-badge" id="det-score"></span>
+        </div>
+        <div class="dim-grid-mini" id="det-dims"></div>
+        <div class="inspector-section">
+          <div class="inspector-label">架构优点与核心机制</div>
+          <div class="inspector-text" id="det-pros"></div>
+        </div>
+        <div class="inspector-section">
+          <div class="inspector-label">现实短板</div>
+          <div class="inspector-text" id="det-cons"></div>
+        </div>
+        <div class="inspector-section">
+          <div class="inspector-label">Gorness 一步到位落地方案</div>
+          <div class="inspector-borrow" id="det-borrow"></div>
+        </div>
+      </aside>
+    </div>
+  </div>
+</section>
+
+<!-- Chapter 2: Unified Full-System Architecture (All 10 Subsystems at Once) -->
+<section id="unified-arch" class="chapter-white">
+  <div class="container">
+    <div class="chapter-kicker">02 · 统一整体系统架构（Unified 1.0 System Blueprint）</div>
+    <h2 class="chapter-title">三层宿主结构 × 十大核心子系统，一次完整闭环</h2>
+    <p class="chapter-lead">
+      不留半成品接口，不搞分期重构。整个 Gorness 应用由<strong>原生客户端表现层（macOS Swift 启动器 + Apple 工作台 + 60fps TUI）</strong>、<strong>无特权 Go 微内核总线</strong>与<strong>十大正交能力域</strong>一次性装配成型，共用唯一一个 SQLite WAL 全局单调递增事件账本（<code>seq</code>）。
+    </p>
+
+    <!-- Full System Architectural SVG -->
+    <div class="svg-frame">
+      <svg viewBox="0 0 1120 520" role="img" aria-labelledby="sys-arch-title sys-arch-desc">
+        <title id="sys-arch-title">Gorness 1.0 全栈统一系统架构图</title>
+        <desc id="sys-arch-desc">从顶层 macOS 原生宿主、Apple 工作台、终端 TUI 与 ACP 接口，经同源安全守卫接入 gornessd 微内核总线，向下驱动主循环、多模型缓存层、原子事务文件系统、多 Agent 编排器、Always-On 引擎、OS 沙箱凭证代理与统一 SQLite WAL 账本的完整架构图。</desc>
+        <defs>
+          <marker id="sa-b" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M0 1.5 L8.5 5 L0 8.5z" fill="#0071E3"/></marker>
+          <marker id="sa-m" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M0 1.5 L8.5 5 L0 8.5z" fill="#86868B"/></marker>
+        </defs>
+
+        <!-- Layer 1: Client Surfaces -->
+        <rect x="20" y="16" width="1080" height="92" rx="14" fill="#F5F5F7" stroke="#D2D2D7"/>
+        <text x="38" y="38" font-size="11" font-family="ui-monospace, SF Mono, monospace" font-weight="600" fill="#6E6E73">LAYER 1 · SURFACES &amp; NATIVE HOSTS (共享同一 gornessd 守护进程会话流)</text>
+
+        <rect x="38" y="48" width="248" height="48" rx="9" fill="#FFFFFF" stroke="#D2D2D7"/>
+        <text x="52" y="69" font-size="13" font-weight="700" fill="#1D1D1F">gorness studio (Mac 独立工作台)</text>
+        <text x="52" y="86" font-size="11" font-family="ui-monospace, SF Mono, monospace" fill="#6E6E73">纯 Go 驱动 · Keychain · 原生通知中心</text>
+
+        <rect x="302" y="48" width="266" height="48" rx="9" fill="#FFFFFF" stroke="#0071E3" stroke-width="1.6"/>
+        <text x="316" y="69" font-size="13" font-weight="700" fill="#0071E3">Apple HIG Workbench UI (零依赖内嵌)</text>
+        <text x="316" y="86" font-size="11" font-family="ui-monospace, SF Mono, monospace" fill="#6E6E73">三栏工作台 · 可视化编排画布 · DOM Morph</text>
+
+        <rect x="584" y="48" width="246" height="48" rx="9" fill="#FFFFFF" stroke="#D2D2D7"/>
+        <text x="598" y="69" font-size="13" font-weight="700" fill="#1D1D1F">gorness CLI &amp; 60fps TUI</text>
+        <text x="598" y="86" font-size="11" font-family="ui-monospace, SF Mono, monospace" fill="#6E6E73">BubbleTea v2 · --json CI · SSH Remote</text>
+
+        <rect x="846" y="48" width="236" height="48" rx="9" fill="#FFFFFF" stroke="#D2D2D7"/>
+        <text x="860" y="69" font-size="13" font-weight="700" fill="#1D1D1F">ACP / MCP / Webhook 网关</text>
+        <text x="860" y="86" font-size="11" font-family="ui-monospace, SF Mono, monospace" fill="#6E6E73">Zed · JetBrains · Slack/IM · Git PR</text>
+
+        <!-- Vertical Connectors Layer 1 -> Layer 2 -->
+        <line x1="162" y1="108" x2="162" y2="140" stroke="#0071E3" stroke-width="1.8" marker-end="url(#sa-b)"/>
+        <line x1="435" y1="108" x2="435" y2="140" stroke="#0071E3" stroke-width="1.8" marker-end="url(#sa-b)"/>
+        <line x1="707" y1="108" x2="707" y2="140" stroke="#0071E3" stroke-width="1.8" marker-end="url(#sa-b)"/>
+        <line x1="964" y1="108" x2="964" y2="140" stroke="#0071E3" stroke-width="1.8" marker-end="url(#sa-b)"/>
+
+        <!-- Layer 2: Microkernel Spine -->
+        <rect x="20" y="142" width="1080" height="72" rx="14" fill="#1D1D1F"/>
+        <text x="42" y="168" font-size="11" font-family="ui-monospace, SF Mono, monospace" fill="#64D2FF">LAYER 2 · ZERO-PRIVILEGE GO MICROKERNEL SPINE (internal/kernel + internal/server)</text>
+        <text x="42" y="193" font-size="14.5" font-weight="700" fill="#FFFFFF">同源 HTTP/Socket 守卫 · Context/Scope 拓扑逆序自动回滚 · 预编译零开销 Hook 切片 · 4s 心跳 SSE 流 · 单源双语 SettingsRegistry</text>
+
+        <!-- Connectors Spine -> Subsystems -->
+        <line x1="150" y1="214" x2="150" y2="244" stroke="#86868B" stroke-width="1.5" marker-end="url(#sa-m)"/>
+        <line x1="410" y1="214" x2="410" y2="244" stroke="#86868B" stroke-width="1.5" marker-end="url(#sa-m)"/>
+        <line x1="690" y1="214" x2="690" y2="244" stroke="#86868B" stroke-width="1.5" marker-end="url(#sa-m)"/>
+        <line x1="960" y1="214" x2="960" y2="244" stroke="#86868B" stroke-width="1.5" marker-end="url(#sa-m)"/>
+
+        <!-- Layer 3: Domain Capability Grid (2x4) -->
+        <rect x="20" y="246" width="256" height="86" rx="12" fill="#FFFFFF" stroke="#D2D2D7" stroke-width="1.4"/>
+        <text x="36" y="268" font-size="10.5" font-family="ui-monospace, SF Mono, monospace" font-weight="600" fill="#0071E3">internal/loop + context</text>
+        <text x="36" y="289" font-size="14" font-weight="700" fill="#1D1D1F">可插拔主循环与锚定压缩</text>
+        <text x="36" y="309" font-size="12" fill="#6E6E73">步边界 Steer 注入 · DoomLoop 熔断</text>
+        <text x="36" y="324" font-size="12" fill="#6E6E73">静态前缀缓存分割 · 增量摘要合并</text>
+
+        <rect x="294" y="246" width="256" height="86" rx="12" fill="#FFFFFF" stroke="#D2D2D7" stroke-width="1.4"/>
+        <text x="310" y="268" font-size="10.5" font-family="ui-monospace, SF Mono, monospace" font-weight="600" fill="#0071E3">internal/provider</text>
+        <text x="310" y="289" font-size="14" font-weight="700" fill="#1D1D1F">四大原生模型流与弹性重试</text>
+        <text x="310" y="309" font-size="12" fill="#6E6E73">Anthropic / OpenAI / Gemini / Ollama</text>
+        <text x="310" y="324" font-size="12" fill="#6E6E73">Preserved Thinking 保真 · 1.5x 超时</text>
+
+        <rect x="568" y="246" width="256" height="86" rx="12" fill="#FFFFFF" stroke="#D2D2D7" stroke-width="1.4"/>
+        <text x="584" y="268" font-size="10.5" font-family="ui-monospace, SF Mono, monospace" font-weight="600" fill="#0071E3">internal/vfs + index + ptc</text>
+        <text x="584" y="289" font-size="14" font-weight="700" fill="#1D1D1F">原子编辑事务与代码智能</text>
+        <text x="584" y="309" font-size="12" fill="#6E6E73">BLAKE3 前置锁 · 按块部分批准</text>
+        <text x="584" y="324" font-size="12" fill="#6E6E73">Tree-sitter RepoMap · LSP · PTC 脚本</text>
+
+        <rect x="842" y="246" width="258" height="86" rx="12" fill="#FFFFFF" stroke="#0071E3" stroke-width="1.8"/>
+        <text x="858" y="268" font-size="10.5" font-family="ui-monospace, SF Mono, monospace" font-weight="600" fill="#0071E3">internal/fleet</text>
+        <text x="858" y="289" font-size="14" font-weight="700" fill="#1D1D1F">五模可视化多 Agent 编排器</text>
+        <text x="858" y="309" font-size="12" fill="#6E6E73">Cache-Fork 子代理 · Worktree 战队</text>
+        <text x="858" y="324" font-size="12" fill="#6E6E73">共享黑板抢单 · Witness + Refinery</text>
+
+        <rect x="20" y="346" width="350" height="86" rx="12" fill="#FFFFFF" stroke="#0071E3" stroke-width="1.8"/>
+        <text x="36" y="368" font-size="10.5" font-family="ui-monospace, SF Mono, monospace" font-weight="600" fill="#0071E3">internal/alwayson</text>
+        <text x="36" y="389" font-size="14" font-weight="700" fill="#1D1D1F">Always-On 全天候常驻五大原语</text>
+        <text x="36" y="409" font-size="12" fill="#6E6E73">幂等 Inbox(单写者租约+微批) · 双模 Timers · 指针型 Memory</text>
+        <text x="36" y="424" font-size="12" fill="#6E6E73">Deferred 非阻塞挂起恢复 · 静默节流 Outbox · Dreaming 自进化</text>
+
+        <rect x="388" y="346" width="352" height="86" rx="12" fill="#FFFFFF" stroke="#D97706" stroke-width="1.6"/>
+        <text x="404" y="368" font-size="10.5" font-family="ui-monospace, SF Mono, monospace" font-weight="600" fill="#D97706">internal/security + sandbox</text>
+        <text x="404" y="389" font-size="14" font-weight="700" fill="#1D1D1F">九步固定权限门控 · OS 沙箱 · 外部凭证代理</text>
+        <text x="404" y="409" font-size="12" fill="#6E6E73">Seatbelt / Landlock 强隔离 · 规范路径防软链逃逸 · 不可信信封</text>
+        <text x="404" y="424" font-size="12" fill="#6E6E73">Egress Proxy 注入密钥(环境0密钥) · 隔离预览壳与只读副本打开</text>
+
+        <rect x="758" y="346" width="342" height="86" rx="12" fill="#FFFFFF" stroke="#D2D2D7" stroke-width="1.4"/>
+        <text x="774" y="368" font-size="10.5" font-family="ui-monospace, SF Mono, monospace" font-weight="600" fill="#0071E3">internal/ext + connectors</text>
+        <text x="774" y="389" font-size="14" font-weight="700" fill="#1D1D1F">开放扩展生态与企业插件包</text>
+        <text x="774" y="409" font-size="12" fill="#6E6E73">SKILL.md 路径激活 · 内容哈希信任 Hooks/MCP · BM25 搜索</text>
+        <text x="774" y="424" font-size="12" fill="#6E6E73">可插拔企业连接器 (如 Salesforce v68 动态读写挂载)</text>
+
+        <!-- Layer 4: Unified Storage Substrate -->
+        <rect x="20" y="448" width="1080" height="56" rx="12" fill="#F5F5F7" stroke="#AEAEB2" stroke-width="1.4"/>
+        <text x="42" y="472" font-size="11" font-family="ui-monospace, SF Mono, monospace" font-weight="700" fill="#1D1D1F">LAYER 4 · ZERO-DB FILE-NATIVE VAULT (~/.gorness/ · TOML Config + MD Memory/Agents/Board + JSONL Tree + HTML)</text>
+        <text x="42" y="492" font-size="12.5" fill="#6E6E73">彻底零数据库：config/providers/workflows(.toml) · agents/skills/memory/missions(.md) · sessions/inbox/outbox(.jsonl) · artifacts(.html)</text>
+      </svg>
+    </div>
+
+    <!-- All 10 Subsystems Complete Spec Cards -->
+    <div class="subsystems-bento">
+      <div class="sys-spec-card">
+        <div class="sys-spec-head">
+          <span class="sys-spec-pkg">01 · cmd/gorness* + studio/macos</span>
+          <span class="sys-spec-origin">融合 OpenCode v2 + Crush + Auriga</span>
+        </div>
+        <h4>单引擎守护服务 + 原生三端同源</h4>
+        <ul>
+          <li><strong>原生 Swift 启动器：</strong>探测复用或拉起内置 <code>gornessd</code>，管理 Menu Bar 常驻胶囊、系统通知、Keychain 与企业 SSO 桥接。</li>
+          <li><strong>零依赖内嵌工作台：</strong>前端静态资源经 <code>embed.FS</code> 编译进二进制，同源通信零 CORS 暴露；CLI/TUI 通过同一套流式接口无缝接力。</li>
+        </ul>
+      </div>
+
+      <div class="sys-spec-card">
+        <div class="sys-spec-head">
+          <span class="sys-spec-pkg">02 · internal/kernel</span>
+          <span class="sys-spec-origin">融合 DeepSeek Harness + Orca</span>
+        </div>
+        <h4>无特权 Go 微内核与预编译事件总线</h4>
+        <ul>
+          <li><strong>四条生命周期铁律：</strong>服务就绪后才可见；归属直接注册者；拓扑逆序先停消费方再停底层服务；卸载自动清理一切路由、工具、定时器与登记子进程。</li>
+          <li><strong>零开销拦截点：</strong>启动收尾将监听器固化为紧凑切片，空位点耗时 <code>0 ns</code>；连 <code>AgentLoop</code> 自身均可按模式热替换。</li>
+        </ul>
+      </div>
+
+      <div class="sys-spec-card">
+        <div class="sys-spec-head">
+          <span class="sys-spec-pkg">03 · internal/provider + prompt</span>
+          <span class="sys-spec-origin">融合 Claude Code + Pi + OpenCode</span>
+        </div>
+        <h4>四大原生传输层与字节级缓存保真</h4>
+        <ul>
+          <li><strong>零失真原生协议：</strong>直连 Anthropic Messages（原生支持 Adaptive/Preserved Thinking、<code>eager_input_streaming</code>、<code>fallbacks</code>）、OpenAI Responses、Gemini 与本地 Ollama/MLX。</li>
+          <li><strong>固定前缀铁律：</strong><code>messages[0]</code> 严格只放排序工具定义与静态系统提示；一切动态变化通过尾部 <code>&lt;system-reminder&gt;</code> 注入，重试支持 <code>1.5x</code> 超时放大与脏流重置。</li>
+        </ul>
+      </div>
+
+      <div class="sys-spec-card">
+        <div class="sys-spec-head">
+          <span class="sys-spec-pkg">04 · internal/index + context</span>
+          <span class="sys-spec-origin">融合 Aider + Cursor + Gemini CLI</span>
+        </div>
+        <h4>确定性代码智能与锚定增量压缩</h4>
+        <ul>
+          <li><strong>PageRank 符号图谱：</strong>内置 <code>ripgrep</code> + <code>Tree-sitter</code> 提取全仓 AST 引用图并按 Token 预算生成高信噪比 RepoMap，写文件后自动触发 <code>LSP</code> 增量类型检查。</li>
+          <li><strong>跨会话无损压缩：</strong>保留头部与最近 30% 原文轮次，中间段与旧摘要增量归并，压缩后自动重新挂载最近活跃修改的核心文件。</li>
+        </ul>
+      </div>
+
+      <div class="sys-spec-card">
+        <div class="sys-spec-head">
+          <span class="sys-spec-pkg">05 · internal/vfs + tools + ptc</span>
+          <span class="sys-spec-origin">融合 Kendr Code + Pi + Claude Code</span>
+        </div>
+        <h4>BLAKE3 原子编辑事务与 PTC 脚本模式</h4>
+        <ul>
+          <li><strong>防覆盖事务引擎：</strong>写操作前置核对读取时的 BLAKE3 哈希；支持逐 Diff 块勾选部分批准（Partial Hunk Approval）；按 <code>changeKind</code> 精确支持一键还原或连带文件回退。</li>
+          <li><strong>4+1 工具 + Code Mode：</strong>极简常驻面搭配 BM25 延迟工具搜索，支持模型编写沙箱脚本在单轮内批量组合调用外部工具并过滤大结果集。</li>
+        </ul>
+      </div>
+
+      <div class="sys-spec-card">
+        <div class="sys-spec-head">
+          <span class="sys-spec-pkg">06 · internal/security + sandbox</span>
+          <span class="sys-spec-origin">融合 Codex + OpenClaw + Auriga</span>
+        </div>
+        <h4>九步权限状态机 · OS 沙箱 · 外部凭证代理</h4>
+        <ul>
+          <li><strong>内核沙箱与凭证隔离：</strong>macOS Seatbelt / Linux Landlock 强制收紧系统服务通道；子进程环境 0 密钥，由边界外 Egress 代理按可信主机透明注入 Token 并全链路 <code>RedactDeep</code> 脱敏。</li>
+          <li><strong>内容绑定信任：</strong>Hooks、MCP 配置与审批均绑定内容哈希；外部打开文件强制复制只读副本核对 inode，HTML 预览严格限制在无 <code>allow-same-origin</code> 隔离壳中。</li>
+        </ul>
+      </div>
+
+      <div class="sys-spec-card">
+        <div class="sys-spec-head">
+          <span class="sys-spec-pkg">07 · internal/alwayson</span>
+          <span class="sys-spec-origin">完整内置 Anthropic Always-On 架构</span>
+        </div>
+        <h4>休眠-唤醒全天候常驻五大原语</h4>
+        <ul>
+          <li><strong>单活收件箱与双模定时器：</strong>SQLite <code>inbox_events</code> 幂等去重 + 单写者心跳租约 + 连发消息微批合并；<code>timers</code> 独立轮询 Follow-up 与 Cron 入箱。</li>
+          <li><strong>非阻塞挂起与梦境进化：</strong>高危工具触发 <code>Defer</code> 保存现场并立刻释放 Worker；空闲期 <code>Dreamer</code> 自动整理四层指针记忆并提炼固化新 <code>SKILL.md</code>。</li>
+        </ul>
+      </div>
+
+      <div class="sys-spec-card">
+        <div class="sys-spec-head">
+          <span class="sys-spec-pkg">08 · internal/fleet + protocol</span>
+          <span class="sys-spec-origin">融合 Anthropic 5 范式 + Gas Town + Goose</span>
+        </div>
+        <h4>可视化多 Agent 舰队与全协议互操作</h4>
+        <ul>
+          <li><strong>五模合一编排：</strong>对抗盲审、缓存共享子代理、独占 Git Worktree 常驻战队、强类型事件网格、五表共享 SQL 黑板，配齐 <code>Witness</code> 巡检与 <code>Refinery</code> 串行合并队列。</li>
+          <li><strong>零壁垒生态：</strong>原生兼容 <code>.agents/skills/</code>、全传输双向 MCP（默认不盲信自报 <code>readOnlyHint</code>）、ACP Server/Host 与 SSH 远端免安装守护注入。</li>
+        </ul>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- Chapter 3: Deep Study of Anthropic "Building Always-On Agents" -->
+<section id="always-on" class="chapter-light">
+  <div class="container">
+    <div class="chapter-kicker">03 · Anthropic《Building Always-On Agents》五大原语内核化设计</div>
+    <h2 class="chapter-title">99% 时间零 Token 深度休眠，事件到达毫秒级精准唤醒</h2>
+    <p class="chapter-lead">
+      彻底告别传统常驻 Agent 轮询烧钱、并发双跑踩踏状态、审批阻塞死等三大顽疾。Gorness 在数据库与内核层将 <strong>Event Inbox、Timers、Memory VFS、Permissions (Defer) 与 Outbox</strong> 铸成标准闭环。点击下方四个真实运行切片查看内部流转：
+    </p>
+
+    <div class="always-on-stage">
+      <div class="sim-toolbar">
+        <div class="sim-triggers" role="group" aria-label="切换 Always-On 运行推演切片">
+          <button class="trigger-btn active-trig" onclick="setAlwaysOnScenario(0, this)">推演 1 · 连发消息防抖微批合并</button>
+          <button class="trigger-btn" onclick="setAlwaysOnScenario(1, this)">推演 2 · 自设 Follow-up 定时巡检与静默收官</button>
+          <button class="trigger-btn" onclick="setAlwaysOnScenario(2, this)">推演 3 · Deferred 挂起释放 Worker 与远程恢复</button>
+          <button class="trigger-btn" onclick="setAlwaysOnScenario(3, this)">推演 4 · 凌晨 Dreaming 记忆策展与技能合成</button>
+        </div>
+        <div class="sleep-meter">
+          <span>内核态</span>
+          <span class="state-chip state-run" id="ao-state-chip">WAKE · BATCH RUN</span>
+          <span style="font-family:var(--font-mono);font-size:12px;color:var(--ink-secondary);" id="ao-token-rate">Cache Hit 95%</span>
+        </div>
+      </div>
+
+      <div class="svg-frame" style="margin-top:0;padding:16px;">
+        <svg viewBox="0 0 1040 415" role="img" aria-labelledby="ao-cycle-title ao-cycle-desc">
+          <title id="ao-cycle-title">Gorness Always-On 五大原语闭环图</title>
+          <desc id="ao-cycle-desc">外部 Webhook、用户消息与持久化定时器统一进入幂等 Event Inbox，由持有单写者租约的 Worker 唤醒 Session，结合四层指针记忆与非阻塞权限挂起，最终经 Outbox 节流投递后回归零消耗休眠。</desc>
+          <defs>
+            <marker id="ao-arr" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M0 1.5 L8.5 5 L0 8.5z" fill="#86868B"/></marker>
+            <marker id="ao-arr-blue" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M0 1.5 L8.5 5 L0 8.5z" fill="#0071E3"/></marker>
+            <marker id="ao-arr-amber" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M0 1.5 L8.5 5 L0 8.5z" fill="#D97706"/></marker>
+          </defs>
+
+          <!-- Sleep/Wake Timeline Bar -->
+          <rect x="20" y="12" width="1000" height="40" rx="10" fill="#F5F5F7" stroke="#E5E5EA"/>
+          <text x="36" y="36" font-size="11.5" font-weight="700" fill="#6E6E73">SLEEP / WAKE</text>
+          <rect x="134" y="20" width="180" height="24" rx="6" fill="#E8F5E9"/>
+          <text x="224" y="36" font-size="11" font-family="ui-monospace, SF Mono, monospace" fill="#1D9A50" text-anchor="middle">SLEEP (0 Tok · 14MB RSS)</text>
+          <rect x="322" y="20" width="146" height="24" rx="6" fill="#0071E3"/>
+          <text x="395" y="36" font-size="11" font-family="ui-monospace, SF Mono, monospace" fill="#FFFFFF" text-anchor="middle">RUN #41 (Batch Wake)</text>
+          <rect x="476" y="20" width="232" height="24" rx="6" fill="#FEF3C7"/>
+          <text x="592" y="36" font-size="11" font-family="ui-monospace, SF Mono, monospace" fill="#B45309" text-anchor="middle">DEFERRED SAVED (Worker 空闲可接他单)</text>
+          <rect x="716" y="20" width="144" height="24" rx="6" fill="#0071E3"/>
+          <text x="788" y="36" font-size="11" font-family="ui-monospace, SF Mono, monospace" fill="#FFFFFF" text-anchor="middle">RUN #42 (Resume)</text>
+          <rect x="868" y="20" width="138" height="24" rx="6" fill="#E8F5E9"/>
+          <text x="937" y="36" font-size="11" font-family="ui-monospace, SF Mono, monospace" fill="#1D9A50" text-anchor="middle">SLEEP (0 Tok)</text>
+
+          <!-- Connectors -->
+          <path d="M 176 140 L 228 140" stroke="#0071E3" stroke-width="2" fill="none" marker-end="url(#ao-arr-blue)" class="flow-line-active"/>
+          <path d="M 320 302 L 320 204" stroke="#86868B" stroke-width="1.8" fill="none" marker-end="url(#ao-arr)"/>
+          <path d="M 412 140 L 476 140" stroke="#0071E3" stroke-width="2.2" fill="none" marker-end="url(#ao-arr-blue)" class="flow-line-active"/>
+          <path d="M 556 208 L 556 280" stroke="#0071E3" stroke-width="1.8" fill="none" marker-end="url(#ao-arr-blue)"/>
+          <path d="M 596 280 L 596 208" stroke="#86868B" stroke-width="1.5" stroke-dasharray="4 3" fill="none" marker-end="url(#ao-arr)"/>
+          <path d="M 686 208 L 686 280" stroke="#D97706" stroke-width="1.8" fill="none" marker-end="url(#ao-arr-amber)"/>
+          <path d="M 508 208 L 508 246 Q 508 254 500 254 L 368 254 Q 360 254 360 262 L 360 302" stroke="#86868B" stroke-width="1.5" stroke-dasharray="5 4" fill="none" marker-end="url(#ao-arr)"/>
+          <path d="M 736 140 L 804 140" stroke="#0071E3" stroke-width="2" fill="none" marker-end="url(#ao-arr-blue)" class="flow-line-active"/>
+          <path d="M 912 198 L 912 390 Q 912 398 904 398 L 98 398 Q 90 398 90 390 L 90 198" stroke="#D97706" stroke-width="1.6" stroke-dasharray="6 4" fill="none" marker-end="url(#ao-arr-amber)"/>
+
+          <rect x="418" y="118" width="52" height="15" fill="#FFFFFF"/>
+          <text x="444" y="129" font-size="9.5" font-family="ui-monospace, SF Mono, monospace" fill="#0071E3" text-anchor="middle">LEASE=1</text>
+
+          <rect x="415" y="385" width="224" height="16" fill="#FFFFFF"/>
+          <text x="527" y="396" font-size="10" font-family="ui-monospace, SF Mono, monospace" fill="#D97706" text-anchor="middle">USER REPLY / APPROVAL CARD RESPONSE → INBOX</text>
+
+          <!-- Nodes -->
+          <rect x="20" y="84" width="156" height="112" rx="12" fill="#F5F5F7" stroke="#D2D2D7"/>
+          <text x="34" y="107" font-size="10.5" font-family="ui-monospace, SF Mono, monospace" fill="#6E6E73">FAST INGRESS</text>
+          <text x="34" y="128" font-size="14" font-weight="700" fill="#1D1D1F">极速事件写入端</text>
+          <text x="34" y="148" font-size="11.5" fill="#6E6E73">• Webhook 验签入表</text>
+          <text x="34" y="166" font-size="11.5" fill="#6E6E73">• 用户连发消息收集</text>
+          <text x="34" y="184" font-size="11" font-family="ui-monospace, SF Mono, monospace" fill="#1D9A50">200 OK &lt; 1.5ms</text>
+
+          <rect id="node-inbox" x="228" y="80" width="184" height="122" rx="14" fill="#FFFFFF" stroke="#0071E3" stroke-width="2"/>
+          <text x="242" y="103" font-size="10.5" font-family="ui-monospace, SF Mono, monospace" font-weight="700" fill="#0071E3">01 · EVENT INBOX</text>
+          <text x="242" y="125" font-size="15" font-weight="700" fill="#1D1D1F">幂等事件收件箱</text>
+          <text x="242" y="146" font-size="11.5" fill="#6E6E73">追加账本 (inbox.jsonl + flock)</text>
+          <text x="242" y="165" font-size="11" font-family="ui-monospace, SF Mono, monospace" fill="#1D1D1F">UNIQUE(source, source_id)</text>
+          <text x="242" y="184" font-size="11.5" fill="#0071E3">单活锁 · 防抖合并 · 崩溃重领</text>
+
+          <rect id="node-timers" x="228" y="302" width="184" height="72" rx="12" fill="#FFFFFF" stroke="#D2D2D7" stroke-width="1.5"/>
+          <text x="242" y="323" font-size="10.5" font-family="ui-monospace, SF Mono, monospace" font-weight="700" fill="#6E6E73">02 · TIMERS</text>
+          <text x="242" y="343" font-size="13.5" font-weight="700" fill="#1D1D1F">Follow-up &amp; Cron 调度</text>
+          <text x="242" y="361" font-size="11" fill="#6E6E73">单事务扫描到期项投递 Inbox</text>
+
+          <rect x="476" y="76" width="260" height="132" rx="16" fill="#1D1D1F"/>
+          <text x="494" y="100" font-size="10.5" font-family="ui-monospace, SF Mono, monospace" fill="#64D2FF">SINGLE-WRITER WORKER · SESSION RUN</text>
+          <text x="494" y="124" font-size="16" font-weight="700" fill="#FFFFFF">Gorness Agent Loop</text>
+          <text x="494" y="146" font-size="12" fill="#A1A1A6">• 固定前缀挂载 System + Tools + Memory</text>
+          <text x="494" y="165" font-size="12" fill="#A1A1A6">• 续接关联 Session 或创建干净新会话</text>
+          <text x="494" y="184" font-size="11.5" fill="#30D158">• 运行中来新信：Queue / Fold / Restart</text>
+
+          <rect id="node-memory" x="476" y="280" width="152" height="94" rx="12" fill="#FFFFFF" stroke="#D2D2D7" stroke-width="1.5"/>
+          <text x="490" y="301" font-size="10.5" font-family="ui-monospace, SF Mono, monospace" font-weight="700" fill="#0071E3">03 · MEMORY VFS</text>
+          <text x="490" y="320" font-size="13.5" font-weight="700" fill="#1D1D1F">指针型四层记忆</text>
+          <text x="490" y="338" font-size="10.5" font-family="ui-monospace, SF Mono, monospace" fill="#6E6E73">instructions · index</text>
+          <text x="490" y="353" font-size="10.5" font-family="ui-monospace, SF Mono, monospace" fill="#6E6E73">reported · progress/*</text>
+          <text x="490" y="368" font-size="11" fill="#1D9A50">+ 空闲 Dreaming 提炼</text>
+
+          <rect id="node-perm" x="642" y="280" width="166" height="94" rx="12" fill="#FFFFFF" stroke="#D2D2D7" stroke-width="1.5"/>
+          <text x="656" y="301" font-size="10.5" font-family="ui-monospace, SF Mono, monospace" font-weight="700" fill="#D97706">04 · PERMISSIONS</text>
+          <text x="656" y="320" font-size="13.5" font-weight="700" fill="#1D1D1F">无人值守安全门控</text>
+          <text x="656" y="338" font-size="11" fill="#6E6E73">• 沙箱外凭证代理注入</text>
+          <text x="656" y="353" font-size="11" fill="#6E6E73">• Auto 分类器实时阻断</text>
+          <text x="656" y="368" font-size="11" font-weight="600" fill="#D97706">• Defer 存盘释放 Worker</text>
+
+          <rect id="node-outbox" x="804" y="80" width="216" height="118" rx="14" fill="#FFFFFF" stroke="#D2D2D7" stroke-width="1.5"/>
+          <text x="820" y="103" font-size="10.5" font-family="ui-monospace, SF Mono, monospace" font-weight="700" fill="#0071E3">05 · OUTBOX DISPATCH</text>
+          <text x="820" y="125" font-size="15" font-weight="700" fill="#1D1D1F">受控发件箱与信噪过滤</text>
+          <text x="820" y="146" font-size="11.5" fill="#6E6E73">三终态：Send / Silent / Defer</text>
+          <text x="820" y="164" font-size="11.5" fill="#6E6E73">核对 reported.md 杜绝重复刷屏</text>
+          <text x="820" y="182" font-size="11" font-family="ui-monospace, SF Mono, monospace" fill="#1D1D1F">Workbench · MenuBar · IM</text>
+        </svg>
+      </div>
+
+      <div class="sim-narration" id="ao-step-desc"></div>
+
+      <div class="primitives-five-grid">
+        <div class="prim-card highlighted" id="pcard-0">
+          <div class="prim-sub">01 · EVENT INBOX</div>
+          <div class="prim-title">唯一事实源收件箱</div>
+          <div class="prim-desc">快速落盘去重 ACK，深度提示注入检查放到 Run 内；单 Inbox 严格绑定单活 Worker 租约，进程强杀重启自动续跑未完事件。</div>
+        </div>
+        <div class="prim-card" id="pcard-1">
+          <div class="prim-sub">02 · DURABLE TIMERS</div>
+          <div class="prim-title">主动性唤醒引擎</div>
+          <div class="prim-desc">Agent 可随时调用 <code>set_followup</code> 给自己定闹钟检查异步构建或外部回复；周期 Cron 自动推进下次触发槽位并投递 Inbox。</div>
+        </div>
+        <div class="prim-card" id="pcard-2">
+          <div class="prim-sub">03 · POINTER MEMORY</div>
+          <div class="prim-title">只存不可重查之物</div>
+          <div class="prim-desc">Issue/PR 等外部数据只存指针防过期；启动仅加载轻量索引保住缓存命中，空闲期运行 Dreaming 归并冗余并沉淀自进化技能。</div>
+        </div>
+        <div class="prim-card" id="pcard-3">
+          <div class="prim-sub">04 · DEFERRED CALL</div>
+          <div class="prim-title">挂起绝不卡死队列</div>
+          <div class="prim-desc">遇越权或不确定决策时保存半完成工具栈立即收尾本轮 Run，Worker 继续消费其他事件；用户批复卡片回流 Inbox 后无缝接续。</div>
+        </div>
+        <div class="prim-card" id="pcard-4">
+          <div class="prim-sub">05 · PACED OUTBOX</div>
+          <div class="prim-title">克制打扰赢得信任</div>
+          <div class="prim-desc">屏蔽后台百步排障噪音，只发结论或审批卡；发送前校验 <code>reported.md</code>，无新进展自动走 <code>Silent</code> 静默结束。</div>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- Chapter 4: Interactive Visual Multi-Agent Orchestration Studio -->
+<section id="orchestration" class="chapter-obsidian">
+  <div class="container">
+    <div class="chapter-kicker">04 · 多 Agent 编排可视化中心（Interactive Visual Fleet Studio）</div>
+    <h2 class="chapter-title">看见每一个智能体的思考、工作树、黑板抢单与合入门控</h2>
+    <p class="chapter-lead">
+      将五种行业标准协同范式（生成验证闭环、主从缓存分派、常驻 Worktree 战队、强类型事件总线、去中心化共享黑板）统一收编进 <code>internal/fleet</code>。<strong>上方可切换 6 种编排拓扑结构，点击画布中的任意智能体或基础设施节点，右侧面板即刻实时透视其上下文水位、独占分支、运行日志，并支持直接注入中途纠偏指令（Steer）</strong>：
+    </p>
+
+    <div class="segmented-bar" role="tablist" aria-label="切换多 Agent 编排可视化模式">
+      <button class="seg-btn active" onclick="selectTopology('hybrid', this)">Gorness 旗舰混合舰队（点击节点可交互透视）</button>
+      <button class="seg-btn" onclick="selectTopology('genver', this)">范式 1 · 生成-验证对抗</button>
+      <button class="seg-btn" onclick="selectTopology('orchsub', this)">范式 2 · 主从缓存分派</button>
+      <button class="seg-btn" onclick="selectTopology('teams', this)">范式 3 · 常驻 Worktree 战队</button>
+      <button class="seg-btn" onclick="selectTopology('bus', this)">范式 4 · 强类型事件网格</button>
+      <button class="seg-btn" onclick="selectTopology('shared', this)">范式 5 · 千级共享状态黑板</button>
+    </div>
+
+    <div class="orchestration-studio">
+      <div class="studio-top">
+        <div>
+          <div class="pattern-headline" id="topo-title"></div>
+          <p class="pattern-summary" id="topo-desc"></p>
+        </div>
+        <div class="studio-gauges">
+          <div class="gauge-pill">
+            <div class="gauge-lbl">上下文与代码隔离</div>
+            <div class="gauge-val" id="topo-ctx"></div>
+          </div>
+          <div class="gauge-pill">
+            <div class="gauge-lbl">单点故障风险</div>
+            <div class="gauge-val" id="topo-spof" style="color:#30D158;"></div>
+          </div>
+          <div class="gauge-pill">
+            <div class="gauge-lbl">收敛与安全门控</div>
+            <div class="gauge-val" id="topo-guard"></div>
+          </div>
+        </div>
+      </div>
+
+      <div class="fleet-live-grid">
+        <!-- Left: Dynamic Interactive Topology SVG -->
+        <div class="dark-svg-wrapper">
+          <svg id="topo-svg" viewBox="0 0 820 440" role="img" aria-labelledby="topo-svg-title topo-svg-desc">
+            <title id="topo-svg-title">Gorness 多 Agent 可视化编排拓扑</title>
+            <desc id="topo-svg-desc">可点击交互的多智能体实时协作拓扑与数据流图。</desc>
+          </svg>
+        </div>
+
+        <!-- Right: Live Selected Agent Node Inspector & Steer Console -->
+        <aside class="node-inspector-dark" aria-live="polite">
+          <div>
+            <span class="ni-badge" id="ni-role">CLICK ANY NODE ON CANVAS</span>
+            <div class="ni-title" id="ni-name">Mayor / Lead Coordinator</div>
+            <div class="ni-meta" id="ni-model">claude-opus-5-5 · effort: high</div>
+
+            <div class="ni-kv-list" id="ni-kvs"></div>
+
+            <div class="ni-log" id="ni-log"></div>
+          </div>
+
+          <div>
+            <div style="font-size:11px;color:var(--ink-on-dark-muted);margin-bottom:6px;">向当前选中节点发送步边界纠偏指令（<code>POST /api/runs/:id/steer</code>）：</div>
+            <div class="steer-box">
+              <input type="text" class="steer-input" id="steer-input" placeholder="例如：优先复用 vfs 包已有 BLAKE3 校验器..." aria-label="向选中 Agent 发送中途纠偏指令"/>
+              <button class="steer-btn" onclick="sendDemoSteer()">注入 Steer</button>
+            </div>
+          </div>
+        </aside>
+      </div>
+
+      <div class="studio-bottom">
+        <div class="studio-note">
+          <div class="studio-note-title">适用问题特征</div>
+          <div class="studio-note-body" id="topo-when"></div>
+        </div>
+        <div class="studio-note">
+          <div class="studio-note-title">常见失控陷阱</div>
+          <div class="studio-note-body" id="topo-fail"></div>
+        </div>
+        <div class="studio-note">
+          <div class="studio-note-title">Gorness 内核保障机制</div>
+          <div class="studio-note-body" id="topo-go"></div>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- Chapter 5: Unified Complete Codebase, SQLite Schema, HTTP/SSE API & Hard Invariants -->
+<section id="contracts" class="chapter-light">
+  <div class="container">
+    <div class="chapter-kicker">05 · 一次到位的工程实现契约（Repository · Schema · API · Guardrails）</div>
+    <h2 class="chapter-title">完整包划分、彻底零数据库 ~/.gorness/ 全透明文件架构、全接口契约与十条安全红线</h2>
+    <p class="chapter-lead">
+      直接面向编码落地的完整施工图：所有模块边界无循环依赖，所有状态变更先落盘后改内存，所有外部依赖均通过结构体构造参数注入以实现零端口内存级全量测试。
+    </p>
+
+    <div class="spec-workbench">
+      <!-- Left: Multi-Tab Engineering Specification Viewer -->
+      <div class="code-window">
+        <div class="code-titlebar">
+          <div class="mac-dots">
+            <span class="mac-dot dot-close"></span>
+            <span class="mac-dot dot-min"></span>
+            <span class="mac-dot dot-max"></span>
+          </div>
+          <div class="code-tabs" role="tablist">
+            <button class="code-tab active" onclick="switchCodeTab('repo', this)">全仓目录树</button>
+            <button class="code-tab" onclick="switchCodeTab('sql', this)">~/.gorness/ 文件架构</button>
+            <button class="code-tab" onclick="switchCodeTab('api', this)">HTTP/SSE/ACP 接口</button>
+            <button class="code-tab" onclick="switchCodeTab('kernel', this)">微内核与权限门控</button>
+          </div>
+        </div>
+        <pre class="go-code" id="go-code-display"></pre>
+      </div>
+
+      <!-- Right: 10 Non-Negotiable Architectural Guardrails -->
+      <div class="invariants-panel">
+        <h3>十条贯穿全仓的硬边界（每一条均绑定自动化单测）</h3>
+        <div class="inv-list">
+          <div class="inv-item">
+            <strong>1. 单调全局序号（Global Monotonic <code>seq</code>）</strong>
+            <span><code>messages</code>、<code>agent_runs</code>、<code>run_steps</code>、<code>file_snapshots</code> 共用同一递增序列；<code>/fork</code> 与 <code>/rewind</code> 按单个事务精确截断或还原新建/修改文件。</span>
+          </div>
+          <div class="inv-item">
+            <strong>2. 九步固定顺序 <code>PermissionGate</code></strong>
+            <span>硬黑名单底线 → Plan 只读拦截 → 未信任项目配置降级 → Hook 询问 → 语义级只读判定（MCP 自报 <code>readOnlyHint</code> 一律不免审）→ 自启动配置保护 → 必问工具 → 内容指纹授权 → 模式分支。</span>
+          </div>
+          <div class="inv-item">
+            <strong>3. 派生上下文权限单调收紧</strong>
+            <span>子代理、Code Mode 脚本、Always-On 后台唤醒、外部 ACP 委托代理，其工具集、目录规范边界（解析软链接后）与沙箱策略严格继承父级交集，绝不允许提权。</span>
+          </div>
+          <div class="inv-item">
+            <strong>4. 同意永远绑定“内容指纹”而非文件名</strong>
+            <span>项目级 Hooks、<code>.mcp.json</code>、审批 Diff 块与命令放行均绑定 BLAKE3 哈希；文件或工作区路径一旦变动，旧信任立刻失效并回退人工确认。</span>
+          </div>
+          <div class="inv-item">
+            <strong>5. 沙箱零密钥 + 全链路单一脱敏器</strong>
+            <span>工具环境变量不含任何 LLM Key 或企业会话 <code>sid</code>；日志、落库、错误回显统一经过唯一 <code>RedactDeep</code> 清洗。</span>
+          </div>
+          <div class="inv-item">
+            <strong>6. 安全外部查看与零逃逸预览壳</strong>
+            <span>调用 macOS <code>open</code> 前仅对白名单文档复制只读副本并用 FD+inode 复核；模型生成的 HTML 一律在无 <code>allow-same-origin</code> 且禁外网跳转的隔离预览壳中渲染。</span>
+          </div>
+          <div class="inv-item">
+            <strong>7. 工具如实禀报语义（Honest Tool Reporting）</strong>
+            <span>结果截断、部分写入失败、超时后状态未知（严禁谎报“未执行，可安全重试”）必须如实结构化告知模型与前端工具卡。</span>
+          </div>
+          <div class="inv-item">
+            <strong>8. 审批卡片 500ms 防误触冷静锁</strong>
+            <span>新审批卡切入视口后 <code>500ms</code> 内屏蔽批准点击与快捷键连击，杜绝连续拍板误放行高危指令。</span>
+          </div>
+          <div class="inv-item">
+            <strong>9. 同源守护与子进程全生命周期陪葬</strong>
+            <span>引擎仅应答本机同源页面与认证 CLI，绝不挂载宽泛 CORS；所有拉起的 MCP、LSP、Hook 与 Worktree 进程统一登记进程组，引擎退出零孤儿残留。</span>
+          </div>
+          <div class="inv-item">
+            <strong>10. 零 Mock 框架纯构造注入可测性</strong>
+            <span>每个测试独占临时数据目录、带符号链接覆盖的工作区与 <code>FakeHome</code>，直接通过内存 <code>Handler.ServeHTTP</code> 跑通全链路竞态测试（<code>go test -race</code>）。</span>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- Chapter 6: Apple HIG Three-Pane Workbench + Menu Bar Mockup -->
+<section id="apple-ui" class="chapter-white">
+  <div class="container">
+    <div class="chapter-kicker">06 · Apple Human Interface Guidelines 旗舰界面规范</div>
+    <h2 class="chapter-title">三栏自适应工作台 + Menu Bar 灵动胶囊：繁杂归内核，清透归用户</h2>
+    <p class="chapter-lead">
+      完整延续 macOS 原生质感：左侧边栏智能分区（待处理事项、置顶会话、最近活跃项目），中央流式对话与嵌套子代理卡片（底部悬浮支持<strong>逐块勾选部分批准</strong>的 500ms 防误触审批卡），右侧可拖拽四页检查器（文件、变更时光机、可视化编排、隔离预览）。点击顶部切换三种实时工作态：
+    </p>
+
+    <div class="mac-studio-frame" aria-label="Gorness Apple HIG 桌面工作台交互原型">
+      <div class="mac-window-bar">
+        <div class="mac-dots">
+          <span class="mac-dot dot-close"></span>
+          <span class="mac-dot dot-min"></span>
+          <span class="mac-dot dot-max"></span>
+        </div>
+
+        <div class="mac-view-switcher" role="tablist">
+          <button class="mac-view-btn active" onclick="switchMacView('session', this)">主会话与嵌套子代理流</button>
+          <button class="mac-view-btn" onclick="switchMacView('fleetview', this)">检查器：可视化战队监控</button>
+          <button class="mac-view-btn" onclick="switchMacView('inboxview', this)">Always-On 收发与定时中心</button>
+        </div>
+
+        <div class="mac-menubar-pill">
+          <span style="width:7px;height:7px;border-radius:50%;background:#30D158;display:inline-block;"></span>
+          <span id="menubar-status-text">gornessd · Seatbelt 严格 · 缓存 96%</span>
+        </div>
+      </div>
+
+      <div class="mac-body">
+        <!-- Left Resizable Sidebar -->
+        <div class="mac-sidebar">
+          <div>
+            <div class="side-group-title">需要处理 (1)</div>
+            <div class="side-item" style="background:#FFFBEB;color:#92400E;font-weight:600;">
+              <span>待确认：vfs 事务块写入</span>
+              <span class="side-dot" style="background:#D97706;"></span>
+            </div>
+          </div>
+
+          <div>
+            <div class="side-group-title">最近项目</div>
+            <div class="side-item active">
+              <span>gorness</span>
+              <span style="font-family:var(--font-mono);font-size:11px;">3 活跃</span>
+            </div>
+            <div class="side-item">
+              <span>auriga-connectors</span>
+              <span class="side-dot" style="background:#30D158;"></span>
+            </div>
+            <div class="side-item">
+              <span>apple-hig-kit</span>
+              <span style="font-size:11px;color:#86868B;">空闲</span>
+            </div>
+          </div>
+
+          <div>
+            <div class="side-group-title">ALWAYS-ON 守护与连接器</div>
+            <div class="side-item">
+              <span>Follow-up 定时回查 (2)</span>
+              <span style="font-family:var(--font-mono);font-size:11px;color:#0071E3;">+14m</span>
+            </div>
+            <div class="side-item">
+              <span>Dreaming 技能提炼</span>
+              <span style="font-family:var(--font-mono);font-size:11px;color:#1D9A50;">就绪</span>
+            </div>
+            <div class="side-item">
+              <span>企业连接器 (可选)</span>
+              <span style="font-size:11px;color:#86868B;">只读挂载</span>
+            </div>
+          </div>
+        </div>
+
+        <!-- Center Conversation & Tool Stream -->
+        <div class="mac-main" id="mac-main-panel"></div>
+
+        <!-- Right 4-Tab Inspector + Partial Hunk Approval Card -->
+        <div class="mac-inspector">
+          <div>
+            <div style="display:flex;gap:6px;background:#ECECEF;padding:3px;border-radius:8px;margin-bottom:14px;font-size:11.5px;font-weight:600;text-align:center;">
+              <span style="flex:1;padding:4px 0;color:#6E6E73;">文件</span>
+              <span style="flex:1;padding:4px 0;background:#fff;border-radius:6px;color:#1D1D1F;">变更 &amp; 审批</span>
+              <span style="flex:1;padding:4px 0;color:#6E6E73;">计划</span>
+              <span style="flex:1;padding:4px 0;color:#6E6E73;">隔离预览</span>
+            </div>
+
+            <div class="side-group-title" style="padding:0;">PARTIAL HUNK APPROVAL · 按块部分批准</div>
+            <div class="approval-card" id="demo-approval-card">
+              <div style="font-size:12px;font-weight:700;color:#92400E;">当前是“自动模式”，修改自动执行配置需你确认</div>
+              <div style="font-size:11.5px;color:#78350F;margin-top:3px;"><code>reasonCode: auto-run-config</code> · 500ms 防连点保护已就绪</div>
+
+              <label class="hunk-check">
+                <input type="checkbox" checked id="hunk1"/>
+                <span><strong>Hunk #1</strong> <code>internal/vfs/tx.go</code><br><span style="color:#15803D;">+ 启用 FD + inode 双重原子替换校验</span></span>
+              </label>
+
+              <label class="hunk-check">
+                <input type="checkbox" checked id="hunk2"/>
+                <span><strong>Hunk #2</strong> <code>.gorness/hooks.json</code><br><span style="color:#B45309;">+ 注册提交前 go test -race 守卫</span></span>
+              </label>
+
+              <div class="approval-actions">
+                <button class="btn-approve" onclick="resolveDemoApproval(true)">批准勾选块</button>
+                <button class="btn-deny" onclick="resolveDemoApproval(false)">拒绝</button>
+              </div>
+            </div>
+          </div>
+
+          <div style="padding-top:14px;border-top:1px solid var(--hairline-light);font-size:12px;color:#6E6E73;display:flex;flex-direction:column;gap:6px;">
+            <div style="display:flex;justify-content:space-between;"><span>本轮生效模式 (<code>run_created</code>)</span><strong style="color:#1D1D1F;">Auto · Seatbelt Strict</strong></div>
+            <div style="display:flex;justify-content:space-between;"><span>全局序列水位 (<code>seq</code>)</span><strong style="font-family:var(--font-mono);color:#1D1D1F;">#1,048 (可随时 Fork/Rewind)</strong></div>
+            <div style="display:flex;justify-content:space-between;"><span>中英双语设置注册表</span><strong style="color:#1D9A50;">热生效 · 0 重启</strong></div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<footer class="blueprint-footer">
+  <div class="container">
+    <div class="footer-row">
+      <div>
+        <strong style="color:var(--ink-primary);">Gorness 1.0 Complete Master Architecture Blueprint</strong> · 统一规划 · 一次完整成型
+      </div>
+      <div>
+        Go 1.26 Microkernel · Zero-DB TOML/MD/HTML+JSONL Vault · Always-On 5 Primitives · Visual Multi-Agent Fleet · Apple HIG Workbench
+      </div>
+    </div>
+  </div>
+</footer>
+
+<script>
+  // 1. 14 Studied Harnesses Dataset
+  const HARNESS_DATA = [
+    {
+      id: "claude-code",
+      name: "Claude Code",
+      maker: "Anthropic · 闭源旗舰",
+      lang: "TypeScript",
+      cat: "frontier",
+      catLabel: "原厂旗舰",
+      score: 88,
+      sig: "读写并发分批 · BM25 延迟工具省 40% Token · 静态缓存边界",
+      dims: { "主循环控制": "10/10", "编辑与工具": "9/10", "上下文工程": "9/10", "沙箱隔离": "8/10", "生态扩展性": "10/10", "多端触达": "10/10" },
+      pros: "综合完成度最高。只读工具自动并发、写工具独占串行；Blake2b 静态前缀分割保障高缓存命中；子代理 Fork 复用父缓存；生态标准（Skills/Hooks/MCP）事实定义者。",
+      cons: "强绑定单一厂商模型；重度任务 Token 账单高；闭源 TS 单体无法自由裁剪嵌入。",
+      borrow: "Gorness 完整内置读写并发分批器、静态/动态缓存分割线（尾部 system-reminder 注入）与 BM25 延迟工具搜索。"
+    },
+    {
+      id: "kendr-code",
+      name: "Kendr Code",
+      maker: "Kendr Research · 事务严选标杆",
+      lang: "Rust / TS",
+      cat: "durable",
+      catLabel: "事务与崩溃自愈",
+      score: 88,
+      sig: "读取哈希前置多文件原子事务 · 单写者租约 · CAS 持久化审批",
+      dims: { "编辑事务安全": "10/10", "权限 CAS": "10/10", "崩溃恢复审计": "10/10", "沙箱隔离": "9/10", "原生模型广度": "7/10", "常驻主动性": "6/10" },
+      pros: "编辑安全与持久化满分。拒绝裸拼接 Shell 改文件，每次写入强制校验读取时的内容哈希，多文件变更支持原子替换与补偿回滚；审批落库防并发双批，杀进程重启无损对账。",
+      cons: "多数模型退化走受限 JSON 而非原生工具流；缺少 Always-On 常驻事件闭环与可视化舰队。",
+      borrow: "Gorness 一步到位实现 BLAKE3 读取前置校验、SnapshotStore 原子回滚、按块部分批准与 SQLite 单写者心跳租约。"
+    },
+    {
+      id: "codex",
+      name: "Codex CLI / App",
+      maker: "OpenAI · Apache-2.0",
+      lang: "Rust",
+      cat: "frontier",
+      catLabel: "原厂旗舰",
+      score: 82,
+      sig: "三平台原生 OS 沙箱 (Seatbelt/Landlock) · 四层安全栈 · 高性价比",
+      dims: { "主循环控制": "9/10", "编辑与工具": "9/10", "上下文工程": "8/10", "沙箱隔离": "10/10", "权限模型": "8/10", "多端协同": "8/10" },
+      pros: "OS 级安全隔离满分标杆。默认断网并在内核层限制文件写路径与系统调用；Starlark 声明式策略加 Guardian 风险分类器双保险。",
+      cons: "超百万行 Rust 代码较沉重；偏重自家协议目录。",
+      borrow: "Gorness 原生集成 macOS Seatbelt（严格封堵 LaunchServices/剪贴板代办通道）与 Linux Landlock v3 沙箱。"
+    },
+    {
+      id: "orca-harness",
+      name: "Orca Harness",
+      maker: "Orca · 极速执行内核",
+      lang: "Rust",
+      cat: "microkernel",
+      catLabel: "亚毫秒高性能",
+      score: 81,
+      sig: "100 工具并发扇出 <0.3ms · 3.3ms 冷启动 · 超大输出可寻址分页",
+      dims: { "并发扇出吞吐": "10/10", "冷启动速度": "10/10", "大输出分页": "9/10", "事件流确定性": "9/10", "多模型广度": "7/10", "桌面交互": "6/10" },
+      pros: "证明了 Harness 自身开销可被压缩到极致：启动期将扩展订阅编译为固定数组（空位点零动态分发开销）；超长输出截断但保留分页句柄供模型按需翻阅。",
+      cons: "仅做底层核，缺少完整 Apple 桌面工作台与常驻记忆。",
+      borrow: "Gorness 在 Go 微内核中复刻预编译不可变 Hook 切片与大输出可寻址分页器。"
+    },
+    {
+      id: "cursor-agent",
+      name: "Cursor",
+      maker: "Anysphere · IDE 标杆",
+      lang: "TS / Rust",
+      cat: "frontier",
+      catLabel: "交互审阅标杆",
+      score: 80,
+      sig: "毫秒级仓库感知 · 极致逐块 Diff 审阅体验 · 后台并行代理",
+      dims: { "上下文工程": "10/10", "Diff 交互体验": "10/10", "主循环控制": "9/10", "开放微内核": "5/10", "私有可控": "5/10", "持久化账本": "6/10" },
+      pros: "人机协同审阅流畅度天花板，逐块代码差异接受/拒绝极为直观。",
+      cons: "重度依赖私有云端索引与封闭编辑器外壳。",
+      borrow: "Gorness 工作台内置同等顺滑的逐块勾选 Diff 审批与文件变更时光机，且 100% 本地开源自托管。"
+    },
+    {
+      id: "opencode-v2",
+      name: "OpenCode v2",
+      maker: "Anomaly (SST) · MIT (226k★)",
+      lang: "TypeScript",
+      cat: "agnostic",
+      catLabel: "多模型多端守护",
+      score: 79,
+      sig: "单后台守护服务驱动 CLI/Web/Desktop · 75+ 模型供应商 · 6 方言缓存",
+      dims: { "模型层广度": "10/10", "多端同源架构": "9/10", "上下文工程": "9/10", "生态兼容": "9/10", "内置沙箱": "6/10", "崩溃自愈": "6/10" },
+      pros: "确立了现代 Harness 最佳形态：一个后台守护进程持有全部会话，任意终端随时接入接力；跨厂商读取技能目录；自动挂载 LSP。",
+      cons: "无内置 OS 沙箱；TS 运行时内存偏大。",
+      borrow: "Gorness 采用同样的单 gornessd 后台服务多端同源拓扑，并用静态 Go 二进制 + Swift 宿主彻底消除运行时肥胖。"
+    },
+    {
+      id: "deepseek-harness",
+      name: "DeepSeek Harness (dsh)",
+      maker: "DeepSeek AI · MIT (252k★)",
+      lang: "TypeScript",
+      cat: "microkernel",
+      catLabel: "微内核纯度标杆",
+      score: 78,
+      sig: "Everything is a Plugin · 连主循环都可替换 · 卸载自动回滚副作用",
+      dims: { "微内核解耦": "10/10", "副作用可逆": "10/10", "全链路可回放": "10/10", "静态可追踪": "6/10", "冷启动轻量": "6/10", "原生沙箱": "7/10" },
+      pros: "真正做到无特权内核：所有能力通过 Capability Seam 装配，插件卸载自动逆序清理注册项，杜绝热更新泄漏。",
+      cons: "动态 JS 注入牺牲了编译期静态调用链检查。",
+      borrow: "Gorness 用 Go 强类型接口实现 Context/Scope/Seam 拓扑逆序卸载回滚，兼得彻底解耦与编译期类型安全。"
+    },
+    {
+      id: "hermes-agent",
+      name: "Hermes Agent",
+      maker: "Nous Research · MIT (262k★)",
+      lang: "Python",
+      cat: "alwayson",
+      catLabel: "自进化与常驻记忆",
+      score: 77,
+      sig: "任务后自动编写修补 SKILL.md · FTS5 全文记忆 · Verify-on-Stop 守卫",
+      dims: { "自进化技能": "10/10", "跨会话记忆": "10/10", "完成度校验": "9/10", "全渠道接入": "10/10", "单文件分发": "4/10", "原生桌面端": "6/10" },
+      pros: "越用越聪明的代表：自动复盘复杂任务并沉淀为新技能；SQLite FTS5 毫秒级检索历史对话；内置不可被 --yolo 绕过的硬安全底线。",
+      cons: "Python 依赖环境重，并发与二进制分发不如 Go。",
+      borrow: "Gorness 内置 FTS5 历史检索、不可穿透硬拒绝底线，并在 Always-On 空闲期运行 Dreaming 自进化技能提炼。"
+    },
+    {
+      id: "pi-harness",
+      name: "Pi (及纯 Go 移植 pi-go)",
+      maker: "Earendil · MIT (121k★)",
+      lang: "TS / Go",
+      cat: "durable",
+      catLabel: "极简高信噪比",
+      score: 76,
+      sig: "4 核心工具实测单次成功成本最低 ($0.028) · 会话树任意分支回溯",
+      dims: { "Token 经济性": "10/10", "核心精简度": "10/10", "会话树分叉": "10/10", "SSH 远端注入": "9/10", "内置安全门控": "2/10", "多代理编排": "4/10" },
+      pros: "极少常驻工具带来极高模型专注度；将会话存为树结构支持任意节点分叉；pi-go 验证了 go:embed 跨平台 SSH 免装远端执行。",
+      cons: "零权限护栏与零内置编排，无法直接用于企业高敏环境。",
+      borrow: "Gorness 保持 4+1 极简常驻工具面、会话树分叉与 go:embed SSH 远端代理，外层补齐完整安全与编排。"
+    },
+    {
+      id: "gas-town",
+      name: "Gas Town",
+      maker: "Gas Town Hall · 集群编排器",
+      lang: "Go / Git",
+      cat: "alwayson",
+      catLabel: "大规模战队治理",
+      score: 74,
+      sig: "Mayor/Witness/Refinery 角色分层 · 独立 Git Worktree · 门控合并队列",
+      dims: { "多代理规模": "10/10", "防踩踏隔离": "10/10", "防僵死看门狗": "9/10", "合并质量门控": "10/10", "部署轻便度": "5/10", "内建模型流": "5/10" },
+      pros: "解决了 20+ 并行 Agent 改坏同一代码库的痛点：工人独占 Git Worktree，Witness 巡检僵死会话，Refinery 串行变基测试合入。",
+      cons: "外挂在其他 CLI 之上的重型脚手架，链路繁琐。",
+      borrow: "Gorness 直接将 Worktree 隔离池、Witness 心跳看门狗与 Refinery 合并队列做成内建 Go 原生引擎能力。"
+    },
+    {
+      id: "crush-charm",
+      name: "Crush",
+      maker: "Charmbracelet · Go 终端代表",
+      lang: "Go",
+      cat: "agnostic",
+      catLabel: "Go 终端美学",
+      score: 71,
+      sig: "Bubble Tea v2 + Ultraviolet 缓冲渲染 · SQLite sqlc · LSP 自动协同",
+      dims: { "终端 UI 质感": "10/10", "Go 代码整洁度": "9/10", "LSP 诊断": "8/10", "微内核纯度": "6/10", "多代理可视化": "4/10", "全天候常驻": "4/10" },
+      pros: "验证了纯 Go + Bubble Tea v2 打造工业级流畅终端体验的可行性。",
+      cons: "单体终端工具，无微内核、无桌面端可视化多 Agent 编排、无 Always-On 常驻架构。",
+      borrow: "Gorness 的 CLI/TUI 端吸收其渲染架构，同时把内核升级为全天候多端多智能体平台。"
+    },
+    {
+      id: "goose",
+      name: "Goose",
+      maker: "Linux 基金会 AAIF · Apache-2.0",
+      lang: "Rust",
+      cat: "agnostic",
+      catLabel: "开放协议标杆",
+      score: 68,
+      sig: "MCP-First 标准治理 · CLI+Desktop+API 一体 · 厂商中立",
+      dims: { "MCP 兼容度": "10/10", "模型中立": "9/10", "开放标准": "10/10", "编辑事务严密": "7/10", "崩溃自愈账本": "5/10", "舰队编排": "5/10" },
+      pros: "开放协议互操作性强。",
+      cons: "缺少事务级文件回滚锁与高并发舰队编排。",
+      borrow: "Gorness 全面兼容 MCP / AGENTS.md / SKILL.md / ACP 四大开放标准，且对 MCP 工具默认实施零信任权限门控。"
+    },
+    {
+      id: "openclaw",
+      name: "OpenClaw",
+      maker: "OpenClaw · 常驻网关",
+      lang: "TypeScript",
+      cat: "alwayson",
+      catLabel: "控制面/数据面隔离",
+      score: 65,
+      sig: "可信 Gateway 与不可信 Harness 物理隔离 · 20+ 聊天渠道 · ACP 托管",
+      dims: { "渠道覆盖": "10/10", "边界安全拆分": "9/10", "插件隔离": "9/10", "原生代码编辑": "5/10", "本地性能": "6/10", "事务回滚": "5/10" },
+      pros: "OpenAI 安全团队背书的持久化 Agent 隔离范式：配置与凭证留在可信网关，不可信代码执行关进受控沙箱。",
+      cons: "自身不具备高精度代码编辑内核。",
+      borrow: "Gorness 内置沙箱外 Egress 凭证代理与远程沙箱 Worker 分离协议，原生实现可信控制面与不可信执行面隔离。"
+    },
+    {
+      id: "aider",
+      name: "Aider",
+      maker: "Paul Gauthier · Apache-2.0",
+      lang: "Python",
+      cat: "durable",
+      catLabel: "仓库图谱先驱",
+      score: 60,
+      sig: "Tree-sitter + PageRank 仓库骨架图 (RepoMap) · 多态容错编辑格式",
+      dims: { "结构化上下文": "10/10", "弱模型编辑容错": "10/10", "Git 亲和度": "9/10", "安全沙箱": "3/10", "现代协议": "4/10", "多代理": "3/10" },
+      pros: "PageRank RepoMap 至今仍是零向量库理解大型代码库结构的最佳算法；多态编辑格式大幅提升开源模型改码成功率。",
+      cons: "旧世代同步架构。",
+      borrow: "Gorness 在 internal/index 中用 Go 原生实现增量缓存的 Tree-sitter PageRank RepoMap 与多态编辑回退链。"
+    }
+  ];
+
+  function renderHarnessTable(filter) {
+    const tbody = document.getElementById("harness-tbody");
+    const list = filter === "all" ? HARNESS_DATA : HARNESS_DATA.filter(h => h.cat === filter);
+    tbody.innerHTML = list.map((h, idx) => `
+      <tr class="${idx === 0 ? 'selected-row' : ''}" onclick="selectHarness('${h.id}', this)">
+        <td><strong>${h.name}</strong></td>
+        <td><span class="lang-pill ${h.lang.includes('Go') ? 'go-lang' : ''}">${h.lang}</span></td>
+        <td style="color:var(--ink-secondary);white-space:nowrap;">${h.catLabel}</td>
+        <td>
+          <div class="score-bar-inline">
+            <span>${h.score}</span>
+            <div class="score-mini-track"><div class="score-mini-fill" style="width:${h.score}%"></div></div>
+          </div>
+        </td>
+        <td style="color:var(--ink-secondary);">${h.sig}</td>
+      </tr>
+    `).join("");
+    if (list.length > 0) populateInspector(list[0]);
+  }
+
+  function filterHarnesses(cat, btn) {
+    document.querySelectorAll("#landscape .seg-btn").forEach(b => b.classList.remove("active"));
+    btn.classList.add("active");
+    renderHarnessTable(cat);
+  }
+
+  function selectHarness(id, rowEl) {
+    document.querySelectorAll("#harness-tbody tr").forEach(r => r.classList.remove("selected-row"));
+    rowEl.classList.add("selected-row");
+    const item = HARNESS_DATA.find(h => h.id === id);
+    if (item) populateInspector(item);
+  }
+
+  function populateInspector(h) {
+    document.getElementById("det-name").textContent = h.name;
+    document.getElementById("det-maker").textContent = h.maker + " · " + h.lang;
+    document.getElementById("det-score").textContent = h.score + " / 100";
+    document.getElementById("det-pros").textContent = h.pros;
+    document.getElementById("det-cons").textContent = h.cons;
+    document.getElementById("det-borrow").textContent = h.borrow;
+    document.getElementById("det-dims").innerHTML = Object.entries(h.dims).map(([k, v]) => `
+      <div class="dim-item-mini"><span style="color:var(--ink-secondary);">${k}</span><span>${v}</span></div>
+    `).join("");
+  }
+
+  // 2. Always-On Scenarios
+  const AO_SCENARIOS = [
+    {
+      chip: "WAKE · BATCH RUN",
+      chipClass: "state-chip state-run",
+      rate: "Cache Hit 95% · 3 Events Merged",
+      activeCards: [0, 4],
+      nodes: { inbox: "#0071E3", timers: "#D2D2D7", memory: "#0071E3", perm: "#D2D2D7", outbox: "#0071E3" },
+      desc: "<strong>推演 1（连发消息防抖合并）：</strong>用户在 3 秒内连续补发了 3 条指令。Ingress 端点 1.2ms 内幂等写入 <code>inbox_events</code>；持有唯一租约的 Worker 在短暂合并窗口后<strong>将 3 条待处理行打包为单次 Run</strong>，命中 95% 静态缓存一次性输出完整答复，经 Outbox 投递后立即休眠。"
+    },
+    {
+      chip: "TIMER WAKE · SILENT",
+      chipClass: "state-chip state-sleep",
+      rate: "0 User Noise · Auto Check-in",
+      activeCards: [1, 2, 4],
+      nodes: { inbox: "#0071E3", timers: "#0071E3", memory: "#0071E3", perm: "#D2D2D7", outbox: "#1D9A50" },
+      desc: "<strong>推演 2（自设闹钟主动回查 + 无事不扰）：</strong>Agent 提交 PR 后调用 <code>set_followup('+20m', '核查远端 CI 状态')</code>。到期后时间轮在单事务内把闹钟转为标准事件推入 Inbox 唤醒 Worker；Agent 查验 CI 全绿且比对 <code>reported.md</code> 无需重复汇报，选择 <strong>Silent 终态静默休眠</strong>。"
+    },
+    {
+      chip: "DEFERRED · WORKER FREE",
+      chipClass: "state-chip state-defer",
+      rate: "Non-blocking · Snapshot Saved",
+      activeCards: [3, 0, 4],
+      nodes: { inbox: "#0071E3", timers: "#D2D2D7", memory: "#D2D2D7", perm: "#D97706", outbox: "#D97706" },
+      desc: "<strong>推演 3（高危调用挂起不阻塞）：</strong>夜间巡检准备执行生产库迁移脚本，九步 <code>PermissionGate</code> 返回 <code>Defer</code>——<strong>半完成工具调用连同内容指纹完整落盘保存，当前 Run 立即结束并释放 Worker 去服务其他会话</strong>；Outbox 推送审批卡片，清晨你在手机/Menu Bar 点击批准，回流 Inbox 唤醒 Run #42 原地续跑。"
+    },
+    {
+      chip: "DREAMING · SKILL SYNTH",
+      chipClass: "state-chip state-sleep",
+      rate: "Idle Curation · FTS5 Recall",
+      activeCards: [2],
+      nodes: { inbox: "#D2D2D7", timers: "#0071E3", memory: "#1D9A50", perm: "#D2D2D7", outbox: "#D2D2D7" },
+      desc: "<strong>推演 4（空闲期梦境记忆策展）：</strong>低峰期 Cron 触发内置 <code>Dreamer</code> 任务，通过 SQLite FTS5 扫描近期排障会话，清理 <code>notes/</code> 中已废弃的旧配置指针，并将反复验证有效的排障链路自动提炼为候选技能包写入沙箱待审区。"
+    }
+  ];
+
+  function setAlwaysOnScenario(idx, btn) {
+    if (btn) {
+      document.querySelectorAll(".trigger-btn").forEach(b => b.classList.remove("active-trig"));
+      btn.classList.add("active-trig");
+    }
+    const s = AO_SCENARIOS[idx];
+    const chip = document.getElementById("ao-state-chip");
+    chip.className = s.chipClass;
+    chip.textContent = s.chip;
+    document.getElementById("ao-token-rate").textContent = s.rate;
+    document.getElementById("ao-step-desc").innerHTML = s.desc;
+
+    document.getElementById("node-inbox").setAttribute("stroke", s.nodes.inbox);
+    document.getElementById("node-timers").setAttribute("stroke", s.nodes.timers);
+    document.getElementById("node-memory").setAttribute("stroke", s.nodes.memory);
+    document.getElementById("node-perm").setAttribute("stroke", s.nodes.perm);
+    document.getElementById("node-outbox").setAttribute("stroke", s.nodes.outbox);
+
+    for (let i = 0; i < 5; i++) {
+      const c = document.getElementById("pcard-" + i);
+      if (s.activeCards.includes(i)) c.classList.add("highlighted");
+      else c.classList.remove("highlighted");
+    }
+  }
+
+  // 3. Interactive Node Inspector Data + 6 Visual Topologies
+  const NODE_DETAILS = {
+    lead: {
+      role: "COORDINATOR · MAYOR",
+      name: "Lead 架构统筹代理",
+      model: "claude-opus-5-5 · effort: high",
+      kvs: [
+        ["上下文占用", "19.4k / 1M (纯净)"],
+        ["权限边界", "Plan + Dispatch + Read"],
+        ["守护看门狗", "Witness Heartbeat OK"],
+        ["前缀缓存复用", "已向 5 子节点共享前缀"]
+      ],
+      log: "[12:04:01] 扫描 RepoMap 锁定 3 个受影响子包\n[12:04:03] 扇出 2 个只读 Goroutine 探索边界\n[12:04:05] 向 fleet_tasks 写入 3 个隔离 Worktree 任务单"
+    },
+    explore: {
+      role: "EPHEMERAL SUBAGENTS",
+      name: "内存级并发探索协程池 ×N",
+      model: "claude-sonnet-5-5 · effort: medium",
+      kvs: [
+        ["并发扇出耗时", "0.18 ms (errgroup)"],
+        ["权限派生", "只读交集 (禁写/禁外发)"],
+        ["缓存策略", "零拷贝命中父级静态前缀"],
+        ["回传契约", "仅返回 <800 tok 结构化结论"]
+      ],
+      log: "[Sub-1] ripgrep + Tree-sitter 定位 14 处调用点\n[Sub-2] 审计 hooks 内容哈希信任链路无绕过\n[Done] 原始 38k 搜索输出已就地销毁，回传精炼摘要"
+    },
+    blackboard: {
+      role: "ACID SHARED STATE",
+      name: "Markdown + Flock 共享协作黑板",
+      model: "internal/fleet/blackboard.go",
+      kvs: [
+        ["核心协作五表", "announce/assign/subtasks/notes/landed"],
+        ["并发抢单机制", "CAS 乐观锁原子认领"],
+        ["最大动态拆解深度", "10 层子任务树"],
+        ["防死循环仲裁", "连续 3 轮无新证据自动收敛"]
+      ],
+      log: "TABLE subtasks: 11 total · 8 landed · 3 active\nTABLE notes: Worker-1 发布了最新 Seam 接口签名，Worker-2/3 已实时同步读取"
+    },
+    wt1: {
+      role: "PERSISTENT TEAMMATE #1",
+      name: "常驻专家 · 内核与生命周期包",
+      model: "claude-opus-5-5 · Seatbelt Strict",
+      kvs: [
+        ["独占工作树", ".gorness/wt/kernel-seam"],
+        ["累积领域轮次", "第 5 个连续子任务 (不重置)"],
+        ["编辑事务状态", "tx_81a2 (4 files BLAKE3 OK)"],
+        ["LSP 实时诊断", "gopls: 0 errors, 0 warnings"]
+      ],
+      log: "[wt/kernel-seam] 完成逆序 Scope.Unmount 实现\n[wt/kernel-seam] go test -race ./internal/kernel/... PASS (0.41s)\n[Next] 提交至 Verifier 盲审队列"
+    },
+    wt2: {
+      role: "PERSISTENT TEAMMATE #2",
+      name: "常驻专家 · 存储账本与 Always-On",
+      model: "claude-opus-5-5 · Seatbelt Strict",
+      kvs: [
+        ["独占工作树", ".gorness/wt/file-vault"],
+        ["累积领域轮次", "第 4 个连续子任务"],
+        ["编辑事务状态", "tx_81b9 (migrations v1 OK)"],
+        ["沙箱网络策略", "Offline Loopback Only"]
+      ],
+      log: "[wt/file-vault] 读取黑板 notes 中 Worker-1 的新接口\n[wt/file-vault] 完成单写者租约超时重领测试\n[Status] 正在补充符号链接路径逃逸回归用例"
+    },
+    verifier: {
+      role: "ADVERSARIAL VERIFIER",
+      name: "独立盲审与 Rubric 验证守卫",
+      model: "claude-opus-5-5 · Blind Context",
+      kvs: [
+        ["思维链隔离", "不读取生成者 CoT 防同化"],
+        ["硬性验证器", "go vet + test -race + 边界扫描"],
+        ["最大打回轮次", "MaxRounds = 3 (超限转人工)"],
+        ["拦截战绩", "刚刚打回 1 处未包裹不可信输出"]
+      ],
+      log: "[Verify] 检出 mcp_bridge.go 第 88 行直接回喂原始 stdout\n[Action] 附精确修复指引打回 Worker-2 重修\n[Re-check] 第二轮复审全项 PASS → 放行至 Refinery"
+    },
+    refinery: {
+      role: "MERGE QUEUE GATEKEEPER",
+      name: "Refinery 串行变基与主干合入池",
+      model: "Deterministic Git + Test Runner",
+      kvs: [
+        ["合入拓扑", "FIFO 串行 Rebase onto main"],
+        ["冲突处理", "语义冲突自动唤醒原专家消解"],
+        ["审计追溯", "记录 Commit SHA 至 landed 表"],
+        ["主干健康度", "100% Green · 0 脏提交"]
+      ],
+      log: "[Queue] Rebase wt/kernel-seam onto main → Clean\n[Gate] 全仓回归测试 142/142 PASS\n[Landed] Fast-forward merged · 自动清理临时 Worktree"
+    }
+  };
+
+  function inspectNode(nodeKey) {
+    const d = NODE_DETAILS[nodeKey] || NODE_DETAILS.lead;
+    document.getElementById("ni-role").textContent = d.role;
+    document.getElementById("ni-name").textContent = d.name;
+    document.getElementById("ni-model").textContent = d.model;
+    document.getElementById("ni-kvs").innerHTML = d.kvs.map(([k, v]) => `
+      <div class="ni-kv"><span>${k}</span><span>${v}</span></div>
+    `).join("");
+    document.getElementById("ni-log").textContent = d.log;
+  }
+
+  function sendDemoSteer() {
+    const inp = document.getElementById("steer-input");
+    const logEl = document.getElementById("ni-log");
+    const txt = inp.value.trim() || "优先保持接口零第三方依赖并补齐竞态测试";
+    logEl.textContent += "\n[STEER QUEUED] 将在当前工具步结束边界注入：\"" + txt + "\"";
+    inp.value = "";
+  }
+
+  const TOPOLOGIES = {
+    hybrid: {
+      title: "Gorness 旗舰混合编排拓扑（点击画布中任意模块可实时透视与纠偏）",
+      desc: "把五种协同范式熔于一炉：Lead 统筹全局 → 内存级 Goroutine 探索子代理秒级摸底 → SQLite 五表共享黑板实时同步跨代理发现 → 独占 Git Worktree 的常驻专家并行改码 → 独立盲审 Verifier 挑刺 → Refinery 串行变基测试无误后合入 main。",
+      ctx: "Cache-Fork + 独立 Worktree",
+      spof: "零单点 (SQL WAL 随时续跑)",
+      guard: "盲审 Rubric + Refinery 队列",
+      when: "跨模块大型工程研发、全栈特性一次性交付、夜间长周期自主攻关。",
+      fail: "单一主从模式会因主节点中转丢失跨模块接口变更细节；无合并队列的并行写则会把 Git 工作树撞碎。",
+      go: "2KB Goroutine 跑探索、Git Worktree 跑常驻写工人、SQLite WAL 跑共享黑板、Witness 协程巡检防僵死。",
+      defaultNode: "lead",
+      svg: `
+        <defs>
+          <marker id="hy-b" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M0 1.5 L8.5 5 L0 8.5z" fill="#2997FF"/></marker>
+          <marker id="hy-g" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M0 1.5 L8.5 5 L0 8.5z" fill="#30D158"/></marker>
+          <marker id="hy-a" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M0 1.5 L8.5 5 L0 8.5z" fill="#FF9F0A"/></marker>
+        </defs>
+
+        <!-- Connectors -->
+        <path d="M 118 164 L 118 244" stroke="#2997FF" stroke-width="2" fill="none" marker-end="url(#hy-b)" class="flow-line-active"/>
+        <path d="M 212 108 L 268 108" stroke="#2997FF" stroke-width="2.2" fill="none" marker-end="url(#hy-b)" class="flow-line-active"/>
+        <path d="M 348 164 L 348 244" stroke="#2997FF" stroke-width="1.8" fill="none" marker-end="url(#hy-b)" class="flow-line-active"/>
+        <path d="M 498 164 L 498 244" stroke="#2997FF" stroke-width="1.8" fill="none" marker-end="url(#hy-b)" class="flow-line-active"/>
+        <path d="M 578 298 L 628 160" stroke="none"/>
+        <path d="M 576 286 L 602 286 Q 610 286 610 278 L 610 132 Q 610 124 618 124 L 634 124" stroke="#30D158" stroke-width="1.9" fill="none" marker-end="url(#hy-g)" class="flow-line-active"/>
+        <path d="M 348 356 L 348 394 Q 348 402 356 402 L 602 402 Q 610 402 610 394 L 610 278" stroke="#30D158" stroke-width="1.7" fill="none"/>
+        <path d="M 718 68 L 718 36 Q 718 28 710 28 L 430 28 Q 422 28 422 36 L 422 62" stroke="#FF9F0A" stroke-width="1.6" stroke-dasharray="5 4" fill="none" marker-end="url(#hy-a)"/>
+        <path d="M 718 184 L 718 248" stroke="#30D158" stroke-width="2.2" fill="none" marker-end="url(#hy-g)" class="flow-line-active"/>
+
+        <rect x="506" y="19" width="136" height="16" rx="3" fill="#0D0D12"/>
+        <text x="574" y="30" font-size="9.5" font-family="ui-monospace, SF Mono, monospace" fill="#FF9F0A" text-anchor="middle">REJECT + DIFF RUBRIC</text>
+
+        <!-- Clickable Node: Lead -->
+        <g class="svg-agent-node" onclick="inspectNode('lead')">
+          <rect class="node-box" x="22" y="62" width="190" height="102" rx="12" fill="#1D2B3A" stroke="#2997FF" stroke-width="2"/>
+          <text x="36" y="85" font-size="10" font-family="ui-monospace, SF Mono, monospace" fill="#64D2FF">MAYOR / LEAD [点击透视]</text>
+          <text x="36" y="107" font-size="14.5" font-weight="700" fill="#FFFFFF">全局架构统筹代理</text>
+          <text x="36" y="127" font-size="11" fill="#A1A1A6">拆解边界 · 保持主窗口干净</text>
+          <text x="36" y="146" font-size="10.5" font-family="ui-monospace, SF Mono, monospace" fill="#30D158">● Witness Watchdog OK</text>
+        </g>
+
+        <!-- Clickable Node: Explore Goroutines -->
+        <g class="svg-agent-node" onclick="inspectNode('explore')">
+          <rect class="node-box" x="22" y="244" width="190" height="132" rx="12" fill="#1B1B23" stroke="rgba(255,255,255,0.18)"/>
+          <text x="36" y="267" font-size="10" font-family="ui-monospace, SF Mono, monospace" fill="#2997FF">CACHE-FORK SUBAGENTS</text>
+          <text x="36" y="289" font-size="14" font-weight="700" fill="#FFFFFF">只读并发探索协程 ×N</text>
+          <text x="36" y="310" font-size="11" fill="#98989D">• 0.18ms 扇出 · 共享缓存</text>
+          <text x="36" y="328" font-size="11" fill="#98989D">• ripgrep + AST 符号扫描</text>
+          <text x="36" y="354" font-size="10.5" font-family="ui-monospace, SF Mono, monospace" fill="#64D2FF">仅回传蒸馏摘要 (&lt;800 tok)</text>
+        </g>
+
+        <!-- Clickable Node: Shared SQL Blackboard -->
+        <g class="svg-agent-node" onclick="inspectNode('blackboard')">
+          <rect class="node-box" x="268" y="62" width="310" height="102" rx="12" fill="#18202C" stroke="#2997FF" stroke-width="1.8"/>
+          <text x="284" y="85" font-size="10" font-family="ui-monospace, SF Mono, monospace" fill="#64D2FF">MARKDOWN SHARED BOARD [点击透视]</text>
+          <text x="284" y="107" font-size="14.5" font-weight="700" fill="#FFFFFF">全透明 Markdown 任务树与跨代理证据黑板</text>
+          <text x="284" y="128" font-size="10.5" font-family="ui-monospace, SF Mono, monospace" fill="#D1D1D6">announce · assign · subtasks(CAS)</text>
+          <text x="284" y="146" font-size="10.5" font-family="ui-monospace, SF Mono, monospace" fill="#30D158">notes(实时可见) · landed · 收敛守卫</text>
+        </g>
+
+        <!-- Clickable Node: Worktree Worker 1 -->
+        <g class="svg-agent-node" onclick="inspectNode('wt1')">
+          <rect class="node-box" x="268" y="244" width="148" height="112" rx="11" fill="#1B1B23" stroke="#30D158" stroke-width="1.6"/>
+          <text x="280" y="266" font-size="9.5" font-family="ui-monospace, SF Mono, monospace" fill="#30D158">TEAMMATE #1</text>
+          <text x="280" y="287" font-size="13.5" font-weight="700" fill="#FFFFFF">内核与 Seam 专家</text>
+          <text x="280" y="307" font-size="10.5" font-family="ui-monospace, SF Mono, monospace" fill="#98989D">wt/kernel-seam</text>
+          <text x="280" y="326" font-size="10.5" fill="#64D2FF">BLAKE3 事务已锁</text>
+          <text x="280" y="344" font-size="10" fill="#30D158">● gopls 0 errors</text>
+        </g>
+
+        <!-- Clickable Node: Worktree Worker 2 -->
+        <g class="svg-agent-node" onclick="inspectNode('wt2')">
+          <rect class="node-box" x="428" y="244" width="148" height="112" rx="11" fill="#1B1B23" stroke="#30D158" stroke-width="1.6"/>
+          <text x="440" y="266" font-size="9.5" font-family="ui-monospace, SF Mono, monospace" fill="#30D158">TEAMMATE #2</text>
+          <text x="440" y="287" font-size="13.5" font-weight="700" fill="#FFFFFF">纯文件引擎专家</text>
+          <text x="440" y="307" font-size="10.5" font-family="ui-monospace, SF Mono, monospace" fill="#98989D">wt/file-vault</text>
+          <text x="440" y="326" font-size="10.5" fill="#64D2FF">Seatbelt 断网沙箱</text>
+          <text x="440" y="344" font-size="10" fill="#30D158">● 单测竞态通过</text>
+        </g>
+
+        <!-- Clickable Node: Verifier -->
+        <g class="svg-agent-node" onclick="inspectNode('verifier')">
+          <rect class="node-box" x="634" y="68" width="168" height="116" rx="12" fill="#1B1B23" stroke="#FF9F0A" stroke-width="1.8"/>
+          <text x="648" y="90" font-size="9.5" font-family="ui-monospace, SF Mono, monospace" fill="#FF9F0A">BLIND VERIFIER</text>
+          <text x="648" y="111" font-size="14" font-weight="700" fill="#FFFFFF">对抗盲审守卫</text>
+          <text x="648" y="131" font-size="11" fill="#98989D">隔离思维链 · 跑单测</text>
+          <text x="648" y="149" font-size="11" fill="#98989D">核验十条安全红线</text>
+          <text x="648" y="169" font-size="10" font-family="ui-monospace, SF Mono, monospace" fill="#FF9F0A">MaxRounds = 3</text>
+        </g>
+
+        <!-- Clickable Node: Refinery -->
+        <g class="svg-agent-node" onclick="inspectNode('refinery')">
+          <rect class="node-box" x="634" y="248" width="168" height="128" rx="12" fill="#13261C" stroke="#30D158" stroke-width="2"/>
+          <text x="648" y="271" font-size="9.5" font-family="ui-monospace, SF Mono, monospace" fill="#30D158">REFINERY QUEUE</text>
+          <text x="648" y="292" font-size="14" font-weight="700" fill="#FFFFFF">串行变基合入池</text>
+          <text x="648" y="313" font-size="11" fill="#A1A1A6">自动 Rebase 检冲突</text>
+          <text x="648" y="331" font-size="11" fill="#A1A1A6">全量通过后合入主干</text>
+          <text x="648" y="357" font-size="10.5" font-family="ui-monospace, SF Mono, monospace" fill="#30D158">→ branch: main ✓</text>
+        </g>
+      `
+    },
+    genver: {
+      title: "范式 1 · Generator–Verifier（生成-验证对抗闭环）",
+      desc: "生成代理产出补丁，独立盲审代理依据显式 Rubric 与自动化测试集执行挑刺；任何断言失败均附带精确位置打回重修，直至全绿通过或达到轮次上限转交人工。",
+      ctx: "双独立上下文盲审隔离",
+      spof: "极低 (双节点确定性闭环)",
+      guard: "机器可判定测试 + 轮次熔断",
+      when: "高可靠代码生成、安全边界重构、合规文档审查等验收标准明确且容错率极低的任务。",
+      fail: "无量化标准的模糊提示会让 Verifier 变成橡皮图章；不可解冲突若无上限会死循环振荡。",
+      go: "Gorness 将编译器、go test -race 与异构盲审封装为标准 VerifyGuard 插件挂在 Stop 边界。",
+      defaultNode: "verifier",
+      svg: `
+        <defs>
+          <marker id="gv1" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M0 1.5 L8.5 5 L0 8.5z" fill="#2997FF"/></marker>
+          <marker id="gv2" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M0 1.5 L8.5 5 L0 8.5z" fill="#FF9F0A"/></marker>
+          <marker id="gv3" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M0 1.5 L8.5 5 L0 8.5z" fill="#30D158"/></marker>
+        </defs>
+        <path d="M 154 210 L 218 210" stroke="#2997FF" stroke-width="2" fill="none" marker-end="url(#gv1)" class="flow-line-active"/>
+        <path d="M 430 194 L 512 194" stroke="#2997FF" stroke-width="2.2" fill="none" marker-end="url(#gv1)" class="flow-line-active"/>
+        <path d="M 616 276 L 616 344 Q 616 352 608 352 L 332 352 Q 324 352 324 344 L 324 276" stroke="#FF9F0A" stroke-width="2" stroke-dasharray="6 5" fill="none" marker-end="url(#gv2)" class="flow-line-active"/>
+        <path d="M 720 210 L 792 210" stroke="#30D158" stroke-width="2.2" fill="none" marker-end="url(#gv3)" class="flow-line-active"/>
+
+        <rect x="384" y="342" width="176" height="18" fill="#0D0D12"/>
+        <text x="472" y="354" font-size="10" font-family="ui-monospace, SF Mono, monospace" fill="#FF9F0A" text-anchor="middle">REJECT + EXACT FAILING LINE</text>
+
+        <rect x="26" y="166" width="128" height="88" rx="12" fill="#1B1B23" stroke="rgba(255,255,255,0.16)"/>
+        <text x="40" y="196" font-size="10" font-family="ui-monospace, SF Mono, monospace" fill="#98989D">SPEC &amp; RUBRIC</text>
+        <text x="40" y="220" font-size="14" font-weight="700" fill="#FFFFFF">任务与测试契约</text>
+
+        <g class="svg-agent-node" onclick="inspectNode('wt1')">
+          <rect class="node-box" x="218" y="146" width="212" height="130" rx="14" fill="#1D2B3A" stroke="#2997FF" stroke-width="2"/>
+          <text x="236" y="174" font-size="10.5" font-family="ui-monospace, SF Mono, monospace" fill="#64D2FF">GENERATOR AGENT</text>
+          <text x="236" y="200" font-size="16" font-weight="700" fill="#FFFFFF">生成与定向修复代理</text>
+          <text x="236" y="224" font-size="12" fill="#A1A1A6">在原子事务内编码并响应</text>
+          <text x="236" y="244" font-size="12" fill="#A1A1A6">Verifier 打回的精确诊断</text>
+        </g>
+
+        <g class="svg-agent-node" onclick="inspectNode('verifier')">
+          <rect class="node-box" x="512" y="146" width="208" height="130" rx="14" fill="#1B1B23" stroke="#FF9F0A" stroke-width="2"/>
+          <text x="530" y="174" font-size="10.5" font-family="ui-monospace, SF Mono, monospace" fill="#FF9F0A">BLIND VERIFIER</text>
+          <text x="530" y="200" font-size="16" font-weight="700" fill="#FFFFFF">盲审与沙箱验证器</text>
+          <text x="530" y="224" font-size="12" fill="#A1A1A6">独立上下文不看生成者借口</text>
+          <text x="530" y="244" font-size="12" fill="#A1A1A6">实跑编译器与全套断言</text>
+        </g>
+
+        <g class="svg-agent-node" onclick="inspectNode('refinery')">
+          <rect class="node-box" x="742" y="172" width="64" height="78" rx="10" fill="#13261C" stroke="#30D158" stroke-width="2"/>
+          <text x="774" y="216" font-size="12.5" font-weight="700" fill="#30D158" text-anchor="middle">PASS</text>
+        </g>
+      `
+    },
+    orchsub: {
+      title: "范式 2 · Orchestrator–Subagent（主从并发扇出 + 前缀缓存共享）",
+      desc: "主代理拆解互不依赖的只读探索或专项审查任务，通过 Go 协程瞬间扇出多个独立窗口的子代理并发执行，子代理销毁前仅向主代理返回高信噪比摘要。",
+      ctx: "瞬态独立窗口 (完结即销毁)",
+      spof: "中 (主代理负责汇总)",
+      guard: "权限取交集 + 禁递归失控",
+      when: "大型仓库多目录并发摸底、PR 多维联合审查（安全/架构/覆盖率并行扫描）。",
+      fail: "跨子代理依赖若全靠主代理传话会产生信息漏斗损耗。",
+      go: "自动复用父会话冻结的 Prompt Cache 前缀，首 Token 延迟与成本直降 80%。",
+      defaultNode: "explore",
+      svg: `
+        <defs>
+          <marker id="os1" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M0 1.5 L8.5 5 L0 8.5z" fill="#2997FF"/></marker>
+          <marker id="os2" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M0 1.5 L8.5 5 L0 8.5z" fill="#30D158"/></marker>
+        </defs>
+        <path d="M 224 165 L 284 165 Q 292 165 292 157 L 292 92 Q 292 84 300 84 L 344 84" stroke="#2997FF" stroke-width="2" fill="none" marker-end="url(#os1)" class="flow-line-active"/>
+        <path d="M 224 220 L 344 220" stroke="#2997FF" stroke-width="2" fill="none" marker-end="url(#os1)" class="flow-line-active"/>
+        <path d="M 224 275 L 284 275 Q 292 275 292 283 L 292 348 Q 292 356 300 356 L 344 356" stroke="#2997FF" stroke-width="2" fill="none" marker-end="url(#os1)" class="flow-line-active"/>
+
+        <path d="M 556 84 L 598 84 Q 606 84 606 92 L 606 188 Q 606 196 614 196 L 646 196" stroke="#30D158" stroke-width="2" fill="none" marker-end="url(#os2)" class="flow-line-active"/>
+        <path d="M 556 220 L 646 220" stroke="#30D158" stroke-width="2" fill="none" marker-end="url(#os2)" class="flow-line-active"/>
+        <path d="M 556 356 L 598 356 Q 606 356 606 348 L 606 244 Q 606 236 614 236 L 646 236" stroke="#30D158" stroke-width="2" fill="none" marker-end="url(#os2)" class="flow-line-active"/>
+
+        <g class="svg-agent-node" onclick="inspectNode('lead')">
+          <rect class="node-box" x="28" y="132" width="196" height="176" rx="14" fill="#1D2B3A" stroke="#2997FF" stroke-width="2"/>
+          <text x="44" y="160" font-size="10.5" font-family="ui-monospace, SF Mono, monospace" fill="#64D2FF">ORCHESTRATOR</text>
+          <text x="44" y="186" font-size="15.5" font-weight="700" fill="#FFFFFF">主控拆解代理</text>
+          <text x="44" y="212" font-size="11.5" fill="#A1A1A6">• 保持主上下文清爽</text>
+          <text x="44" y="232" font-size="11.5" fill="#A1A1A6">• 共享只读缓存前缀</text>
+          <text x="44" y="274" font-size="10.5" font-family="ui-monospace, SF Mono, monospace" fill="#30D158">0.18ms Goroutine Fanout</text>
+        </g>
+
+        <g class="svg-agent-node" onclick="inspectNode('explore')">
+          <rect class="node-box" x="344" y="42" width="212" height="84" rx="12" fill="#1B1B23" stroke="rgba(255,255,255,0.18)"/>
+          <text x="360" y="66" font-size="10" font-family="ui-monospace, SF Mono, monospace" fill="#64D2FF">SUBAGENT 01</text>
+          <text x="360" y="88" font-size="14" font-weight="700" fill="#FFFFFF">安全与权限链路扫描</text>
+          <text x="360" y="108" font-size="11" fill="#98989D">独立窗口 · 只读工具集</text>
+        </g>
+
+        <g class="svg-agent-node" onclick="inspectNode('explore')">
+          <rect class="node-box" x="344" y="178" width="212" height="84" rx="12" fill="#1B1B23" stroke="rgba(255,255,255,0.18)"/>
+          <text x="360" y="202" font-size="10" font-family="ui-monospace, SF Mono, monospace" fill="#64D2FF">SUBAGENT 02</text>
+          <text x="360" y="224" font-size="14" font-weight="700" fill="#FFFFFF">AST 符号引用分析</text>
+          <text x="360" y="244" font-size="11" fill="#98989D">独立窗口 · Tree-sitter</text>
+        </g>
+
+        <g class="svg-agent-node" onclick="inspectNode('explore')">
+          <rect class="node-box" x="344" y="314" width="212" height="84" rx="12" fill="#1B1B23" stroke="rgba(255,255,255,0.18)"/>
+          <text x="360" y="338" font-size="10" font-family="ui-monospace, SF Mono, monospace" fill="#64D2FF">SUBAGENT 03</text>
+          <text x="360" y="360" font-size="14" font-weight="700" fill="#FFFFFF">回归测试缺口排查</text>
+          <text x="360" y="380" font-size="11" fill="#98989D">独立窗口 · 并行零阻塞</text>
+        </g>
+
+        <g class="svg-agent-node" onclick="inspectNode('lead')">
+          <rect class="node-box" x="646" y="152" width="152" height="136" rx="14" fill="#13261C" stroke="#30D158" stroke-width="1.8"/>
+          <text x="662" y="180" font-size="10.5" font-family="ui-monospace, SF Mono, monospace" fill="#30D158">SYNTHESIS</text>
+          <text x="662" y="204" font-size="15" font-weight="700" fill="#FFFFFF">蒸馏结论合成</text>
+          <text x="662" y="228" font-size="11.5" fill="#A1A1A6">汇总三方精炼证据</text>
+          <text x="662" y="248" font-size="11.5" fill="#A1A1A6">输出精准执行方案</text>
+        </g>
+      `
+    },
+    teams: {
+      title: "范式 3 · Persistent Agent Teams（长周期常驻专家战队 + Git Worktrees）",
+      desc: "每个 Teammate 跨多轮任务持久存活，深耕各自负责的子系统并不断积累领域记忆；物理上各自独占一个 Git Worktree 分支目录，彻底根除并行改码踩踏。",
+      ctx: "跨任务持久保留领域上下文",
+      spof: "低 (各分区自主闭环推进)",
+      guard: "Git Worktree 隔离 + Refinery 变基",
+      when: "多服务框架迁移、大型系统分模块同步重写。",
+      fail: "慢工人长尾效应；跨分区公共契约变更需同步。",
+      go: "完成一个分区即流式进入 Refinery 增量合入，无需全队空等最慢节点。",
+      defaultNode: "wt1",
+      svg: `
+        <defs>
+          <marker id="tm1" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M0 1.5 L8.5 5 L0 8.5z" fill="#2997FF"/></marker>
+          <marker id="tm2" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M0 1.5 L8.5 5 L0 8.5z" fill="#30D158"/></marker>
+        </defs>
+        <path d="M 204 185 L 248 185 Q 256 185 256 177 L 256 98 Q 256 90 264 90 L 296 90" stroke="#2997FF" stroke-width="2" fill="none" marker-end="url(#tm1)" class="flow-line-active"/>
+        <path d="M 204 220 L 296 220" stroke="#2997FF" stroke-width="2" fill="none" marker-end="url(#tm1)" class="flow-line-active"/>
+        <path d="M 204 255 L 248 255 Q 256 255 256 263 L 256 342 Q 256 350 264 350 L 296 350" stroke="#2997FF" stroke-width="2" fill="none" marker-end="url(#tm1)" class="flow-line-active"/>
+
+        <path d="M 564 90 L 602 90 Q 610 90 610 98 L 610 190 Q 610 198 618 198 L 644 198" stroke="#30D158" stroke-width="2" fill="none" marker-end="url(#tm2)" class="flow-line-active"/>
+        <path d="M 564 220 L 644 220" stroke="#30D158" stroke-width="2" fill="none" marker-end="url(#tm2)" class="flow-line-active"/>
+        <path d="M 564 350 L 602 350 Q 610 350 610 342 L 610 242 Q 610 234 618 234 L 644 234" stroke="#30D158" stroke-width="2" fill="none" marker-end="url(#tm2)" class="flow-line-active"/>
+
+        <g class="svg-agent-node" onclick="inspectNode('lead')">
+          <rect class="node-box" x="24" y="144" width="180" height="152" rx="14" fill="#1D2B3A" stroke="#2997FF" stroke-width="2"/>
+          <text x="40" y="172" font-size="10" font-family="ui-monospace, SF Mono, monospace" fill="#64D2FF">TEAM LEAD</text>
+          <text x="40" y="196" font-size="15" font-weight="700" fill="#FFFFFF">分区任务派发器</text>
+          <text x="40" y="220" font-size="11.5" fill="#A1A1A6">按包边界切分工作队列</text>
+          <text x="40" y="240" font-size="11.5" fill="#A1A1A6">专家跨任务保留深层上下文</text>
+        </g>
+
+        <g class="svg-agent-node" onclick="inspectNode('wt1')">
+          <rect class="node-box" x="296" y="44" width="268" height="92" rx="12" fill="#1B1B23" stroke="#30D158" stroke-width="1.6"/>
+          <text x="312" y="68" font-size="10" font-family="ui-monospace, SF Mono, monospace" fill="#30D158">PERSISTENT TEAMMATE #1</text>
+          <text x="312" y="90" font-size="14" font-weight="700" fill="#FFFFFF">常驻内核包专家 (已累积 5 轮上下文)</text>
+          <text x="312" y="112" font-size="11" font-family="ui-monospace, SF Mono, monospace" fill="#98989D">Worktree: .gorness/wt/kernel-seam</text>
+        </g>
+
+        <g class="svg-agent-node" onclick="inspectNode('wt2')">
+          <rect class="node-box" x="296" y="174" width="268" height="92" rx="12" fill="#1B1B23" stroke="#30D158" stroke-width="1.6"/>
+          <text x="312" y="198" font-size="10" font-family="ui-monospace, SF Mono, monospace" fill="#30D158">PERSISTENT TEAMMATE #2</text>
+          <text x="312" y="220" font-size="14" font-weight="700" fill="#FFFFFF">常驻存储包专家 (已累积 4 轮上下文)</text>
+          <text x="312" y="242" font-size="11" font-family="ui-monospace, SF Mono, monospace" fill="#98989D">Worktree: .gorness/wt/file-vault</text>
+        </g>
+
+        <g class="svg-agent-node" onclick="inspectNode('wt2')">
+          <rect class="node-box" x="296" y="304" width="268" height="92" rx="12" fill="#1B1B23" stroke="#30D158" stroke-width="1.6"/>
+          <text x="312" y="328" font-size="10" font-family="ui-monospace, SF Mono, monospace" fill="#30D158">PERSISTENT TEAMMATE #3</text>
+          <text x="312" y="350" font-size="14" font-weight="700" fill="#FFFFFF">常驻协议与 UI 专家 (零锁争用)</text>
+          <text x="312" y="372" font-size="11" font-family="ui-monospace, SF Mono, monospace" fill="#98989D">Worktree: .gorness/wt/workbench</text>
+        </g>
+
+        <g class="svg-agent-node" onclick="inspectNode('refinery')">
+          <rect class="node-box" x="644" y="148" width="154" height="144" rx="14" fill="#13261C" stroke="#30D158" stroke-width="1.8"/>
+          <text x="660" y="176" font-size="10" font-family="ui-monospace, SF Mono, monospace" fill="#30D158">REFINERY</text>
+          <text x="660" y="200" font-size="14.5" font-weight="700" fill="#FFFFFF">流式集成队列</text>
+          <text x="660" y="224" font-size="11.5" fill="#A1A1A6">先完先合 · 自动变基</text>
+          <text x="660" y="244" font-size="11.5" fill="#A1A1A6">端到端联调守护</text>
+        </g>
+      `
+    },
+    bus: {
+      title: "范式 4 · Typed Message Bus（强类型发布/订阅事件驱动网格）",
+      desc: "智能体围绕强类型主题总线发布与订阅事件，工作流随告警与现场发现自然涌现，新增专精监听代理零代码耦合。",
+      ctx: "事件信封携带快照与因果链",
+      spof: "低 (确定性泛型路由零误判)",
+      guard: "TraceID 全链路追踪 + MaxHops=8",
+      when: "线上告警自动研判自愈、CI 失败自动根因定位与补丁投递流水线。",
+      fail: "纯 LLM 路由易静默丢包；深层事件级联若无因果 ID 难以排障。",
+      go: "用确定性 Go 泛型 Topic 路由替代脆弱的提示词路由，内置死信队列与跳数上限。",
+      defaultNode: "lead",
+      svg: `
+        <defs>
+          <marker id="mb1" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M0 1.5 L8.5 5 L0 8.5z" fill="#2997FF"/></marker>
+          <marker id="mb2" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M0 1.5 L8.5 5 L0 8.5z" fill="#30D158"/></marker>
+        </defs>
+        <rect x="36" y="192" width="748" height="54" rx="12" fill="#162436" stroke="#2997FF" stroke-width="2"/>
+        <text x="410" y="216" font-size="12" font-weight="700" font-family="ui-monospace, SF Mono, monospace" fill="#FFFFFF" text-anchor="middle">GORNESS TYPED PUB/SUB BUS · TraceID + CausationID + MaxHops=8</text>
+        <text x="410" y="235" font-size="10.5" font-family="ui-monospace, SF Mono, monospace" fill="#64D2FF" text-anchor="middle">alert.ci_failed  →  triage.diagnosed  →  enrich.git_blame  →  patch.verified</text>
+
+        <path d="M 136 136 L 136 192" stroke="#2997FF" stroke-width="2" fill="none" marker-end="url(#mb1)" class="flow-line-active"/>
+        <path d="M 410 192 L 410 136" stroke="#2997FF" stroke-width="2" fill="none" marker-end="url(#mb1)" class="flow-line-active"/>
+        <path d="M 674 136 L 674 192" stroke="#30D158" stroke-width="2" fill="none" marker-end="url(#mb2)" class="flow-line-active"/>
+
+        <path d="M 260 246 L 260 308" stroke="#2997FF" stroke-width="2" fill="none" marker-end="url(#mb1)" class="flow-line-active"/>
+        <path d="M 560 246 L 560 308" stroke="#30D158" stroke-width="2" fill="none" marker-end="url(#mb2)" class="flow-line-active"/>
+
+        <rect x="44" y="52" width="184" height="84" rx="12" fill="#1B1B23" stroke="rgba(255,255,255,0.16)"/>
+        <text x="60" y="78" font-size="10" font-family="ui-monospace, SF Mono, monospace" fill="#FF9F0A">EVENT SOURCE</text>
+        <text x="60" y="102" font-size="14" font-weight="700" fill="#FFFFFF">CI 挂单 / 异常日志源</text>
+
+        <g class="svg-agent-node" onclick="inspectNode('explore')">
+          <rect class="node-box" x="318" y="52" width="184" height="84" rx="12" fill="#1B1B23" stroke="#2997FF" stroke-width="1.6"/>
+          <text x="334" y="78" font-size="10" font-family="ui-monospace, SF Mono, monospace" fill="#64D2FF">TRIAGE AGENT</text>
+          <text x="334" y="102" font-size="14" font-weight="700" fill="#FFFFFF">故障分级与主题分发</text>
+        </g>
+
+        <g class="svg-agent-node" onclick="inspectNode('wt1')">
+          <rect class="node-box" x="582" y="52" width="184" height="84" rx="12" fill="#1B1B23" stroke="#30D158" stroke-width="1.6"/>
+          <text x="598" y="78" font-size="10" font-family="ui-monospace, SF Mono, monospace" fill="#30D158">PATCH AGENT</text>
+          <text x="598" y="102" font-size="14" font-weight="700" fill="#FFFFFF">自动修复补丁合成</text>
+        </g>
+
+        <g class="svg-agent-node" onclick="inspectNode('explore')">
+          <rect class="node-box" x="164" y="308" width="192" height="84" rx="12" fill="#1B1B23" stroke="rgba(255,255,255,0.16)"/>
+          <text x="180" y="334" font-size="10" font-family="ui-monospace, SF Mono, monospace" fill="#64D2FF">BLAME ENRICHER</text>
+          <text x="180" y="358" font-size="14" font-weight="700" fill="#FFFFFF">提交历史上下文富化</text>
+        </g>
+
+        <g class="svg-agent-node" onclick="inspectNode('verifier')">
+          <rect class="node-box" x="464" y="308" width="196" height="84" rx="12" fill="#13261C" stroke="#30D158" stroke-width="1.6"/>
+          <text x="480" y="334" font-size="10" font-family="ui-monospace, SF Mono, monospace" fill="#30D158">OUTBOX RESPONDER</text>
+          <text x="480" y="358" font-size="14" font-weight="700" fill="#FFFFFF">提交草稿 PR 并发审批卡</text>
+        </g>
+      `
+    },
+    shared: {
+      title: "范式 5 · Decentralized Shared State（去中心化五表共享黑板）",
+      desc: "复刻 Anthropic 1,000-Agent 攻克复杂形式化证明的核心机制：无中央协调瓶颈，所有对等 Agent 直接读写事务型共享状态库，动态向下拆解 10 层子任务树并实时站在同伴发现之上演进。",
+      ctx: "ACID 全局共享知识与任务库",
+      spof: "零单点 (任意节点退出不影响全局)",
+      guard: "CAS 抢单锁 + 一等公民收敛条件",
+      when: "超复杂难题递归拆解、多维度深度调研交叉印证。",
+      fail: "无收敛守卫时易陷入互相跟帖的反应式死循环（Reactive Loops）。",
+      go: "内置 CAS 原子认领与一等公民终止判定器（时间/预算上限 + 连续 N 轮无新增实质进展优雅停机）。",
+      defaultNode: "blackboard",
+      svg: `
+        <defs>
+          <marker id="ss1" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M0 1.5 L8.5 5 L0 8.5z" fill="#2997FF"/></marker>
+          <marker id="ss2" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M0 1.5 L8.5 5 L0 8.5z" fill="#30D158"/></marker>
+        </defs>
+        <path d="M 196 116 L 266 116" stroke="#2997FF" stroke-width="2" fill="none" marker-end="url(#ss1)" class="flow-line-active"/>
+        <path d="M 196 324 L 266 324" stroke="#2997FF" stroke-width="2" fill="none" marker-end="url(#ss1)" class="flow-line-active"/>
+        <path d="M 624 116 L 554 116" stroke="#2997FF" stroke-width="2" fill="none" marker-end="url(#ss1)" class="flow-line-active"/>
+        <path d="M 624 324 L 554 324" stroke="#30D158" stroke-width="2" fill="none" marker-end="url(#ss2)" class="flow-line-active"/>
+
+        <g class="svg-agent-node" onclick="inspectNode('blackboard')">
+          <rect class="node-box" x="266" y="58" width="288" height="324" rx="16" fill="#16202E" stroke="#2997FF" stroke-width="2.2"/>
+          <text x="410" y="88" font-size="10.5" font-family="ui-monospace, SF Mono, monospace" fill="#64D2FF" text-anchor="middle">SHARED ACID STORE</text>
+          <text x="410" y="114" font-size="16" font-weight="700" fill="#FFFFFF" text-anchor="middle">五表事务黑板与动态任务树</text>
+
+          <rect x="288" y="134" width="244" height="36" rx="7" fill="#0D0D12" stroke="rgba(255,255,255,0.1)"/>
+          <text x="300" y="156" font-size="11" font-family="ui-monospace, SF Mono, monospace" fill="#E5E5EA">subtasks · CAS 抢单 + 递归拆树</text>
+
+          <rect x="288" y="180" width="244" height="36" rx="7" fill="#0D0D12" stroke="rgba(255,255,255,0.1)"/>
+          <text x="300" y="202" font-size="11" font-family="ui-monospace, SF Mono, monospace" fill="#64D2FF">notes    · 跨代理即时共享证据</text>
+
+          <rect x="288" y="226" width="244" height="36" rx="7" fill="#0D0D12" stroke="rgba(255,255,255,0.1)"/>
+          <text x="300" y="248" font-size="11" font-family="ui-monospace, SF Mono, monospace" fill="#30D158">landed   · 已通过校验成果账本</text>
+
+          <rect x="288" y="278" width="244" height="82" rx="8" fill="rgba(255,159,10,0.13)" stroke="rgba(255,159,10,0.4)"/>
+          <text x="410" y="302" font-size="11" font-weight="700" fill="#FF9F0A" text-anchor="middle">CONVERGENCE GUARD</text>
+          <text x="410" y="322" font-size="11" fill="#E5E5EA" text-anchor="middle">预算上限 + 连续静默轮次仲裁</text>
+          <text x="410" y="342" font-size="10.5" fill="#98989D" text-anchor="middle">根治无休止反应式跟帖循环</text>
+        </g>
+
+        <g class="svg-agent-node" onclick="inspectNode('explore')">
+          <rect class="node-box" x="24" y="74" width="172" height="84" rx="12" fill="#1B1B23" stroke="rgba(255,255,255,0.18)"/>
+          <text x="38" y="100" font-size="10" font-family="ui-monospace, SF Mono, monospace" fill="#64D2FF">PEER AGENT 01</text>
+          <text x="38" y="124" font-size="13.5" font-weight="700" fill="#FFFFFF">文献与源码挖掘者</text>
+        </g>
+
+        <g class="svg-agent-node" onclick="inspectNode('wt1')">
+          <rect class="node-box" x="24" y="282" width="172" height="84" rx="12" fill="#1B1B23" stroke="rgba(255,255,255,0.18)"/>
+          <text x="38" y="308" font-size="10" font-family="ui-monospace, SF Mono, monospace" fill="#64D2FF">PEER AGENT 02</text>
+          <text x="38" y="332" font-size="13.5" font-weight="700" fill="#FFFFFF">难题拆解与验证者</text>
+        </g>
+
+        <g class="svg-agent-node" onclick="inspectNode('wt2')">
+          <rect class="node-box" x="624" y="74" width="172" height="84" rx="12" fill="#1B1B23" stroke="rgba(255,255,255,0.18)"/>
+          <text x="638" y="100" font-size="10" font-family="ui-monospace, SF Mono, monospace" fill="#64D2FF">PEER POOL 03..N</text>
+          <text x="638" y="124" font-size="13.5" font-weight="700" fill="#FFFFFF">弹性并发抢单工人</text>
+        </g>
+
+        <g class="svg-agent-node" onclick="inspectNode('verifier')">
+          <rect class="node-box" x="624" y="282" width="172" height="84" rx="12" fill="#13261C" stroke="#30D158" stroke-width="1.6"/>
+          <text x="638" y="308" font-size="10" font-family="ui-monospace, SF Mono, monospace" fill="#30D158">ARBITER</text>
+          <text x="638" y="332" font-size="13.5" font-weight="700" fill="#FFFFFF">收敛仲裁结项代理</text>
+        </g>
+      `
+    }
+  };
+
+  function selectTopology(key, btn) {
+    if (btn) {
+      document.querySelectorAll("#orchestration .seg-btn").forEach(b => b.classList.remove("active"));
+      btn.classList.add("active");
+    }
+    const t = TOPOLOGIES[key];
+    document.getElementById("topo-title").textContent = t.title;
+    document.getElementById("topo-desc").textContent = t.desc;
+    document.getElementById("topo-ctx").textContent = t.ctx;
+    document.getElementById("topo-spof").textContent = t.spof;
+    document.getElementById("topo-guard").textContent = t.guard;
+    document.getElementById("topo-when").textContent = t.when;
+    document.getElementById("topo-fail").textContent = t.fail;
+    document.getElementById("topo-go").textContent = t.go;
+    const svgEl = document.getElementById("topo-svg");
+    svgEl.innerHTML = `<title id="topo-svg-title">${t.title}</title><desc id="topo-svg-desc">${t.desc}</desc>` + t.svg;
+    inspectNode(t.defaultNode);
+  }
+
+  // 4. Unified Complete Engineering Specs (Repo, 12-Table SQL, API, Microkernel)
+  const GO_SNIPPETS = {
+    repo: `<span class="cm">// 100% 纯 Go 语言生态 (CGO_ENABLED=0)，零数据库依赖，单一静态二进制 gorness (&lt;10MB)</span>
+gorness/
+├── go.mod                     <span class="cm">// 仅用 go-toml/v2 · fsnotify · cron/v3 · bubbletea + lipgloss</span>
+├── cmd/gorness/               <span class="cm">// 唯一入口：gorness(TUI) | gorness studio | gorness run | gorness daemon</span>
+├── internal/
+│   ├── config/                <span class="cm">// ~/.gorness/ 与项目 .gorness/ 叠加、Keychain/cmd 凭据、fsnotify 热重载</span>
+│   ├── store/                 <span class="cm">// 零数据库存储引擎：JSONL 会话树分叉/回退、内存索引、Flock 原子队列、快照库</span>
+│   ├── llm/                   <span class="cm">// 四大原生流式协议适配器、静态前缀缓存分割、1.5x 重试、异构角色模型路由器</span>
+│   ├── tools/                 <span class="cm">// 5 核心工具 (read/edit/write/bash/search) + 逐块 Diff + macOS Seatbelt + MCP</span>
+│   ├── core/                  <span class="cm">// 纯粹微内核 Hook 总线、多项目并发会话调度器、AgentLoop、锚定增量压缩</span>
+│   ├── fleet/                 <span class="cm">// 6 种多 Agent 编排协调器、Git Worktree 池、MD 共享黑板抢单、串行变基合入</span>
+│   ├── alwayson/              <span class="cm">// inbox.jsonl 防抖微批、timers.toml 调度、MD 记忆与 Dreamer、Deferred 挂起恢复</span>
+│   ├── server/                <span class="cm">// 本机同源守卫 HTTP + 4s 心跳 SSE、隔离 HTML 预览壳、embed.FS 挂载</span>
+│   └── tui/                   <span class="cm">// Charm Bubble Tea + Lip Gloss 多项目多会话极速终端界面</span>
+└── web/                       <span class="cm">// embed.FS 静态内嵌的零构建链 Apple HIG 三栏工作台与 SVG 可视化编排画布</span>`,
+
+    sql: `<span class="cm"># ~/.gorness/ 彻底零数据库 · 全透明四格式文件架构 (TOML / MD / HTML + JSONL)</span>
+<span class="cm"># 人类编辑器、Obsidian、ripgrep、Git 与大模型 100% 原生直读，永不膨胀成黑盒坏库</span>
+
+~/.gorness/
+├── <span class="ty">config.toml</span>                <span class="cm"># 全局主配置：端口、主题语言、默认模型槽位、并发与 Seatbelt 策略</span>
+├── <span class="ty">providers.toml</span>             <span class="cm"># 多模型服务商目录 (Anthropic/OpenAI/Gemini/AppleGenAI/Ollama/MLX)</span>
+│                              <span class="cm"># 支持 keychain:gorness/xxx | env:API_KEY | cmd:动态令牌脚本</span>
+├── <span class="ty">rules.toml</span> &amp; <span class="ty">mcp.toml</span>      <span class="cm"># 权限放行/询问/硬拦截规则、出站域名白名单与 MCP 服务声明</span>
+├── <span class="kw">agents/</span>                    <span class="cm"># [MD] 异构模型绑定不同 Agent（丢入 .md 自动 fsnotify 热加载！）</span>
+│   ├── lead.md                <span class="cm"># provider="anthropic", model="claude-opus-5-5", effort="xhigh"</span>
+│   ├── coder.md               <span class="cm"># provider="anthropic", model="claude-sonnet-5-5", effort="high"</span>
+│   ├── verifier.md            <span class="cm"># provider="openai",    model="gpt-5.5" (异构模型对抗盲审)</span>
+│   └── explorer.md            <span class="cm"># provider="local_mlx", model="qwen3-coder" (零成本并发侦察)</span>
+├── <span class="kw">workflows/</span>                 <span class="cm"># [TOML] 6 种多 Agent 编排拓扑配置，直接驱动 Web 可视化拓扑画布</span>
+├── <span class="kw">skills/</span>                    <span class="cm"># [MD] SKILL.md 技能包（自动兼容 ~/.agents/skills 与 ~/.claude/skills）</span>
+├── <span class="kw">memory/</span>                    <span class="cm"># [MD] Always-On 记忆：INSTRUCTIONS.md · INDEX.md · REPORTED.md · notes/</span>
+├── <span class="kw">alwayson/</span>                  <span class="cm"># [TOML+JSONL+MD] timers.toml · inbox.jsonl · deferred/*.md · outbox.jsonl</span>
+├── <span class="kw">workspaces/</span>&lt;project-slug&gt;/ <span class="cm"># 多项目并行隔离区（支持项目内 .gorness/ 局部覆盖）</span>
+│   ├── workspace.toml         <span class="cm"># 项目根路径、角色模型项目级覆盖、已信任配置 SHA-256 指纹</span>
+│   ├── sessions/*.jsonl       <span class="cm"># 追加式单调 seq 会话事件树（O(1) 落盘，零转义支持任意点 /fork &amp; /rewind）</span>
+│   ├── missions/&lt;id&gt;/         <span class="cm"># 多 Agent 现场：MISSION.md · tasks/*.md (Flock抢单) · notes/*.md</span>
+│   └── artifacts/*.html       <span class="cm"># Agent 产出的可视化架构图、报告与编排快照 HTML</span>
+└── <span class="kw">runtime/</span>                   <span class="cm"># SHA-256 文件快照块 snapshots/ · Git worktrees/ · daemon.sock</span>`,
+
+    api: `<span class="cm">// 同源受保护 HTTP + 4s 心跳 SSE 接口契约 (internal/server/routes.go)</span>
+GET    /api/health                        <span class="cm">// Swift 宿主探活与版本/数据目录一致性核验</span>
+GET    /api/bootstrap                     <span class="cm">// 首屏一次性并行拉取设置定义、工作区、会话、待审批与常驻状态</span>
+GET    /api/settings/schema               <span class="cm">// 返回中英双语 SettingsRegistry 元数据驱动动态设置窗</span>
+PATCH  /api/settings                      <span class="cm">// 原子校验落盘并热广播，无需重启守护进程</span>
+
+POST   /api/workspaces                    <span class="cm">// 注册工作区并初始化 RepoMap 与沙箱基线</span>
+PATCH  /api/workspaces/:id                <span class="cm">// 切换权限/沙箱模式或更新按哈希信任的 Hooks/MCP</span>
+PATCH  /api/sessions/:id                  <span class="cm">// 跨项目移动会话：同事务停运行、清旧待批、迁移会话级授权</span>
+POST   /api/sessions/:id/fork             <span class="cm">// 按指定 seq 分叉新会话分支</span>
+POST   /api/sessions/:id/rewind           <span class="cm">// 按指定 seq 回退历史并可选按 SnapshotStore 精确还原工作区文件</span>
+
+POST   /api/runs/stream                   <span class="cm">// 发起流式运行 (SSE: run_created | thinking_delta | tool_start | approval_required ...)</span>
+POST   /api/runs/:id/steer                <span class="cm">// 运行中步边界注入中途纠偏指令（若已结束返回 409 由前端转新消息）</span>
+POST   /api/runs/:id/stop                 <span class="cm">// 级联取消当前 Run 的 context.Context 树，立即中止在途子进程</span>
+POST   /api/approvals/:id/resolve         <span class="cm">// 提交批准/按块部分批准(hunkIds)/拒绝，唤醒挂起调用或投递 Inbox</span>
+
+POST   /api/inbox/webhook/:source         <span class="cm">// Always-On 外部事件极速验签入箱 (&lt;2ms 200 ACK)</span>
+GET    /api/alwayson/state                <span class="cm">// 实时查看收件箱队列、活跃 Follow-up/Cron 定时器、Outbox 与 Dreaming 记录</span>
+POST   /api/fleet/missions                <span class="cm">// 启动多 Agent 编排任务（支持切换 5 种拓扑与并发 Worktree 上限）</span>
+GET    /api/fleet/missions/:id/stream     <span class="cm">// 实时推送可视化拓扑画布节点状态、黑板抢单树与 Refinery 队列事件</span>
+GET    /preview/:token                    <span class="cm">// 严密 CSP + 无 allow-same-origin 的模型生成 HTML 安全预览外壳</span>`,
+
+    kernel: `<span class="kw">package</span> security
+
+<span class="cm">// Evaluate 严格按固定九步顺序判定工具调用权限——顺序本身即不可绕过的安全策略：</span>
+<span class="kw">func</span> (g *<span class="ty">PermissionGate</span>) <span class="fn">Evaluate</span>(ctx <span class="ty">EvalContext</span>, call <span class="ty">ToolCall</span>) <span class="ty">GateDecision</span> {
+    <span class="cm">// 1. 硬拒绝底线（即使在 --yolo 模式下也绝对拦截的危险命令与路径逃逸）</span>
+    <span class="kw">if</span> reason, blocked := g.hardFloor.<span class="fn">Match</span>(call); blocked {
+        <span class="kw">return</span> <span class="fn">Deny</span>(<span class="st">"hard-floor"</span>, reason)
+    }
+    <span class="cm">// 2. Plan 只读模式拦截一切写工具与未授信外部工具</span>
+    <span class="kw">if</span> ctx.EffectiveMode == <span class="ty">ModePlan</span> &amp;&amp; !g.<span class="fn">isStrictlyReadOnly</span>(call) {
+        <span class="kw">return</span> <span class="fn">Deny</span>(<span class="st">"plan-readonly"</span>, <span class="st">"mutations disabled in plan mode"</span>)
+    }
+    <span class="cm">// 3. 项目级配置内容哈希校验：若 .mcp.json 或 hooks 被篡改，强制降级逐次询问（后台运行直接拒绝）</span>
+    <span class="kw">if</span> ctx.ConfigTampered {
+        <span class="kw">return</span> g.<span class="fn">askOrDenyUnattended</span>(ctx, <span class="st">"tampered-project-config"</span>)
+    }
+    <span class="cm">// 4. PreToolUse Hook 显式要求阻断或人工确认</span>
+    <span class="kw">if</span> hookDec := ctx.HookDecision; hookDec.RequiresAction() {
+        <span class="kw">return</span> hookDec
+    }
+    <span class="cm">// 5. 语义级只读放行（注：MCP 服务器自报的 readOnlyHint 一律不采信为免审依据）</span>
+    <span class="kw">if</span> g.<span class="fn">isVerifiedBuiltinReadOnly</span>(call) {
+        <span class="kw">return</span> <span class="fn">Allow</span>()
+    }
+    <span class="cm">// 6. 修改会被自动执行的配置文件（hooks / mcp / skills）必须人工确认</span>
+    <span class="kw">if</span> g.<span class="fn">touchesAutoRunConfig</span>(call) {
+        <span class="kw">return</span> g.<span class="fn">askOrDefer</span>(ctx, <span class="st">"auto-run-config"</span>, call)
+    }
+    <span class="cm">// 7. 跨边界委托外部 Agent 等高危工具每次必问，禁止记为永久放行</span>
+    <span class="kw">if</span> call.AlwaysAsk {
+        <span class="kw">return</span> g.<span class="fn">askOrDefer</span>(ctx, <span class="st">"always-ask"</span>, call)
+    }
+    <span class="cm">// 8. 核验绑定了工作区与内容指纹的已保存授权</span>
+    <span class="kw">if</span> g.grants.<span class="fn">MatchesFingerprint</span>(ctx.WorkspaceID, call) {
+        <span class="kw">return</span> <span class="fn">Allow</span>()
+    }
+    <span class="cm">// 9. 按当前生效模式（Ask / AcceptEdits / Auto 风险分类器）裁决；常驻无人值守自动转 Deferred 挂起</span>
+    <span class="kw">return</span> g.<span class="fn">evaluateByMode</span>(ctx, call)
+}`
+  };
+
+  function switchCodeTab(key, btn) {
+    if (btn) {
+      document.querySelectorAll(".code-tab").forEach(t => t.classList.remove("active"));
+      btn.classList.add("active");
+    }
+    document.getElementById("go-code-display").innerHTML = GO_SNIPPETS[key];
+  }
+
+  // 5. Apple HIG Three-Pane Workbench Interactive Views
+  const MAC_VIEWS = {
+    session: `
+      <div>
+        <div style="display:flex;justify-content:space-between;align-items:center;padding-bottom:14px;border-bottom:1px solid var(--hairline-light);">
+          <div>
+            <strong style="font-size:15px;">重构事务引擎并接入 Always-On 收件箱</strong>
+            <span style="font-size:12px;color:#6E6E73;margin-left:8px;">gorness · 上下文 24%</span>
+          </div>
+          <span class="state-chip state-run">运行中 · ⌘. 停止</span>
+        </div>
+
+        <div style="margin-top:16px;display:flex;flex-direction:column;gap:12px;">
+          <div style="align-self:flex-end;background:#0071E3;color:#fff;padding:10px 15px;border-radius:16px 16px 4px 16px;font-size:13.5px;max-width:82%;">
+            把 <code>internal/vfs</code> 的多文件原子提交加上 inode 复核，并让常驻巡检支持挂起恢复。
+          </div>
+
+          <div style="background:#F5F5F7;border-radius:12px;padding:12px 15px;font-size:12.5px;">
+            <div style="display:flex;justify-content:space-between;color:#6E6E73;">
+              <span>▸ 已收起自适应推理摘要（Adaptive Thinking · 1.4s）</span>
+              <span style="font-family:var(--font-mono);color:#1D9A50;">✓ 2 个探索子代理并发完成 (0.19ms 扇出)</span>
+            </div>
+            <div style="margin-top:8px;padding-left:12px;border-left:2px solid #D2D2D7;color:#6E6E73;font-size:12px;">
+              <div>• <code>subagent:explore</code> 核对全仓软链接规范路径处理 — 已完成 (320ms)</div>
+              <div>• <code>ptc:script</code> 批量校验 ~/.gorness/ 四类文件原子写与 Flock 锁契约 — 已完成 (140ms)</div>
+            </div>
+          </div>
+
+          <div style="font-size:13.5px;line-height:1.6;color:#1D1D1F;">
+            已完成原子替换校验与 <code>Defer</code> 快照序列化代码，<code>gopls</code> 类型诊断零错误。由于涉及自动执行钩子配置文件改动，请在右侧卡片勾选确认要写入的变更块。
+          </div>
+        </div>
+      </div>
+
+      <div style="margin-top:18px;background:#F5F5F7;border:1px solid var(--hairline-strong);border-radius:14px;padding:10px 14px;display:flex;justify-content:space-between;align-items:center;font-size:12.5px;color:#6E6E73;">
+        <span>输入中途指令（将在下一步边界安全注入，支持 <code>@</code> 文件 · <code>$</code> 技能 · <code>/</code> 命令）...</span>
+        <span style="font-family:var(--font-mono);color:#1D1D1F;">↵ 发送</span>
+      </div>
+    `,
+    fleetview: `
+      <div>
+        <div style="display:flex;justify-content:space-between;align-items:center;padding-bottom:14px;border-bottom:1px solid var(--hairline-light);">
+          <div>
+            <strong style="font-size:15px;">可视化舰队实时泳道 · Mission #09</strong>
+            <span style="font-size:12px;color:#6E6E73;margin-left:8px;">混合拓扑 · 3 独立 Git Worktrees</span>
+          </div>
+          <span class="state-chip state-sleep">Refinery 门控保护中</span>
+        </div>
+
+        <div style="margin-top:14px;display:flex;flex-direction:column;gap:10px;">
+          <div style="background:#F5F5F7;border-radius:11px;padding:12px 14px;display:flex;justify-content:space-between;align-items:center;border-left:3px solid #1D9A50;">
+            <div>
+              <strong style="font-size:13px;">Teammate #1 · <code>.gorness/wt/kernel</code></strong>
+              <div style="font-size:12px;color:#6E6E73;">盲审 Verifier 全绿通过 → 已经 Refinery 变基无冲突合入 <code>main</code></div>
+            </div>
+            <span class="state-chip state-sleep">LANDED</span>
+          </div>
+
+          <div style="background:#F5F5F7;border-radius:11px;padding:12px 14px;display:flex;justify-content:space-between;align-items:center;border-left:3px solid #0071E3;">
+            <div>
+              <strong style="font-size:13px;">Teammate #2 · <code>.gorness/wt/alwayson</code></strong>
+              <div style="font-size:12px;color:#6E6E73;">正在跑单写者租约崩溃恢复竞态测试 (<code>go test -race</code> 24/24)</div>
+            </div>
+            <span class="state-chip state-run">VERIFYING</span>
+          </div>
+
+          <div style="background:#FFFBEB;border-radius:11px;padding:12px 14px;display:flex;justify-content:space-between;align-items:center;border-left:3px solid #D97706;">
+            <div>
+              <strong style="font-size:13px;">Teammate #3 · <code>.gorness/wt/vfs-hooks</code></strong>
+              <div style="font-size:12px;color:#92400E;">触发 <code>auto-run-config</code> 门控，已保存现场等待右侧按块审批</div>
+            </div>
+            <span class="state-chip state-defer">AWAITING HUNK</span>
+          </div>
+        </div>
+      </div>
+
+      <div style="margin-top:16px;padding-top:12px;border-top:1px solid var(--hairline-light);display:flex;justify-content:space-between;font-size:12px;color:#6E6E73;">
+        <span>Markdown 共享黑板：8/9 子任务已收敛 · Witness 巡检 0 卡死</span>
+        <span style="font-family:var(--font-mono);">Total Cost: $0.19</span>
+      </div>
+    `,
+    inboxview: `
+      <div>
+        <div style="display:flex;justify-content:space-between;align-items:center;padding-bottom:14px;border-bottom:1px solid var(--hairline-light);">
+          <div>
+            <strong style="font-size:15px;">Always-On 全天候收发与记忆中心</strong>
+            <span style="font-size:12px;color:#6E6E73;margin-left:8px;">今日休眠占比 99.1% · 0 空转消耗</span>
+          </div>
+          <span class="state-chip state-sleep">LEASE HEALTHY</span>
+        </div>
+
+        <div style="margin-top:14px;display:flex;flex-direction:column;gap:10px;font-size:12.5px;">
+          <div style="background:#F5F5F7;border-radius:10px;padding:11px 14px;">
+            <div style="display:flex;justify-content:space-between;"><strong>[Inbox 微批合并] 合并 3 条 Slack 连续追问 → Run #40</strong><span style="font-family:var(--font-mono);color:#6E6E73;">10:18</span></div>
+            <div style="color:#6E6E73;margin-top:3px;">去重键校验通过 · 复用会话缓存 · Outbox 单次精准回复</div>
+          </div>
+
+          <div style="background:#F5F5F7;border-radius:10px;padding:11px 14px;">
+            <div style="display:flex;justify-content:space-between;"><strong style="color:#6E6E73;">[Follow-up 闹钟] 自动核查构建产物签名状态 → Silent</strong><span style="font-family:var(--font-mono);color:#6E6E73;">08:30</span></div>
+            <div style="color:#6E6E73;margin-top:3px;">构建正常且无新异常，核对 <code>reported.md</code> 后静默归档不打扰</div>
+          </div>
+
+          <div style="background:#E8F5E9;border-radius:10px;padding:11px 14px;">
+            <div style="display:flex;justify-content:space-between;"><strong style="color:#14532D;">[Dreaming 自进化] 提炼候选技能 <code>seatbelt-profile-audit</code></strong><span style="font-family:var(--font-mono);color:#15803D;">03:00</span></div>
+            <div style="color:#166534;margin-top:3px;">从近期 5 次沙箱调试轨迹中自动归纳，静态扫描无风险，点击即可启用</div>
+          </div>
+        </div>
+      </div>
+
+      <div style="margin-top:16px;padding-top:12px;border-top:1px solid var(--hairline-light);display:flex;justify-content:space-between;font-size:12px;color:#6E6E73;">
+        <span>指针型记忆：<code>instructions.md</code> (1.8KB) · <code>index.md</code> (2.1KB)</span>
+        <span style="font-family:var(--font-mono);">FTS5 BM25+Trigram Ready</span>
+      </div>
+    `
+  };
+
+  function switchMacView(key, btn) {
+    if (btn) {
+      document.querySelectorAll(".mac-view-btn").forEach(b => b.classList.remove("active"));
+      btn.classList.add("active");
+    }
+    document.getElementById("mac-main-panel").innerHTML = MAC_VIEWS[key];
+  }
+
+  function resolveDemoApproval(approved) {
+    const card = document.getElementById("demo-approval-card");
+    const h1 = document.getElementById("hunk1") ? document.getElementById("hunk1").checked : true;
+    const h2 = document.getElementById("hunk2") ? document.getElementById("hunk2").checked : false;
+    const statusText = document.getElementById("menubar-status-text");
+    if (approved) {
+      const count = (h1 ? 1 : 0) + (h2 ? 1 : 0);
+      card.style.background = "#E8F5E9";
+      card.style.borderColor = "rgba(29, 154, 80, 0.35)";
+      card.innerHTML = `
+        <strong style="font-size:12.5px;color:#14532D;">已原子应用 ${count} 个勾选块 · Snapshot #1,049 已登记</strong>
+        <p style="font-size:11.5px;color:#166534;margin-top:5px;line-height:1.45;">
+          ${count === 2 ? "两处变更块均经 BLAKE3 复核原子落盘，新 Hook 内容哈希已纳入当前项目信任表。" : (count === 1 ? "已按块部分写入所选 Hunk，未勾选块保持原样并已诚实告知模型。" : "未勾选任何块（written: false），引擎未触碰磁盘并已如实通知模型。")}
+        </p>
+      `;
+      statusText.textContent = "gornessd · 变更已落盘 · 0 Errors";
+    } else {
+      card.style.background = "#FEF2F2";
+      card.style.borderColor = "rgba(217, 56, 41, 0.35)";
+      card.innerHTML = `
+        <strong style="font-size:12.5px;color:#991B1B;">已拒绝本次修改 · 工作区字节零变动</strong>
+        <p style="font-size:11.5px;color:#7F1D1D;margin-top:5px;line-height:1.45;">
+          引擎已发送 <code>tool_denied</code> 事件回喂模型另寻安全路径。
+        </p>
+      `;
+      statusText.textContent = "gornessd · 已安全拦截";
+    }
+  }
+
+  // Initialize Everything Cleanly
+  renderHarnessTable("all");
+  setAlwaysOnScenario(0, null);
+  selectTopology("hybrid", null);
+  switchCodeTab("repo", null);
+  switchMacView("session", null);
+</script>
+</body>
+</html>
