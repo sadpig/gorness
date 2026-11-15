@@ -1,0 +1,5 @@
+.worktrees/
+.superpowers/
+dist/
+gorness
+.DS_Store
