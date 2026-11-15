@@ -30,15 +30,14 @@ func NewPathGuard(wsRoot, vaultRoot string) (*PathGuard, error) {
 	if strings.TrimSpace(wsRoot) == "" {
 		return nil, fmt.Errorf("%w: empty workspace root", ErrInvalidTargetPath)
 	}
-	absWs, err := filepath.Abs(wsRoot)
+	rawWs, err := toUncleanedAbs("", wsRoot)
 	if err != nil {
 		return nil, fmt.Errorf("abs workspace root %s: %w", wsRoot, err)
 	}
-	canonWs, err := filepath.EvalSymlinks(absWs)
+	canonWs, err := resolveCanonicalPath(rawWs, 0)
 	if err != nil {
 		return nil, fmt.Errorf("canonicalize workspace root %s: %w", wsRoot, err)
 	}
-	canonWs = filepath.Clean(canonWs)
 	st, err := os.Stat(canonWs)
 	if err != nil || !st.IsDir() {
 		return nil, fmt.Errorf("%w: workspace root %s is not a directory", ErrInvalidTargetPath, canonWs)
@@ -46,11 +45,11 @@ func NewPathGuard(wsRoot, vaultRoot string) (*PathGuard, error) {
 
 	var canonVault string
 	if strings.TrimSpace(vaultRoot) != "" {
-		absVault, err := filepath.Abs(vaultRoot)
+		rawVault, err := toUncleanedAbs("", vaultRoot)
 		if err != nil {
 			return nil, fmt.Errorf("abs vault root %s: %w", vaultRoot, err)
 		}
-		canonVault, err = resolveCanonicalPath(absVault, 0)
+		canonVault, err = resolveCanonicalPath(rawVault, 0)
 		if err != nil {
 			return nil, fmt.Errorf("canonicalize vault root %s: %w", vaultRoot, err)
 		}
@@ -67,9 +66,15 @@ func NewPathGuard(wsRoot, vaultRoot string) (*PathGuard, error) {
 	}
 
 	homeDir, _ := os.UserHomeDir()
+	var canonHome string
 	var canonHomeVault string
 	if homeDir != "" {
-		hv := filepath.Join(homeDir, ".gorness")
+		if resolvedHome, err := resolveCanonicalPath(homeDir, 0); err == nil {
+			canonHome = resolvedHome
+		} else {
+			canonHome = filepath.Clean(homeDir)
+		}
+		hv := canonHome + "/.gorness"
 		if resolvedHV, err := resolveCanonicalPath(hv, 0); err == nil {
 			canonHomeVault = resolvedHV
 		} else {
@@ -81,7 +86,7 @@ func NewPathGuard(wsRoot, vaultRoot string) (*PathGuard, error) {
 		canonWs:         canonWs,
 		canonVault:      canonVault,
 		canonHomeVault:  canonHomeVault,
-		userHome:        homeDir,
+		userHome:        canonHome,
 		wsInWorktreeDir: wsInWorktree,
 	}, nil
 }
@@ -112,39 +117,42 @@ func (p *PathGuard) ResolveInWorkspace(target string) (canonicalAbs, rel string,
 	}
 
 	normSlash := strings.ReplaceAll(trimmed, "\\", "/")
-	if normSlash == "~/.gorness" || strings.HasPrefix(normSlash, "~/.gorness/") {
+	if (normSlash == "~/.gorness" || strings.HasPrefix(normSlash, "~/.gorness/")) && p.userHome == "" {
 		return "", "", false, fmt.Errorf("%w: %s", ErrVaultSecretBlocked, target)
 	}
 
-	expanded := trimmed
+	// 注意：严禁在逐段 Lstat/Readlink 之前调用 filepath.Clean 或 filepath.Join 折叠 ".."，
+	// 否则工作区内软链如 "jump/../hosts" (jump -> /etc) 会被词法消除为工作区内路径。
+	expanded := normSlash
 	if expanded == "~" && p.userHome != "" {
 		expanded = p.userHome
 	} else if strings.HasPrefix(normSlash, "~/") && p.userHome != "" {
-		expanded = filepath.Join(p.userHome, filepath.FromSlash(normSlash[2:]))
+		expanded = strings.TrimRight(p.userHome, "/") + "/" + normSlash[2:]
 	}
 
-	var candidateAbs string
-	if filepath.IsAbs(expanded) {
-		candidateAbs = filepath.Clean(expanded)
-	} else {
-		candidateAbs = filepath.Join(p.canonWs, expanded)
+	candidateRaw, err := toUncleanedAbs(p.canonWs, expanded)
+	if err != nil {
+		return "", "", false, err
 	}
 
-	canonicalAbs, err = resolveCanonicalPath(candidateAbs, 0)
+	canonicalAbs, crossedWsLink, err := resolveCanonicalPathWithOrigin(candidateRaw, p.canonWs, 0)
 	if err != nil {
 		return "", "", false, err
 	}
 
 	inWS := isWithinOrEqualPath(canonicalAbs, p.canonWs)
 
-	// 检查是否命中 ~/.gorness 机密目录（若工作区本身是 runtime/worktrees/<id>，仅放行该 worktree 内部路径）。
+	// 检查是否命中 ~/.gorness 机密目录：
+	// - 若工作区本身是 runtime/worktrees/<id>，仅放行该 worktree 内部路径；
+	// - 对直接寻址（未经过工作区内恶意软链跳板）的 runtime/logs/overflow-<hex>.log 普通文件，返回 inWorkspace=false, err=nil 以允许只读分段查看。
+	allowOverflow := !crossedWsLink && p.IsOverflowLogFile(canonicalAbs)
 	if p.canonVault != "" && isWithinOrEqualPath(canonicalAbs, p.canonVault) {
-		if !(p.wsInWorktreeDir && inWS) {
+		if !(p.wsInWorktreeDir && inWS) && !allowOverflow {
 			return canonicalAbs, "", false, fmt.Errorf("%w: %s", ErrVaultSecretBlocked, target)
 		}
 	}
 	if p.canonHomeVault != "" && isWithinOrEqualPath(canonicalAbs, p.canonHomeVault) {
-		if !inWS {
+		if !inWS && !allowOverflow {
 			return canonicalAbs, "", false, fmt.Errorf("%w: %s", ErrVaultSecretBlocked, target)
 		}
 	}
@@ -158,6 +166,56 @@ func (p *PathGuard) ResolveInWorkspace(target string) (canonicalAbs, rel string,
 		return canonicalAbs, "", false, rErr
 	}
 	return canonicalAbs, filepath.ToSlash(relOS), true, nil
+}
+
+// IsOverflowLogFile 判断规范路径是否为 Vault runtime/logs/ 下可寻址的非软链普通文件 overflow-<hex>.log。
+func (p *PathGuard) IsOverflowLogFile(canonicalAbs string) bool {
+	if p == nil || canonicalAbs == "" {
+		return false
+	}
+	base := filepath.Base(canonicalAbs)
+	if !isValidOverflowLogFilename(base) {
+		return false
+	}
+	parent := filepath.Dir(canonicalAbs)
+	matchesLogsDir := false
+	if p.canonVault != "" && parent == filepath.Join(p.canonVault, "runtime", "logs") {
+		matchesLogsDir = true
+	}
+	if p.canonHomeVault != "" && parent == filepath.Join(p.canonHomeVault, "runtime", "logs") {
+		matchesLogsDir = true
+	}
+	if !matchesLogsDir {
+		return false
+	}
+	if dirSt, err := os.Lstat(parent); err != nil || dirSt.Mode()&os.ModeSymlink != 0 || !dirSt.IsDir() {
+		return false
+	}
+	if rtSt, err := os.Lstat(filepath.Dir(parent)); err != nil || rtSt.Mode()&os.ModeSymlink != 0 || !rtSt.IsDir() {
+		return false
+	}
+	st, err := os.Lstat(canonicalAbs)
+	if err != nil || st.Mode()&os.ModeSymlink != 0 || !st.Mode().IsRegular() {
+		return false
+	}
+	return true
+}
+
+func isValidOverflowLogFilename(name string) bool {
+	if !strings.HasPrefix(name, "overflow-") || !strings.HasSuffix(name, ".log") {
+		return false
+	}
+	hexPart := strings.TrimSuffix(strings.TrimPrefix(name, "overflow-"), ".log")
+	if len(hexPart) < 12 || len(hexPart) > 64 {
+		return false
+	}
+	for i := 0; i < len(hexPart); i++ {
+		c := hexPart[i]
+		if !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f')) {
+			return false
+		}
+	}
+	return true
 }
 
 // IsAutoRunConfigPath 判断目标路径是否属于自执行/敏感工程配置（供 PermissionGate 第 5 步拦截确认）。
@@ -187,33 +245,54 @@ func IsAutoRunConfigPath(canonicalAbs, rel string) bool {
 	return false
 }
 
-// resolveCanonicalPath 逐段做 Lstat + Readlink 规范化解析，支持尚不存在的子目录/子文件与悬空符号链接。
-func resolveCanonicalPath(absPath string, depth int) (string, error) {
-	if depth > maxSymlinkHops {
-		return "", fmt.Errorf("%w: too many symlink hops resolving %s", ErrInvalidTargetPath, absPath)
+// toUncleanedAbs 在不调用 filepath.Clean / filepath.Join 的前提下构造绝对路径串，保留原始路径段顺序供 POSIX 软链遍历。
+func toUncleanedAbs(baseDir, raw string) (string, error) {
+	slash := strings.ReplaceAll(raw, "\\", "/")
+	if strings.HasPrefix(slash, "/") {
+		return slash, nil
 	}
-	cleaned := filepath.Clean(absPath)
-	if !filepath.IsAbs(cleaned) {
-		var err error
-		cleaned, err = filepath.Abs(cleaned)
+	base := baseDir
+	if base == "" {
+		wd, err := os.Getwd()
 		if err != nil {
 			return "", err
 		}
+		if resolvedWD, eErr := filepath.EvalSymlinks(wd); eErr == nil {
+			base = resolvedWD
+		} else {
+			base = wd
+		}
+	}
+	base = strings.TrimRight(strings.ReplaceAll(base, "\\", "/"), "/")
+	if base == "" {
+		return "/" + slash, nil
+	}
+	return base + "/" + slash, nil
+}
+
+// resolveCanonicalPath 按 POSIX 语义从根逐段做 Lstat + Readlink 解析：
+// 先解析当前路径段软链，再对解析结果拼接未处理的尾部段（含 ".."），严禁在软链解析前提前词法折叠 ".."。
+func resolveCanonicalPath(rawPath string, depth int) (string, error) {
+	resolved, _, err := resolveCanonicalPathWithOrigin(rawPath, "", depth)
+	return resolved, err
+}
+
+func resolveCanonicalPathWithOrigin(rawPath, canonWs string, depth int) (string, bool, error) {
+	if depth > maxSymlinkHops {
+		return "", false, fmt.Errorf("%w: too many symlink hops resolving %s", ErrInvalidTargetPath, rawPath)
+	}
+	absRaw, err := toUncleanedAbs("", rawPath)
+	if err != nil {
+		return "", false, err
 	}
 
-	// 快速路径：若整条路径已存在且无悬空软链，直接走系统 EvalSymlinks。
-	if resolved, err := filepath.EvalSymlinks(cleaned); err == nil {
-		return filepath.Clean(resolved), nil
-	}
-
-	// 逐段从根向叶扫描，精确处理父级软链、叶级悬空软链与不存在的新建子目录。
-	relFromRoot := strings.TrimPrefix(cleaned, string(filepath.Separator))
+	relFromRoot := strings.TrimLeft(absRaw, "/")
 	if relFromRoot == "" {
-		return string(filepath.Separator), nil
+		return "/", false, nil
 	}
-	parts := strings.Split(relFromRoot, string(filepath.Separator))
+	parts := strings.Split(relFromRoot, "/")
 
-	cur := string(filepath.Separator)
+	cur := "/"
 	for i, part := range parts {
 		if part == "" || part == "." {
 			continue
@@ -222,37 +301,51 @@ func resolveCanonicalPath(absPath string, depth int) (string, error) {
 			cur = filepath.Dir(cur)
 			continue
 		}
-		next := filepath.Join(cur, part)
+		next := joinSingleSegment(cur, part)
 		st, err := os.Lstat(next)
 		if err != nil {
 			if errors.Is(err, os.ErrNotExist) {
-				// 后续段尚不存在，直接拼接剩余段即可（祖先链已完成规范化）。
-				rest := append([]string{next}, parts[i+1:]...)
-				return filepath.Clean(filepath.Join(rest...)), nil
+				// 保持逐段遍历不提前跳出，确保类似 nonexistent/../symlink_escape/... 后续段仍经过真实 Lstat 检查。
+				cur = next
+				continue
 			}
-			return "", err
+			return "", false, err
 		}
 
 		if st.Mode()&os.ModeSymlink != 0 {
+			fromWS := canonWs != "" && isStrictlyWithinPath(next, canonWs)
 			linkTarget, rErr := os.Readlink(next)
 			if rErr != nil {
-				return "", rErr
+				return "", false, rErr
 			}
-			var targetAbs string
-			if filepath.IsAbs(linkTarget) {
-				targetAbs = linkTarget
+			lt := strings.ReplaceAll(linkTarget, "\\", "/")
+			var targetRaw string
+			if strings.HasPrefix(lt, "/") {
+				targetRaw = lt
+			} else if cur == "/" {
+				targetRaw = "/" + lt
 			} else {
-				targetAbs = filepath.Join(cur, linkTarget)
+				targetRaw = cur + "/" + lt
 			}
 			if i+1 < len(parts) {
-				tail := filepath.Join(parts[i+1:]...)
-				targetAbs = filepath.Join(targetAbs, tail)
+				targetRaw = strings.TrimRight(targetRaw, "/") + "/" + strings.Join(parts[i+1:], "/")
 			}
-			return resolveCanonicalPath(targetAbs, depth+1)
+			resolved, childFromWS, recErr := resolveCanonicalPathWithOrigin(targetRaw, canonWs, depth+1)
+			return resolved, fromWS || childFromWS, recErr
+		}
+		if !st.IsDir() && i+1 < len(parts) {
+			return "", false, fmt.Errorf("%w: non-directory component %s in %s", ErrInvalidTargetPath, next, rawPath)
 		}
 		cur = next
 	}
-	return filepath.Clean(cur), nil
+	return cur, false, nil
+}
+
+func joinSingleSegment(cleanBase, singlePart string) string {
+	if cleanBase == "/" {
+		return "/" + singlePart
+	}
+	return cleanBase + "/" + singlePart
 }
 
 func isWithinOrEqualPath(path, root string) bool {

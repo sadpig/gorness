@@ -125,6 +125,48 @@ func TestPathGuardMacOSSymlinksAndEscape(t *testing.T) {
 	if tildeInWS || !errors.Is(err, ErrVaultSecretBlocked) {
 		t.Fatalf("expected ~/.gorness/providers.toml to fail with ErrVaultSecretBlocked, inWS=%v err=%v", tildeInWS, err)
 	}
+
+	// 7. POSIX symlink/.. semantics: ".." after an escaping symlink must NOT be collapsed lexically before Lstat/Readlink!
+	jumpEtc := filepath.Join(wsRaw, "jump_etc")
+	if err := os.Symlink("/etc", jumpEtc); err != nil {
+		t.Fatalf("symlink jump_etc: %v", err)
+	}
+	jumpAbs, _, jumpInWS, err := pg.ResolveInWorkspace("jump_etc/../hosts")
+	if err != nil {
+		t.Fatalf("unexpected error for jump_etc/../hosts: %v", err)
+	}
+	if jumpInWS {
+		t.Fatalf("expected jump_etc/../hosts to resolve outside workspace, got %q (inWS=true)", jumpAbs)
+	}
+
+	jumpEtcSub := filepath.Join(wsRaw, "jump_etc_sub")
+	if err := os.Symlink("/etc/pam.d", jumpEtcSub); err != nil {
+		t.Fatalf("symlink jump_etc_sub: %v", err)
+	}
+	for _, query := range []string{"jump_etc_sub/../hosts", wsRaw + "/jump_etc_sub/../hosts"} {
+		subAbs, _, subInWS, qErr := pg.ResolveInWorkspace(query)
+		if qErr != nil || subInWS {
+			t.Fatalf("expected %q to resolve to /private/etc/hosts (inWS=false, err=nil), got abs=%q inWS=%v err=%v", query, subAbs, subInWS, qErr)
+		}
+	}
+
+	vaultSkillsDir := filepath.Join(vaultRaw, "skills")
+	if err := os.MkdirAll(vaultSkillsDir, 0o700); err != nil {
+		t.Fatalf("mkdir vault skills: %v", err)
+	}
+	jumpVault := filepath.Join(wsRaw, "jump_vault")
+	if err := os.Symlink(vaultSkillsDir, jumpVault); err != nil {
+		t.Fatalf("symlink jump_vault: %v", err)
+	}
+	for _, vaultQuery := range []string{
+		"jump_vault/../providers.toml",
+		"nonexistent_dir/../jump_vault/../providers.toml",
+	} {
+		_, _, vInWS, vErr := pg.ResolveInWorkspace(vaultQuery)
+		if vInWS || !errors.Is(vErr, ErrVaultSecretBlocked) {
+			t.Fatalf("expected %q to fail with ErrVaultSecretBlocked, got inWS=%v err=%v", vaultQuery, vInWS, vErr)
+		}
+	}
 }
 
 func TestEditHunksZeroSelectionAndStalePrecondition(t *testing.T) {
@@ -809,6 +851,218 @@ func TestSearchCodeRepoMapSkillsAndBM25DeferredTools(t *testing.T) {
 	})
 	if !errors.Is(cmdSecErr, config.ErrCmdSecretDisallowed) {
 		t.Fatalf("expected ErrCmdSecretDisallowed on empty SourceFile MCP cmd: secret, got %v", cmdSecErr)
+	}
+}
+
+func TestRunCommandSubdirWorkdirAndExtraWriteDirs(t *testing.T) {
+	wsRoot := t.TempDir()
+	vaultRoot := t.TempDir()
+	extraWriteDir := t.TempDir()
+	unlistedOutsideDir := t.TempDir()
+
+	paths := config.VaultPaths{Root: vaultRoot}
+	pg, err := NewPathGuard(wsRoot, vaultRoot)
+	if err != nil {
+		t.Fatalf("NewPathGuard: %v", err)
+	}
+	reg, err := NewRegistry(RegistryOptions{
+		WorkspaceRoot: wsRoot,
+		VaultPaths:    paths,
+		PathGuard:     pg,
+	})
+	if err != nil {
+		t.Fatalf("NewRegistry: %v", err)
+	}
+
+	if err := os.WriteFile(filepath.Join(wsRoot, "go.mod"), []byte("module example.com/subtest\n\ngo 1.27\n"), 0o644); err != nil {
+		t.Fatalf("write go.mod: %v", err)
+	}
+	subDir := filepath.Join(wsRoot, "internal", "foo")
+	if err := os.MkdirAll(subDir, 0o755); err != nil {
+		t.Fatalf("mkdir internal/foo: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	// Initialize git repository at workspace root so subdirectory run_command can verify root git_status reporting.
+	initRes, err := reg.Execute(ctx, "run_command", CallContext{
+		WorkspaceRoot: wsRoot,
+		VaultRoot:     vaultRoot,
+		SandboxMode:   SandboxStrict,
+		PathGuard:     pg,
+	}, json.RawMessage(`{"command":"git init -q"}`))
+	if err != nil || initRes.IsError {
+		t.Fatalf("git init failed: res=%+v err=%v", initRes, err)
+	}
+
+	extraFile := filepath.Join(extraWriteDir, "extra_allowed.txt")
+	cmdPayload, _ := json.Marshal(map[string]any{
+		"workdir": "internal/foo",
+		"command": fmt.Sprintf("pwd && head -n 1 ../../go.mod && printf 'root-write-ok' > ../../from_sub.txt && printf 'extra-ok' > %q", extraFile),
+	})
+	res, err := reg.Execute(ctx, "run_command", CallContext{
+		WorkspaceRoot:  wsRoot,
+		VaultRoot:      vaultRoot,
+		SandboxMode:    SandboxStrict,
+		ExtraWriteDirs: []string{extraWriteDir},
+		PathGuard:      pg,
+	}, cmdPayload)
+	if err != nil || res.IsError {
+		t.Fatalf("subdir run_command failed: res=%+v err=%v", res, err)
+	}
+	if !strings.Contains(res.Output, "/internal/foo") || !strings.Contains(res.Output, "module example.com/subtest") {
+		t.Fatalf("expected subdir pwd and parent go.mod read, got:\n%s", res.Output)
+	}
+	if !strings.Contains(res.Output, "[git_status]") || !strings.Contains(res.Output, "from_sub.txt") {
+		t.Fatalf("expected root [git_status] to capture from_sub.txt when workdir=internal/foo, got:\n%s", res.Output)
+	}
+	if got, rErr := os.ReadFile(filepath.Join(wsRoot, "from_sub.txt")); rErr != nil || string(got) != "root-write-ok" {
+		t.Fatalf("expected from_sub.txt='root-write-ok', got %q (err=%v)", string(got), rErr)
+	}
+	if got, rErr := os.ReadFile(extraFile); rErr != nil || string(got) != "extra-ok" {
+		t.Fatalf("expected extra_allowed.txt='extra-ok', got %q (err=%v)", string(got), rErr)
+	}
+
+	// Unlisted outside temp dir must still be blocked by Seatbelt when workdir is a subdirectory.
+	deniedTarget := filepath.Join(unlistedOutsideDir, "nope.txt")
+	denyPayload, _ := json.Marshal(map[string]any{
+		"workdir": "internal/foo",
+		"command": fmt.Sprintf("/usr/bin/touch %q", deniedTarget),
+	})
+	denyRes, err := reg.Execute(ctx, "run_command", CallContext{
+		WorkspaceRoot:  wsRoot,
+		VaultRoot:      vaultRoot,
+		SandboxMode:    SandboxStrict,
+		ExtraWriteDirs: []string{extraWriteDir},
+		PathGuard:      pg,
+	}, denyPayload)
+	if err != nil {
+		t.Fatalf("unexpected Go error on denied touch: %v", err)
+	}
+	if !denyRes.IsError || !strings.Contains(strings.ToLower(denyRes.Output), "operation not permitted") {
+		t.Fatalf("expected kernel Operation not permitted for unlisted dir, got:\n%s", denyRes.Output)
+	}
+}
+
+func TestOverflowLogAddressableReadAndWriteBlock(t *testing.T) {
+	wsRoot := t.TempDir()
+	vaultRoot := t.TempDir()
+	homeDir := t.TempDir()
+
+	cfgMgr, err := config.NewManager(config.Options{
+		VaultRoot:   vaultRoot,
+		UserHomeDir: homeDir,
+	})
+	if err != nil {
+		t.Fatalf("config.NewManager: %v", err)
+	}
+	pg, err := NewPathGuard(wsRoot, vaultRoot)
+	if err != nil {
+		t.Fatalf("NewPathGuard: %v", err)
+	}
+	reg, err := NewRegistry(RegistryOptions{
+		WorkspaceRoot: wsRoot,
+		VaultPaths:    cfgMgr.Paths(),
+		PathGuard:     pg,
+	})
+	if err != nil {
+		t.Fatalf("NewRegistry: %v", err)
+	}
+
+	var lines []string
+	for i := 1; i <= 1500; i++ {
+		lines = append(lines, fmt.Sprintf("overflow-record-%04d-payload-0123456789abcdef", i))
+	}
+	wrapped := WrapUntrustedContent("big_cmd", strings.Join(lines, "\n"))
+
+	marker := "full output saved to "
+	idx := strings.Index(wrapped, marker)
+	if idx < 0 {
+		t.Fatalf("expected %q marker in truncated output, got:\n%s", marker, wrapped)
+	}
+	afterMarker := wrapped[idx+len(marker):]
+	endIdx := strings.Index(afterMarker, "]")
+	if endIdx <= 0 {
+		t.Fatalf("malformed overflow marker: %q", afterMarker)
+	}
+	overflowPath := strings.TrimSpace(afterMarker[:endIdx])
+
+	// 1. PathGuard resolves overflow-*.log with inWorkspace=false, err=nil.
+	_, _, inWS, err := pg.ResolveInWorkspace(overflowPath)
+	if err != nil || inWS {
+		t.Fatalf("expected overflowPath to resolve cleanly with inWS=false err=nil, got inWS=%v err=%v", inWS, err)
+	}
+
+	// 2. read_file can inspect the omitted middle slice of overflow-*.log without AllowOutsideWorkspace.
+	readPayload, _ := json.Marshal(map[string]any{
+		"path":   overflowPath,
+		"offset": 750,
+		"limit":  5,
+	})
+	readRes, err := reg.Execute(context.Background(), "read_file", CallContext{
+		WorkspaceRoot: wsRoot,
+		VaultRoot:     vaultRoot,
+		PathGuard:     pg,
+	}, readPayload)
+	if err != nil || readRes.IsError {
+		t.Fatalf("expected read_file on overflow-*.log to succeed, res=%+v err=%v", readRes, err)
+	}
+	if !strings.Contains(readRes.Output, "overflow-record-0750-payload") {
+		t.Fatalf("expected line 750 in overflow read_file output, got:\n%s", readRes.Output)
+	}
+
+	// 3. edit_file and write_file on overflow-*.log remain strictly blocked with ErrVaultSecretBlocked even if AllowOutsideWorkspace=true!
+	editPayload, _ := json.Marshal(map[string]any{
+		"path":       overflowPath,
+		"old_string": "overflow-record-0750",
+		"new_string": "tampered",
+	})
+	if _, err := reg.Execute(context.Background(), "edit_file", CallContext{
+		WorkspaceRoot:         wsRoot,
+		VaultRoot:             vaultRoot,
+		AllowOutsideWorkspace: true,
+		PathGuard:             pg,
+	}, editPayload); !errors.Is(err, ErrVaultSecretBlocked) {
+		t.Fatalf("expected edit_file on overflow-*.log to fail with ErrVaultSecretBlocked, got %v", err)
+	}
+
+	writePayload, _ := json.Marshal(map[string]any{
+		"path":    overflowPath,
+		"content": "clobber",
+	})
+	if _, err := reg.Execute(context.Background(), "write_file", CallContext{
+		WorkspaceRoot:         wsRoot,
+		VaultRoot:             vaultRoot,
+		AllowOutsideWorkspace: true,
+		PathGuard:             pg,
+	}, writePayload); !errors.Is(err, ErrVaultSecretBlocked) {
+		t.Fatalf("expected write_file on overflow-*.log to fail with ErrVaultSecretBlocked, got %v", err)
+	}
+
+	// 4. Non-overflow logs in runtime/logs/ and symlinked overflow-*.log files remain blocked with ErrVaultSecretBlocked!
+	daemonLog := filepath.Join(cfgMgr.Paths().LogsDir(), "daemon.jsonl")
+	if err := os.WriteFile(daemonLog, []byte("{}\n"), 0o600); err != nil {
+		t.Fatalf("write daemon.jsonl: %v", err)
+	}
+	if _, _, _, err := pg.ResolveInWorkspace(daemonLog); !errors.Is(err, ErrVaultSecretBlocked) {
+		t.Fatalf("expected daemon.jsonl in LogsDir to fail with ErrVaultSecretBlocked, got %v", err)
+	}
+
+	fakeOverflowSymlink := filepath.Join(cfgMgr.Paths().LogsDir(), "overflow-deadbeefcafe.log")
+	if err := os.Symlink(cfgMgr.Paths().ProvidersFile(), fakeOverflowSymlink); err != nil {
+		t.Fatalf("symlink fake overflow: %v", err)
+	}
+	if _, _, _, err := pg.ResolveInWorkspace(fakeOverflowSymlink); !errors.Is(err, ErrVaultSecretBlocked) {
+		t.Fatalf("expected symlinked overflow-*.log -> providers.toml to fail with ErrVaultSecretBlocked, got %v", err)
+	}
+
+	wsOverflowJump := filepath.Join(wsRoot, "sneaky_overflow_jump.log")
+	if err := os.Symlink(overflowPath, wsOverflowJump); err != nil {
+		t.Fatalf("symlink ws overflow jump: %v", err)
+	}
+	if _, _, _, err := pg.ResolveInWorkspace("sneaky_overflow_jump.log"); !errors.Is(err, ErrVaultSecretBlocked) {
+		t.Fatalf("expected workspace symlink pointing to overflow-*.log to fail with ErrVaultSecretBlocked, got %v", err)
 	}
 }
 

@@ -465,16 +465,26 @@ func (r *Registry) handleRunCommand(ctx context.Context, call CallContext, rawIn
 	if err != nil {
 		return ToolResult{}, err
 	}
-	workDir := pg.WorkspaceRoot()
+	wsRoot := pg.WorkspaceRoot()
+	workDir := wsRoot
+	inWS := true
 	if strings.TrimSpace(in.WorkDir) != "" {
-		canonWD, _, inWS, rErr := pg.ResolveInWorkspace(in.WorkDir)
+		canonWD, _, resolvedInWS, rErr := pg.ResolveInWorkspace(in.WorkDir)
 		if rErr != nil {
 			return ToolResult{}, rErr
 		}
-		if !inWS && !call.AllowOutsideWorkspace {
+		if !resolvedInWS && !call.AllowOutsideWorkspace {
 			return ToolResult{}, fmt.Errorf("%w: %s", ErrPathEscapesWorkspace, in.WorkDir)
 		}
+		st, stErr := os.Stat(canonWD)
+		if stErr != nil {
+			return ToolResult{}, stErr
+		}
+		if !st.IsDir() {
+			return ToolResult{}, fmt.Errorf("%w: workdir %s is not a directory", ErrInvalidTargetPath, in.WorkDir)
+		}
 		workDir = canonWD
+		inWS = resolvedInWS
 	}
 
 	timeout := time.Duration(defaultCommandTimeoutSec) * time.Second
@@ -489,9 +499,23 @@ func (r *Registry) handleRunCommand(ctx context.Context, call CallContext, rawIn
 		mode = SandboxStrict
 	}
 
-	gitBefore := quickGitStatus(workDir)
-	res, err := r.seatbelt.Run(runCtx, in.Command, workDir, mode, call.AllowedDomains)
-	gitAfter := quickGitStatus(workDir)
+	sandboxRoot := workDir
+	gitStatusDir := workDir
+	if inWS && wsRoot != "" {
+		sandboxRoot = wsRoot
+		gitStatusDir = wsRoot
+	}
+
+	gitBefore := quickGitStatus(gitStatusDir)
+	res, err := r.seatbelt.runWithParams(runCtx, seatbeltRunParams{
+		CmdStr:         in.Command,
+		SandboxRoot:    sandboxRoot,
+		WorkDir:        workDir,
+		ExtraWriteDirs: call.ExtraWriteDirs,
+		Mode:           mode,
+		AllowedDomains: call.AllowedDomains,
+	})
+	gitAfter := quickGitStatus(gitStatusDir)
 	if gitBefore != gitAfter && gitAfter != "" {
 		res.GitChanges = gitAfter
 	}

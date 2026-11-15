@@ -85,7 +85,8 @@ func (r *Registry) handleReadFile(_ context.Context, call CallContext, rawInput 
 	if err != nil {
 		return ToolResult{}, err
 	}
-	if !inWS && !call.AllowOutsideWorkspace {
+	isOverflowLog := pg.IsOverflowLogFile(canonAbs)
+	if !inWS && !call.AllowOutsideWorkspace && !isOverflowLog {
 		return ToolResult{}, fmt.Errorf("%w: %s", ErrPathEscapesWorkspace, in.Path)
 	}
 
@@ -196,6 +197,9 @@ func (r *Registry) stageEditFromInput(call CallContext, toolName string, rawInpu
 		if err != nil {
 			return nil, err
 		}
+		if pg.IsOverflowLogFile(canonAbs) {
+			return nil, fmt.Errorf("%w: %s", ErrVaultSecretBlocked, in.Path)
+		}
 		if !inWS && !call.AllowOutsideWorkspace {
 			return nil, fmt.Errorf("%w: %s", ErrPathEscapesWorkspace, in.Path)
 		}
@@ -213,6 +217,9 @@ func (r *Registry) stageEditFromInput(call CallContext, toolName string, rawInpu
 		canonAbs, rel, inWS, err := pg.ResolveInWorkspace(in.Path)
 		if err != nil {
 			return nil, err
+		}
+		if pg.IsOverflowLogFile(canonAbs) {
+			return nil, fmt.Errorf("%w: %s", ErrVaultSecretBlocked, in.Path)
 		}
 		if !inWS && !call.AllowOutsideWorkspace {
 			return nil, fmt.Errorf("%w: %s", ErrPathEscapesWorkspace, in.Path)

@@ -207,29 +207,53 @@ func (s *SeatbeltRunner) BuildProfile(wsRoot string, extraWriteDirs []string, mo
 	return b.String()
 }
 
+type seatbeltRunParams struct {
+	CmdStr         string
+	SandboxRoot    string
+	WorkDir        string
+	ExtraWriteDirs []string
+	Mode           SandboxMode
+	AllowedDomains []string
+}
+
 func (s *SeatbeltRunner) Run(
 	ctx context.Context,
 	cmdStr, workDir string,
 	mode SandboxMode,
 	allowedDomains []string,
 ) (CommandResult, error) {
+	return s.runWithParams(ctx, seatbeltRunParams{
+		CmdStr:         cmdStr,
+		SandboxRoot:    workDir,
+		WorkDir:        workDir,
+		Mode:           mode,
+		AllowedDomains: allowedDomains,
+	})
+}
+
+func (s *SeatbeltRunner) runWithParams(ctx context.Context, p seatbeltRunParams) (CommandResult, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	if strings.TrimSpace(cmdStr) == "" {
+	if strings.TrimSpace(p.CmdStr) == "" {
 		return CommandResult{}, errors.New("empty command string")
 	}
+	mode := p.Mode
 	if mode == "" {
 		mode = SandboxStrict
 	}
 
-	canonWorkDir := canonicalizeExistingOrClean(workDir)
+	canonWorkDir := canonicalizeExistingOrClean(p.WorkDir)
 	if canonWorkDir == "" {
 		cwd, err := os.Getwd()
 		if err != nil {
 			return CommandResult{}, err
 		}
 		canonWorkDir = canonicalizeExistingOrClean(cwd)
+	}
+	canonSandboxRoot := canonicalizeExistingOrClean(p.SandboxRoot)
+	if canonSandboxRoot == "" {
+		canonSandboxRoot = canonWorkDir
 	}
 
 	// 为每次命令分配专属隔离临时目录（执行完毕即清理），避免污染或放行宿主机全局 /tmp 与其他会话临时目录。
@@ -242,12 +266,12 @@ func (s *SeatbeltRunner) Run(
 
 	var proxy *EgressProxy
 	proxyPort := 0
-	if mode != SandboxOff && mode != SandboxNetworkAllow && len(allowedDomains) > 0 {
+	if mode != SandboxOff && mode != SandboxNetworkAllow && len(p.AllowedDomains) > 0 {
 		var opts []EgressProxyOption
 		if s != nil && s.proxyDial != nil {
 			opts = append(opts, WithProxyDialContext(s.proxyDial))
 		}
-		proxy, err = NewEgressProxy(allowedDomains, opts...)
+		proxy, err = NewEgressProxy(p.AllowedDomains, opts...)
 		if err != nil {
 			return CommandResult{}, err
 		}
@@ -256,17 +280,22 @@ func (s *SeatbeltRunner) Run(
 	}
 
 	var writeDirs []string
-	if s != nil && len(s.extraWriteDirs) > 0 {
-		writeDirs = append(writeDirs, s.extraWriteDirs...)
+	if mode != SandboxReadOnly {
+		if s != nil && len(s.extraWriteDirs) > 0 {
+			writeDirs = append(writeDirs, s.extraWriteDirs...)
+		}
+		if len(p.ExtraWriteDirs) > 0 {
+			writeDirs = append(writeDirs, p.ExtraWriteDirs...)
+		}
 	}
 	writeDirs = append(writeDirs, canonTmpDir)
 
 	var cmd *exec.Cmd
 	if mode == SandboxOff {
-		cmd = exec.CommandContext(ctx, "/bin/zsh", "-f", "-c", cmdStr)
+		cmd = exec.CommandContext(ctx, "/bin/zsh", "-f", "-c", p.CmdStr)
 	} else {
-		profile := s.BuildProfile(canonWorkDir, writeDirs, mode, proxyPort)
-		cmd = exec.CommandContext(ctx, "/usr/bin/sandbox-exec", "-p", profile, "/bin/zsh", "-f", "-c", cmdStr)
+		profile := s.BuildProfile(canonSandboxRoot, writeDirs, mode, proxyPort)
+		cmd = exec.CommandContext(ctx, "/usr/bin/sandbox-exec", "-p", profile, "/bin/zsh", "-f", "-c", p.CmdStr)
 	}
 
 	cmd.Dir = canonWorkDir
@@ -468,17 +497,14 @@ func canonicalizeExistingOrClean(p string) string {
 	if trimmed == "" {
 		return ""
 	}
-	abs, err := filepath.Abs(trimmed)
+	rawAbs, err := toUncleanedAbs("", trimmed)
 	if err != nil {
 		return filepath.Clean(trimmed)
 	}
-	if resolved, err := filepath.EvalSymlinks(abs); err == nil {
-		return filepath.Clean(resolved)
-	}
-	if resolved, err := resolveCanonicalPath(abs, 0); err == nil {
+	if resolved, err := resolveCanonicalPath(rawAbs, 0); err == nil {
 		return resolved
 	}
-	return filepath.Clean(abs)
+	return filepath.Clean(rawAbs)
 }
 
 func escapeSBPL(s string) string {
