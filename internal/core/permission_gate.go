@@ -694,9 +694,32 @@ func checkHardFloor(ctx EvalContext, call ToolInvocation, target callTargetInfo)
 		}
 		if vRoot := strings.TrimSpace(ctx.VaultRoot); vRoot != "" {
 			cleanV := canonicalOrClean(vRoot)
+			lexV := filepath.Clean(vRoot)
 			cleanWS := canonicalOrClean(ctx.WorkspaceRoot)
-			// 若命令直接点名 Vault 机密目录（且并非当前隔离 worktree 自身路径），由硬底线拦截
-			if strings.Contains(cmd, cleanV) && (cleanWS == "" || !strings.Contains(cmd, cleanWS)) {
+			lexWS := ""
+			if strings.TrimSpace(ctx.WorkspaceRoot) != "" {
+				lexWS = filepath.Clean(ctx.WorkspaceRoot)
+			}
+
+			scrubbed := cmd
+			// 若当前运行位于 runtime/worktrees/<wt> 隔离工作树内，先剔除合法的 worktree 自身路径（禁止携带 /.. 穿越逃逸），再检查剩余命令是否触碰 Vault 机密区
+			wtBase := filepath.Join(cleanV, "runtime", "worktrees")
+			if cleanWS != "" && isPathStrictlyInside(cleanWS, wtBase) {
+				if strings.Contains(scrubbed, cleanWS+"/..") {
+					return "command traversing out of worktree into Gorness vault blocked by hard-floor", true
+				}
+				scrubbed = strings.ReplaceAll(scrubbed, cleanWS, "")
+			}
+			lexWTBase := filepath.Join(lexV, "runtime", "worktrees")
+			if lexWS != "" && lexWS != cleanWS && isPathStrictlyInside(lexWS, lexWTBase) {
+				if strings.Contains(scrubbed, lexWS+"/..") {
+					return "command traversing out of worktree into Gorness vault blocked by hard-floor", true
+				}
+				scrubbed = strings.ReplaceAll(scrubbed, lexWS, "")
+			}
+
+			if (cleanV != "" && strings.Contains(scrubbed, cleanV)) ||
+				(lexV != "" && lexV != "." && strings.Contains(scrubbed, lexV)) {
 				return "command referencing Gorness vault directory blocked by hard-floor", true
 			}
 		}
@@ -749,29 +772,24 @@ func matchesDenyPath(ctx EvalContext, target callTargetInfo) (string, bool) {
 	}
 	patterns := append(builtinDeny, ctx.Rules.DenyPaths...)
 
-	candidates := []string{filepath.ToSlash(target.rawPath)}
-	if target.canonAbs != "" {
-		candidates = append(candidates, filepath.ToSlash(target.canonAbs))
-	}
-	if exp := expandUserHome(target.rawPath, home); exp != "" {
-		candidates = append(candidates, filepath.ToSlash(exp))
+	candidates := collectTargetPathCandidates(target, home)
+
+	isManagedWorktree := false
+	if strings.TrimSpace(ctx.VaultRoot) != "" && strings.TrimSpace(ctx.WorkspaceRoot) != "" {
+		cleanV := canonicalOrClean(ctx.VaultRoot)
+		cleanWS := canonicalOrClean(ctx.WorkspaceRoot)
+		if isPathStrictlyInside(cleanWS, filepath.Join(cleanV, "runtime", "worktrees")) {
+			isManagedWorktree = true
+		}
 	}
 
 	for _, rawPat := range patterns {
-		pat := strings.TrimSpace(rawPat)
-		if pat == "" {
+		trimmedPat := strings.TrimSpace(rawPat)
+		if ((isManagedWorktree && target.inWorkspace) || target.isOverflowLog) &&
+			(trimmedPat == "~/.gorness/*" || trimmedPat == "~/.gorness") {
 			continue
 		}
-		var expandedPats []string
-		expandedPats = append(expandedPats, filepath.ToSlash(pat))
-		if home != "" && (pat == "~" || strings.HasPrefix(pat, "~/")) {
-			expandedPats = append(expandedPats, filepath.ToSlash(expandUserHome(pat, home)))
-		}
-		if ctx.VaultRoot != "" && strings.HasPrefix(pat, "~/.gorness") {
-			suffix := strings.TrimPrefix(pat, "~/.gorness")
-			expandedPats = append(expandedPats, filepath.ToSlash(filepath.Clean(ctx.VaultRoot)+suffix))
-		}
-
+		expandedPats := expandRulePathPatterns(rawPat, home, ctx.WorkspaceRoot, ctx.VaultRoot)
 		for _, ep := range expandedPats {
 			baseDir := strings.TrimSuffix(ep, "/*")
 			for _, cand := range candidates {
@@ -796,7 +814,8 @@ func checkToolACL(ctx EvalContext, call ToolInvocation) (reason, code string, bl
 			}
 		}
 		if ctx.AgentProfile.AllowedTools != nil {
-			if !containsString(ctx.AgentProfile.AllowedTools, name) {
+			isSearchHelper := name == "search_tools" && len(ctx.AgentProfile.AllowedTools) > 0
+			if !isSearchHelper && !containsString(ctx.AgentProfile.AllowedTools, name) {
 				return fmt.Sprintf("tool %q is not in allowed_tools for agent role %q", name, ctx.AgentProfile.ID), "agent-tool-not-allowed", true
 			}
 		}
@@ -806,7 +825,8 @@ func checkToolACL(ctx EvalContext, call ToolInvocation) (reason, code string, bl
 	}
 
 	if ctx.AllowedTools != nil {
-		if !containsString(ctx.AllowedTools, name) {
+		isSearchHelper := name == "search_tools" && len(ctx.AllowedTools) > 0
+		if !isSearchHelper && !containsString(ctx.AllowedTools, name) {
 			return fmt.Sprintf("tool %q is outside run AllowedTools restriction", name), "subagent-tool-not-allowed", true
 		}
 	}
@@ -940,7 +960,15 @@ func evaluateByMode(ctx EvalContext, mode string, call ToolInvocation, target ca
 			return GateResult{
 				Action:      GateAllow,
 				ReasonCode:  "accept-edits",
-				Reason:      "in-workspace file edit allowed in accept_edits mode",
+				Reason:      "file edit allowed in accept_edits mode",
+				Fingerprint: fp,
+			}
+		}
+		if call.ToolName == "read_file" || call.ToolName == "search_code" || (call.Tool != nil && !call.Tool.Mutating && !call.Tool.IsMCP && !target.hasCommand) {
+			return GateResult{
+				Action:      GateAllow,
+				ReasonCode:  "accept-edits-read",
+				Reason:      "non-mutating local tool allowed in accept_edits mode",
 				Fingerprint: fp,
 			}
 		}
@@ -1050,18 +1078,109 @@ func matchesAllowPaths(ctx EvalContext, target callTargetInfo) bool {
 	if home == "" {
 		home, _ = os.UserHomeDir()
 	}
-	cand := filepath.ToSlash(target.canonAbs)
-	if cand == "" {
-		cand = filepath.ToSlash(expandUserHome(target.rawPath, home))
-	}
-	for _, pat := range ctx.Rules.AllowPaths {
-		ep := filepath.ToSlash(expandUserHome(pat, home))
-		base := strings.TrimSuffix(ep, "/*")
-		if matchWildcardPath(ep, cand) || (strings.HasSuffix(ep, "/*") && isPathInsideOrEqual(filepath.FromSlash(cand), filepath.FromSlash(base))) {
-			return true
+	candidates := collectTargetPathCandidates(target, home)
+	for _, rawPat := range ctx.Rules.AllowPaths {
+		for _, ep := range expandRulePathPatterns(rawPat, home, ctx.WorkspaceRoot, ctx.VaultRoot) {
+			base := strings.TrimSuffix(ep, "/*")
+			for _, cand := range candidates {
+				if cand == "" {
+					continue
+				}
+				if matchWildcardPath(ep, cand) || (strings.HasSuffix(ep, "/*") && isPathInsideOrEqual(filepath.FromSlash(cand), filepath.FromSlash(base))) {
+					return true
+				}
+			}
 		}
 	}
 	return false
+}
+
+func collectTargetPathCandidates(target callTargetInfo, home string) []string {
+	var out []string
+	add := func(s string) {
+		trimmed := strings.TrimSpace(s)
+		if trimmed != "" {
+			out = append(out, filepath.ToSlash(trimmed))
+		}
+	}
+	add(target.rawPath)
+	add(target.relPath)
+	add(target.canonAbs)
+	if exp := expandUserHome(target.rawPath, home); exp != "" && exp != target.rawPath {
+		add(exp)
+		add(canonicalizePatternPath(filepath.ToSlash(exp)))
+	}
+	return out
+}
+
+func expandRulePathPatterns(rawPat, home, wsRoot, vaultRoot string) []string {
+	pat := strings.TrimSpace(rawPat)
+	if pat == "" {
+		return nil
+	}
+	var out []string
+	seen := make(map[string]bool)
+	add := func(p string) {
+		slash := filepath.ToSlash(strings.TrimSpace(p))
+		if slash == "" || seen[slash] {
+			return
+		}
+		seen[slash] = true
+		out = append(out, slash)
+	}
+
+	add(pat)
+	if home != "" && (pat == "~" || strings.HasPrefix(pat, "~/")) {
+		exp := expandUserHome(pat, home)
+		add(exp)
+		add(canonicalizePatternPath(filepath.ToSlash(exp)))
+	}
+	if vaultRoot != "" && strings.HasPrefix(pat, "~/.gorness") {
+		suffix := strings.TrimPrefix(pat, "~/.gorness")
+		vPat := filepath.Clean(vaultRoot) + suffix
+		add(vPat)
+		add(canonicalizePatternPath(filepath.ToSlash(vPat)))
+	}
+	if strings.HasPrefix(pat, "/") {
+		add(canonicalizePatternPath(filepath.ToSlash(pat)))
+	} else if !strings.HasPrefix(pat, "~") && strings.TrimSpace(wsRoot) != "" {
+		canonWS := canonicalOrClean(wsRoot)
+		add(canonWS + "/" + strings.TrimPrefix(filepath.ToSlash(pat), "./"))
+	}
+	return out
+}
+
+func canonicalizePatternPath(slashPat string) string {
+	if !strings.HasPrefix(slashPat, "/") {
+		return slashPat
+	}
+	wildIdx := strings.IndexAny(slashPat, "*?[")
+	prefix := slashPat
+	suffix := ""
+	if wildIdx >= 0 {
+		lastSlash := strings.LastIndexByte(slashPat[:wildIdx], '/')
+		if lastSlash <= 0 {
+			return slashPat
+		}
+		prefix = slashPat[:lastSlash]
+		suffix = slashPat[lastSlash:]
+	}
+
+	// 沿已存在的祖先目录解析 macOS 软链（如 /var -> /private/var），保留尚未创建的末级路径段与通配符后缀
+	cur := filepath.Clean(filepath.FromSlash(prefix))
+	var tail []string
+	for cur != "/" && cur != "." {
+		if resolved, err := filepath.EvalSymlinks(cur); err == nil {
+			resolved = filepath.Clean(resolved)
+			for i := len(tail) - 1; i >= 0; i-- {
+				resolved = filepath.Join(resolved, tail[i])
+			}
+			return filepath.ToSlash(resolved) + suffix
+		}
+		tail = append(tail, filepath.Base(cur))
+		cur = filepath.Dir(cur)
+	}
+	return slashPat
 }
 
 func matchWildcardCI(pattern, value string) bool {

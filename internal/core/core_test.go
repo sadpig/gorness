@@ -1,10 +1,14 @@
 package core
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
@@ -1660,4 +1664,710 @@ func TestUnattendedDeferResumeWorktreeAndAllowedToolsIntersection(t *testing.T) 
 		t.Fatalf("expected session run lock released after StopRun, ok=%v err=%v", okLock, lErr)
 	}
 	unlockAfterStop()
+}
+
+func TestFixRound1ReviewFindings(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	// =========================================================================
+	// Critical #1: Client-side compaction anchor emits valid Type="text" user block
+	// on Anthropic /v1/messages wire (never raw {"type":"compaction", ...} in user message).
+	// =========================================================================
+	t.Run("Critical1_CompactionAnchorValidAnthropicUserTextBlock", func(t *testing.T) {
+		var capturedAnthropicBody []byte
+		var wireMu sync.Mutex
+
+		mockAnthropic := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			raw, _ := io.ReadAll(r.Body)
+			wireMu.Lock()
+			capturedAnthropicBody = append([]byte(nil), raw...)
+			wireMu.Unlock()
+
+			w.Header().Set("Content-Type", "text/event-stream")
+			fmt.Fprint(w, "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":50,\"output_tokens\":1}}}\n\n")
+			fmt.Fprint(w, "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"ok\"}}\n\n")
+			fmt.Fprint(w, "event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n")
+			fmt.Fprint(w, "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":2}}\n\n")
+			fmt.Fprint(w, "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n")
+		}))
+		defer mockAnthropic.Close()
+
+		utilStreamer := llm.StreamerFunc(func(ctx context.Context, req llm.Request) (<-chan llm.StreamEvent, error) {
+			ch := make(chan llm.StreamEvent, 4)
+			ch <- llm.StreamEvent{Type: llm.StreamTextDelta, Text: "## Goal & Intent\nWire format safety check."}
+			ch <- llm.StreamEvent{Type: llm.StreamDone, StopReason: "end_turn", InputTokens: 30, OutputTokens: 10}
+			close(ch)
+			return ch, nil
+		})
+		eng, _, _, _ := setupTestEngine(t, nil, utilStreamer)
+		ws, err := eng.Workspaces().Register(t.TempDir(), "CompactionWireRepo")
+		if err != nil {
+			t.Fatalf("Register ws: %v", err)
+		}
+		sess, err := eng.Sessions().Create(ws.ID, "Wire Check", "coder")
+		if err != nil {
+			t.Fatalf("Create session: %v", err)
+		}
+		for i := 1; i <= 4; i++ {
+			_, _ = eng.Sessions().Append(sess.ID, store.SessionEntry{
+				Role:   "user",
+				Blocks: []store.ContentBlock{{Type: "text", Text: fmt.Sprintf("Turn %d user", i)}},
+			})
+			_, _ = eng.Sessions().Append(sess.ID, store.SessionEntry{
+				Role:   "assistant",
+				Blocks: []store.ContentBlock{{Type: "text", Text: fmt.Sprintf("Turn %d assistant", i)}},
+			})
+		}
+
+		if err := eng.CompactSession(ctx, sess.ID); err != nil {
+			t.Fatalf("CompactSession: %v", err)
+		}
+		branch, err := eng.Sessions().LoadActiveBranch(sess.ID)
+		if err != nil || len(branch) == 0 {
+			t.Fatalf("LoadActiveBranch: len=%d err=%v", len(branch), err)
+		}
+		anchorBlk := branch[0].Blocks[0]
+		if anchorBlk.Type != "text" {
+			t.Fatalf("expected anchor block Type='text', got %q", anchorBlk.Type)
+		}
+		if bytes.Contains(anchorBlk.CompactionData, []byte(`"type"`)) {
+			t.Fatalf("expected CompactionData metadata without 'type' key, got %s", anchorBlk.CompactionData)
+		}
+		if len(anchorBlk.CompactionData) == 0 {
+			t.Fatal("expected CompactionData metadata preserved on anchor block")
+		}
+
+		// Stream compacted branch through real Anthropic wire serializer and verify messages[0].content[0].type == "text".
+		native := llm.NewNativeStreamer(mockAnthropic.Client())
+		ch, err := native.Stream(ctx, llm.Request{
+			Provider: config.ProviderConfig{
+				ID:       "anthropic",
+				Protocol: "anthropic",
+				BaseURL:  mockAnthropic.URL,
+			},
+			APIKey:  "sk-ant-test",
+			Model:   "claude-sonnet-5-5",
+			History: branch,
+		})
+		if err != nil {
+			t.Fatalf("NativeStreamer.Stream: %v", err)
+		}
+		for ev := range ch {
+			if ev.Type == llm.StreamError {
+				t.Fatalf("Anthropic stream error: %v", ev.Err)
+			}
+		}
+
+		wireMu.Lock()
+		wireBytes := append([]byte(nil), capturedAnthropicBody...)
+		wireMu.Unlock()
+
+		var wirePayload struct {
+			Messages []struct {
+				Role    string `json:"role"`
+				Content []struct {
+					Type string `json:"type"`
+					Text string `json:"text"`
+				} `json:"content"`
+			} `json:"messages"`
+		}
+		if err := json.Unmarshal(wireBytes, &wirePayload); err != nil {
+			t.Fatalf("unmarshal Anthropic wire payload: %v", err)
+		}
+		if len(wirePayload.Messages) == 0 || wirePayload.Messages[0].Role != "user" || len(wirePayload.Messages[0].Content) == 0 {
+			t.Fatalf("unexpected wire messages[0]: %s", wireBytes)
+		}
+		if gotType := wirePayload.Messages[0].Content[0].Type; gotType != "text" {
+			t.Fatalf("expected Anthropic messages[0].content[0].type == 'text', got %q (payload=%s)", gotType, wireBytes)
+		}
+		if !strings.Contains(wirePayload.Messages[0].Content[0].Text, "<anchored_summary>") {
+			t.Fatalf("expected <anchored_summary> in messages[0].content[0].text, got %q", wirePayload.Messages[0].Content[0].Text)
+		}
+	})
+
+	// =========================================================================
+	// Critical #2: Hard-Floor vault check blocks mixed `<vaultRoot>/providers.toml && <worktreePath>` commands.
+	// =========================================================================
+	t.Run("Critical2_HardFloorVaultCheckWithManagedWorktreePath", func(t *testing.T) {
+		base := t.TempDir()
+		vaultRoot := filepath.Join(base, "vault")
+		wtDir := filepath.Join(vaultRoot, "runtime", "worktrees", "wt-alpha")
+		if err := os.MkdirAll(wtDir, 0o700); err != nil {
+			t.Fatalf("mkdir wtDir: %v", err)
+		}
+		if err := os.WriteFile(filepath.Join(vaultRoot, "providers.toml"), []byte("secret=1\n"), 0o600); err != nil {
+			t.Fatalf("write providers.toml: %v", err)
+		}
+		pg, err := tools.NewPathGuard(wtDir, vaultRoot)
+		if err != nil {
+			t.Fatalf("NewPathGuard(wtDir): %v", err)
+		}
+
+		gate := NewPermissionGate(nil)
+		evalCtx := EvalContext{
+			WorkspaceID:   "ws-wt",
+			WorkspaceRoot: wtDir,
+			VaultRoot:     vaultRoot,
+			EffectiveMode: PermModeYolo,
+			PathGuard:     pg,
+		}
+		runCmdMeta := tools.Tool{Name: "run_command", Mutating: true}
+
+		// Legitimate command referencing only worktree path -> allowed in yolo mode
+		legitCmd, _ := json.Marshal(map[string]string{"command": fmt.Sprintf("ls -la %s", wtDir)})
+		if res := gate.Evaluate(evalCtx, ToolInvocation{ToolName: "run_command", Args: legitCmd, Tool: &runCmdMeta}); res.Action != GateAllow {
+			t.Fatalf("expected legitimate worktree command allowed, got %+v", res)
+		}
+
+		// Mixed command referencing BOTH vault secret file AND worktree path -> MUST be hard-floor denied!
+		mixedCmd, _ := json.Marshal(map[string]string{
+			"command": fmt.Sprintf("cat %s && ls %s", filepath.Join(vaultRoot, "providers.toml"), wtDir),
+		})
+		resMixed := gate.Evaluate(evalCtx, ToolInvocation{ToolName: "run_command", Args: mixedCmd, Tool: &runCmdMeta})
+		if resMixed.Action != GateDeny || resMixed.ReasonCode != "hard-floor" {
+			t.Fatalf("expected hard-floor GateDeny on mixed vault+worktree command, got %+v", resMixed)
+		}
+
+		// Traversal command out of worktree into vault -> MUST be hard-floor denied!
+		travCmd, _ := json.Marshal(map[string]string{
+			"command": fmt.Sprintf("cat %s/../../../providers.toml", wtDir),
+		})
+		resTrav := gate.Evaluate(evalCtx, ToolInvocation{ToolName: "run_command", Args: travCmd, Tool: &runCmdMeta})
+		if resTrav.Action != GateDeny || resTrav.ReasonCode != "hard-floor" {
+			t.Fatalf("expected hard-floor GateDeny on worktree ../ traversal command, got %+v", resTrav)
+		}
+	})
+
+	// =========================================================================
+	// Important #1: GateDeny / PreToolUse deny precedes tryStageForGate (no disk read / no old_string oracle leak).
+	// =========================================================================
+	t.Run("Important1_GateDenyPrecedesStageEditNoOracleLeak", func(t *testing.T) {
+		var observedResults []string
+		var resMu sync.Mutex
+
+		streamer := llm.StreamerFunc(func(ctx context.Context, req llm.Request) (<-chan llm.StreamEvent, error) {
+			ch := make(chan llm.StreamEvent, 8)
+			if strings.Contains(strings.ToLower(req.StaticSystem), "housekeeping utility") {
+				ch <- llm.StreamEvent{Type: llm.StreamTextDelta, Text: "Deny Precedence"}
+				ch <- llm.StreamEvent{Type: llm.StreamDone, StopReason: "end_turn"}
+				close(ch)
+				return ch, nil
+			}
+			for _, e := range req.History {
+				for _, b := range e.Blocks {
+					if b.Type == "tool_result" {
+						resMu.Lock()
+						observedResults = append(observedResults, b.Text)
+						resMu.Unlock()
+						ch <- llm.StreamEvent{Type: llm.StreamTextDelta, Text: "done"}
+						ch <- llm.StreamEvent{Type: llm.StreamDone, StopReason: "end_turn"}
+						close(ch)
+						return ch, nil
+					}
+				}
+			}
+			// Deliberately pass a mismatched old_string on secret/cred.env!
+			ch <- llm.StreamEvent{
+				Type:       llm.StreamToolCall,
+				ToolCallID: "probe_edit",
+				ToolName:   "edit_file",
+				ToolInput:  json.RawMessage(`{"path":"secret/cred.env","old_string":"WRONG_OLD_STRING_ORACLE","new_string":"x"}`),
+			}
+			ch <- llm.StreamEvent{Type: llm.StreamDone, StopReason: "tool_use"}
+			close(ch)
+			return ch, nil
+		})
+
+		eng, _, _, _ := setupTestEngine(t, nil, streamer)
+		wsDir := t.TempDir()
+		secretEnvPath := filepath.Join(wsDir, "secret", "cred.env")
+		if err := os.MkdirAll(filepath.Dir(secretEnvPath), 0o755); err != nil {
+			t.Fatalf("mkdir secret: %v", err)
+		}
+		if err := os.WriteFile(secretEnvPath, []byte("REAL_SECRET=topsecret\n"), 0o600); err != nil {
+			t.Fatalf("write cred.env: %v", err)
+		}
+		// Add workspace rules.toml denying secret/cred.env (tightening deny_paths is always applied).
+		if err := os.MkdirAll(filepath.Join(wsDir, ".gorness"), 0o755); err != nil {
+			t.Fatalf("mkdir .gorness: %v", err)
+		}
+		rulesTOML := fmt.Sprintf("deny_paths = [%q]\n", filepath.ToSlash(secretEnvPath))
+		if err := os.WriteFile(filepath.Join(wsDir, ".gorness", "rules.toml"), []byte(rulesTOML), 0o644); err != nil {
+			t.Fatalf("write rules.toml: %v", err)
+		}
+
+		ws, err := eng.Workspaces().Register(wsDir, "OracleLeakRepo")
+		if err != nil {
+			t.Fatalf("Register ws: %v", err)
+		}
+
+		// Case A: Rules.DenyPaths (Step 1 hard-floor)
+		_, s1, err := eng.StartRun(ctx, RunRequest{WorkspaceID: ws.ID, Prompt: "case deny_paths", PermMode: PermModeAuto})
+		if err != nil {
+			t.Fatalf("StartRun case A: %v", err)
+		}
+		_ = drainRunEvents(s1)
+
+		// Case B: Plan mode (Step 2 plan-readonly) on non-denied normal file
+		_ = os.Remove(filepath.Join(wsDir, ".gorness", "rules.toml"))
+		_, s2, err := eng.StartRun(ctx, RunRequest{WorkspaceID: ws.ID, Prompt: "case plan", PermMode: PermModePlan})
+		if err != nil {
+			t.Fatalf("StartRun case B: %v", err)
+		}
+		_ = drainRunEvents(s2)
+
+		// Case C: Subagent AllowedTools restriction
+		_, s3, err := eng.StartRun(ctx, RunRequest{WorkspaceID: ws.ID, Prompt: "case acl", AllowedTools: []string{"read_file"}})
+		if err != nil {
+			t.Fatalf("StartRun case C: %v", err)
+		}
+		_ = drainRunEvents(s3)
+
+		// Case D: PreToolUse Hook returning GateDeny
+		unsub := eng.Hooks().OnPreToolUse(func(ctx context.Context, ev *PreToolUseEvent) (GateResult, error) {
+			return GateResult{Action: GateDeny, ReasonCode: "policy-hook", Reason: "blocked by pre-tool hook"}, nil
+		})
+		eng.Hooks().Freeze()
+		_, s4, err := eng.StartRun(ctx, RunRequest{WorkspaceID: ws.ID, Prompt: "case hook", PermMode: PermModeAuto})
+		if err != nil {
+			t.Fatalf("StartRun case D: %v", err)
+		}
+		_ = drainRunEvents(s4)
+		unsub()
+		eng.Hooks().Freeze()
+
+		resMu.Lock()
+		got := append([]string(nil), observedResults...)
+		resMu.Unlock()
+		if len(got) != 4 {
+			t.Fatalf("expected 4 tool_result observations, got %d: %v", len(got), got)
+		}
+		wantCodes := []string{"[hard-floor]", "[plan-readonly]", "[subagent-tool-not-allowed]", "[policy-hook]"}
+		for i, wc := range wantCodes {
+			if strings.Contains(got[i], "old_string") {
+				t.Fatalf("case %d leaked old_string match error before GateDeny: %q", i, got[i])
+			}
+			if !strings.Contains(got[i], "Permission denied "+wc) {
+				t.Fatalf("case %d expected 'Permission denied %s', got %q", i, wc, got[i])
+			}
+		}
+	})
+
+	// =========================================================================
+	// Important #2: Outside-workspace GateAllow passes AllowOutsideWorkspace=true
+	// in both parallel read batches and Rules.AllowPaths serial edits!
+	// =========================================================================
+	t.Run("Important2_OutsideWorkspaceAllowPathsParallelReadAndSerialEdit", func(t *testing.T) {
+		sharedDir := t.TempDir()
+		docPath := filepath.Join(sharedDir, "shared_spec.md")
+		editTarget := filepath.Join(sharedDir, "notes.txt")
+		if err := os.WriteFile(docPath, []byte("SHARED_SPEC_TOKEN_777\n"), 0o644); err != nil {
+			t.Fatalf("write shared_spec.md: %v", err)
+		}
+		if err := os.WriteFile(editTarget, []byte("status = draft\n"), 0o644); err != nil {
+			t.Fatalf("write notes.txt: %v", err)
+		}
+
+		var toolErrors []string
+		var errMu sync.Mutex
+
+		streamer := llm.StreamerFunc(func(ctx context.Context, req llm.Request) (<-chan llm.StreamEvent, error) {
+			ch := make(chan llm.StreamEvent, 8)
+			if strings.Contains(strings.ToLower(req.StaticSystem), "housekeeping utility") {
+				ch <- llm.StreamEvent{Type: llm.StreamTextDelta, Text: "Shared AllowPaths"}
+				ch <- llm.StreamEvent{Type: llm.StreamDone, StopReason: "end_turn"}
+				close(ch)
+				return ch, nil
+			}
+			sawToolTurn := false
+			for _, e := range req.History {
+				if e.Role == "tool" {
+					sawToolTurn = true
+					for _, b := range e.Blocks {
+						if b.IsError {
+							errMu.Lock()
+							toolErrors = append(toolErrors, fmt.Sprintf("%s: %s", b.ToolCallID, b.Text))
+							errMu.Unlock()
+						}
+					}
+				}
+			}
+			if sawToolTurn {
+				ch <- llm.StreamEvent{Type: llm.StreamTextDelta, Text: "Completed outside-workspace operations."}
+				ch <- llm.StreamEvent{Type: llm.StreamDone, StopReason: "end_turn"}
+				close(ch)
+				return ch, nil
+			}
+
+			rArgs, _ := json.Marshal(map[string]string{"path": docPath})
+			sArgs, _ := json.Marshal(map[string]string{"pattern": "SHARED_SPEC_TOKEN_777", "path": sharedDir})
+			eArgs, _ := json.Marshal(map[string]string{"path": editTarget, "old_string": "status = draft", "new_string": "status = approved"})
+
+			// Consecutive read_file + search_code outside wsRoot (runs in runParallelReadBatch!) + edit_file outside wsRoot!
+			ch <- llm.StreamEvent{Type: llm.StreamToolCall, ToolCallID: "out_read", ToolName: "read_file", ToolInput: rArgs}
+			ch <- llm.StreamEvent{Type: llm.StreamToolCall, ToolCallID: "out_search", ToolName: "search_code", ToolInput: sArgs}
+			ch <- llm.StreamEvent{Type: llm.StreamToolCall, ToolCallID: "out_edit", ToolName: "edit_file", ToolInput: eArgs}
+			ch <- llm.StreamEvent{Type: llm.StreamDone, StopReason: "tool_use"}
+			close(ch)
+			return ch, nil
+		})
+
+		eng, cfgMgr, _, _ := setupTestEngine(t, nil, streamer)
+		// Notice we pass ONLY the un-canonicalized sharedDir + "/*" to also verify /var -> /private/var pattern canonicalization!
+		rulesBody := fmt.Sprintf("allow_paths = [%q]\n", filepath.ToSlash(sharedDir)+"/*")
+		if err := os.WriteFile(cfgMgr.Paths().RulesFile(), []byte(rulesBody), 0o600); err != nil {
+			t.Fatalf("write global rules.toml: %v", err)
+		}
+		reloadedCfg, err := config.NewManager(config.Options{
+			VaultRoot: cfgMgr.Paths().Root,
+			EnvLookup: func(key string) (string, bool) {
+				if key == "ANTHROPIC_API_KEY" {
+					return "sk-ant-test-key", true
+				}
+				return "", false
+			},
+		})
+		if err != nil {
+			t.Fatalf("reload config manager: %v", err)
+		}
+		eng2, err := NewEngine(EngineOptions{
+			Config:     reloadedCfg,
+			Workspaces: eng.Workspaces(),
+			Sessions:   eng.Sessions(),
+			Snapshots:  eng.Snapshots(),
+			Router:     llm.NewRouter(reloadedCfg, reloadedCfg.Secrets(), streamer),
+		})
+		if err != nil {
+			t.Fatalf("NewEngine eng2: %v", err)
+		}
+		defer eng2.Close()
+
+		ws, err := eng2.Workspaces().Register(t.TempDir(), "OutsideAllowRepo")
+		if err != nil {
+			t.Fatalf("Register ws: %v", err)
+		}
+		_, runStream, err := eng2.StartRun(ctx, RunRequest{
+			WorkspaceID: ws.ID,
+			Prompt:      "Read, search, and edit shared directory",
+			PermMode:    PermModeAcceptEdits,
+		})
+		if err != nil {
+			t.Fatalf("StartRun: %v", err)
+		}
+		evs := drainRunEvents(runStream)
+		sawCompleted := false
+		for _, ev := range evs {
+			if ev.Type == EventRunFailed {
+				t.Fatalf("unexpected EventRunFailed: %+v", ev.Payload)
+			}
+			if ev.Type == EventRunCompleted {
+				sawCompleted = true
+			}
+		}
+		if !sawCompleted {
+			t.Fatalf("expected EventRunCompleted, got %+v", evs)
+		}
+
+		errMu.Lock()
+		errs := append([]string(nil), toolErrors...)
+		errMu.Unlock()
+		if len(errs) != 0 {
+			t.Fatalf("expected 0 tool errors for AllowPaths parallel reads & serial edit, got %v", errs)
+		}
+		updatedNotes, _ := os.ReadFile(editTarget)
+		if !strings.Contains(string(updatedNotes), "status = approved") {
+			t.Fatalf("expected outside-workspace notes.txt edited cleanly, got %q", updatedNotes)
+		}
+	})
+
+	// =========================================================================
+	// Important #3: Multi-tool step [call_1 (ok), call_2 (GateDefer), call_3 (pending)]
+	// pairs all 3 tool_use IDs on both ResumeApproval and normal follow-up run!
+	// =========================================================================
+	t.Run("Important3_SiblingCompletedBeforeGateDeferPairsAllToolUses", func(t *testing.T) {
+		var resumedHistory []store.SessionEntry
+		var histMu sync.Mutex
+
+		streamer := llm.StreamerFunc(func(ctx context.Context, req llm.Request) (<-chan llm.StreamEvent, error) {
+			ch := make(chan llm.StreamEvent, 8)
+			if strings.Contains(strings.ToLower(req.StaticSystem), "housekeeping utility") {
+				ch <- llm.StreamEvent{Type: llm.StreamTextDelta, Text: "Sibling Defer"}
+				ch <- llm.StreamEvent{Type: llm.StreamDone, StopReason: "end_turn"}
+				close(ch)
+				return ch, nil
+			}
+			// Check if call_2 already has a tool_result
+			for _, e := range req.History {
+				for _, b := range e.Blocks {
+					if b.Type == "tool_result" && b.ToolCallID == "sib_call_2" {
+						histMu.Lock()
+						resumedHistory = append([]store.SessionEntry(nil), req.History...)
+						histMu.Unlock()
+						ch <- llm.StreamEvent{Type: llm.StreamTextDelta, Text: "All 3 sibling tool_uses paired!"}
+						ch <- llm.StreamEvent{Type: llm.StreamDone, StopReason: "end_turn"}
+						close(ch)
+						return ch, nil
+					}
+				}
+			}
+
+			ch <- llm.StreamEvent{
+				Type:       llm.StreamToolCall,
+				ToolCallID: "sib_call_1",
+				ToolName:   "read_file",
+				ToolInput:  json.RawMessage(`{"path":"readme.txt"}`),
+			}
+			ch <- llm.StreamEvent{
+				Type:       llm.StreamToolCall,
+				ToolCallID: "sib_call_2",
+				ToolName:   "write_file",
+				ToolInput:  json.RawMessage(`{"path":".gorness/hook.toml","content":"enabled = true\n"}`),
+			}
+			ch <- llm.StreamEvent{
+				Type:       llm.StreamToolCall,
+				ToolCallID: "sib_call_3",
+				ToolName:   "write_file",
+				ToolInput:  json.RawMessage(`{"path":"after.txt","content":"later\n"}`),
+			}
+			ch <- llm.StreamEvent{Type: llm.StreamDone, StopReason: "tool_use"}
+			close(ch)
+			return ch, nil
+		})
+
+		eng, _, _, _ := setupTestEngine(t, nil, streamer)
+		wsDir := t.TempDir()
+		if err := os.WriteFile(filepath.Join(wsDir, "readme.txt"), []byte("hello\n"), 0o644); err != nil {
+			t.Fatalf("write readme.txt: %v", err)
+		}
+		ws, err := eng.Workspaces().Register(wsDir, "SiblingDeferRepo")
+		if err != nil {
+			t.Fatalf("Register ws: %v", err)
+		}
+		sess, err := eng.Sessions().Create(ws.ID, "Multi-Tool Defer", "coder")
+		if err != nil {
+			t.Fatalf("Create session: %v", err)
+		}
+
+		// Run 1 (unattended): sib_call_1 succeeds (appending Role="tool"), sib_call_2 hits GateDefer, sib_call_3 unexecuted!
+		_, st1, err := eng.StartRun(ctx, RunRequest{
+			WorkspaceID: ws.ID,
+			SessionID:   sess.ID,
+			Prompt:      "Run 3 tools",
+			Unattended:  true,
+		})
+		if err != nil {
+			t.Fatalf("StartRun 1: %v", err)
+		}
+		var def *DeferredToolPayload
+		for ev := range st1 {
+			if ev.Type == EventToolDeferred {
+				p := ev.Payload.(DeferredToolPayload)
+				def = &p
+			}
+		}
+		if def == nil || def.ToolCallID != "sib_call_2" {
+			t.Fatalf("expected sib_call_2 deferred, got %+v", def)
+		}
+
+		// Run 2: Resume sib_call_2 -> must execute sib_call_2 AND synthesize interrupted tool_result for sib_call_3!
+		_, st2, err := eng.StartRun(ctx, RunRequest{
+			WorkspaceID: ws.ID,
+			SessionID:   sess.ID,
+			Unattended:  true,
+			ResumeApproval: &DeferredResume{
+				DeferredID: def.ID,
+				ToolCallID: def.ToolCallID,
+				ToolName:   def.ToolName,
+				Args:       def.Args,
+				Approved:   true,
+			},
+		})
+		if err != nil {
+			t.Fatalf("StartRun 2 resume: %v", err)
+		}
+		_ = drainRunEvents(st2)
+
+		histMu.Lock()
+		hist := append([]store.SessionEntry(nil), resumedHistory...)
+		histMu.Unlock()
+
+		paired := make(map[string]store.ContentBlock)
+		for _, e := range hist {
+			for _, b := range e.Blocks {
+				if b.Type == "tool_result" {
+					paired[b.ToolCallID] = b
+				}
+			}
+		}
+		for _, wantID := range []string{"sib_call_1", "sib_call_2", "sib_call_3"} {
+			if _, ok := paired[wantID]; !ok {
+				t.Fatalf("missing paired tool_result for %q in resumed history: %+v", wantID, hist)
+			}
+		}
+		if paired["sib_call_1"].IsError || paired["sib_call_2"].IsError {
+			t.Fatalf("expected sib_call_1 and sib_call_2 to succeed, got %+v / %+v", paired["sib_call_1"], paired["sib_call_2"])
+		}
+		if !paired["sib_call_3"].IsError {
+			t.Fatalf("expected unexecuted sibling sib_call_3 marked IsError=true, got %+v", paired["sib_call_3"])
+		}
+	})
+
+	// =========================================================================
+	// Important #4: `search_tools` allowed when len(AllowedTools) > 0 (unless in DisallowedTools),
+	// and blocked when AllowedTools == []string{}!
+	// =========================================================================
+	t.Run("Important4_SearchToolsACLAlignedWithVisibleSchemas", func(t *testing.T) {
+		var step atomic.Int32
+		var searchToolErr bool
+		var step2VisibleNames []string
+		var forbiddenCallText string
+		var mu sync.Mutex
+
+		streamer := llm.StreamerFunc(func(ctx context.Context, req llm.Request) (<-chan llm.StreamEvent, error) {
+			ch := make(chan llm.StreamEvent, 8)
+			if strings.Contains(strings.ToLower(req.StaticSystem), "housekeeping utility") {
+				ch <- llm.StreamEvent{Type: llm.StreamTextDelta, Text: "BM25 AllowedTools"}
+				ch <- llm.StreamEvent{Type: llm.StreamDone, StopReason: "end_turn"}
+				close(ch)
+				return ch, nil
+			}
+			n := step.Add(1)
+			switch n {
+			case 1:
+				ch <- llm.StreamEvent{
+					Type:       llm.StreamToolCall,
+					ToolCallID: "st_1",
+					ToolName:   "search_tools",
+					ToolInput:  json.RawMessage(`{"query":"ext_allowed_alpha ext_forbidden_beta","limit":5}`),
+				}
+				ch <- llm.StreamEvent{Type: llm.StreamDone, StopReason: "tool_use"}
+			case 2:
+				mu.Lock()
+				for _, ts := range req.Tools {
+					step2VisibleNames = append(step2VisibleNames, ts.Name)
+				}
+				for _, e := range req.History {
+					for _, b := range e.Blocks {
+						if b.Type == "tool_result" && b.ToolCallID == "st_1" && b.IsError {
+							searchToolErr = true
+						}
+					}
+				}
+				mu.Unlock()
+				// Call both allowed extension tool and forbidden extension tool
+				ch <- llm.StreamEvent{
+					Type:       llm.StreamToolCall,
+					ToolCallID: "call_alpha",
+					ToolName:   "ext_allowed_alpha",
+					ToolInput:  json.RawMessage(`{}`),
+				}
+				ch <- llm.StreamEvent{
+					Type:       llm.StreamToolCall,
+					ToolCallID: "call_beta",
+					ToolName:   "ext_forbidden_beta",
+					ToolInput:  json.RawMessage(`{}`),
+				}
+				ch <- llm.StreamEvent{Type: llm.StreamDone, StopReason: "tool_use"}
+			default:
+				mu.Lock()
+				for _, e := range req.History {
+					for _, b := range e.Blocks {
+						if b.Type == "tool_result" && b.ToolCallID == "call_beta" {
+							forbiddenCallText = b.Text
+						}
+					}
+				}
+				mu.Unlock()
+				ch <- llm.StreamEvent{Type: llm.StreamTextDelta, Text: "done"}
+				ch <- llm.StreamEvent{Type: llm.StreamDone, StopReason: "end_turn"}
+			}
+			close(ch)
+			return ch, nil
+		})
+
+		eng, _, _, _ := setupTestEngine(t, nil, streamer)
+		// Mount 10 deferred plugin tools so total tools > 12 (BM25DeferThreshold)
+		if err := eng.Hooks().MountPlugin(Plugin{
+			ID: "deferred_suite",
+			Setup: func(sc *Scope) error {
+				names := []string{
+					"ext_allowed_alpha",
+					"ext_forbidden_beta",
+					"ext_gamma_3", "ext_gamma_4", "ext_gamma_5",
+					"ext_gamma_6", "ext_gamma_7", "ext_gamma_8",
+					"ext_gamma_9", "ext_gamma_10",
+				}
+				for _, nm := range names {
+					nm := nm
+					sc.RegisterTool(tools.Tool{
+						Name:            nm,
+						Description:     "Deferred extension tool " + nm,
+						ReadOnly:        true,
+						ConcurrencySafe: true,
+						DeferLoad:       true,
+						Handler: func(ctx context.Context, call tools.CallContext, rawInput json.RawMessage) (tools.ToolResult, error) {
+							return tools.ToolResult{Output: "ran:" + nm}, nil
+						},
+					})
+				}
+				return nil
+			},
+		}); err != nil {
+			t.Fatalf("MountPlugin: %v", err)
+		}
+
+		ws, err := eng.Workspaces().Register(t.TempDir(), "SearchToolsACLRepo")
+		if err != nil {
+			t.Fatalf("Register ws: %v", err)
+		}
+		_, st, err := eng.StartRun(ctx, RunRequest{
+			WorkspaceID:  ws.ID,
+			Prompt:       "Activate and invoke ext_allowed_alpha",
+			AllowedTools: []string{"read_file", "ext_allowed_alpha"},
+		})
+		if err != nil {
+			t.Fatalf("StartRun: %v", err)
+		}
+		_ = drainRunEvents(st)
+
+		mu.Lock()
+		hadSearchErr := searchToolErr
+		vis2 := append([]string(nil), step2VisibleNames...)
+		betaOut := forbiddenCallText
+		mu.Unlock()
+
+		if hadSearchErr {
+			t.Fatal("expected search_tools to succeed under non-empty AllowedTools")
+		}
+		if !containsString(vis2, "ext_allowed_alpha") {
+			t.Fatalf("expected ext_allowed_alpha visible after search_tools, got %v", vis2)
+		}
+		if containsString(vis2, "ext_forbidden_beta") {
+			t.Fatalf("expected ext_forbidden_beta hidden by AllowedTools filter, got %v", vis2)
+		}
+		if !strings.Contains(betaOut, "Permission denied [subagent-tool-not-allowed]") {
+			t.Fatalf("expected ext_forbidden_beta blocked by ACL, got %q", betaOut)
+		}
+
+		// Also verify direct Gate ACL checks: empty AllowedTools=[] blocks search_tools, and DisallowedTools=["search_tools"] blocks search_tools!
+		gate := NewPermissionGate(nil)
+		searchMeta := tools.Tool{Name: "search_tools", ReadOnly: true, ConcurrencySafe: true}
+		if resEmpty := gate.Evaluate(EvalContext{
+			EffectiveMode: PermModeAuto,
+			AllowedTools:  []string{},
+		}, ToolInvocation{ToolName: "search_tools", Tool: &searchMeta}); resEmpty.Action != GateDeny {
+			t.Fatalf("expected empty AllowedTools=[] to deny search_tools, got %+v", resEmpty)
+		}
+		if resDisallowed := gate.Evaluate(EvalContext{
+			EffectiveMode: PermModeAuto,
+			AgentProfile: &config.AgentProfile{
+				ID:              "strict",
+				AllowedTools:    []string{"read_file"},
+				DisallowedTools: []string{"search_tools"},
+			},
+		}, ToolInvocation{ToolName: "search_tools", Tool: &searchMeta}); resDisallowed.Action != GateDeny || resDisallowed.ReasonCode != "agent-disallowed-tool" {
+			t.Fatalf("expected DisallowedTools=['search_tools'] to deny search_tools, got %+v", resDisallowed)
+		}
+	})
 }

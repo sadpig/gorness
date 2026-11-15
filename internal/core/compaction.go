@@ -119,8 +119,6 @@ func (c *Compactor) Compact(ctx context.Context, sessionID string) (*CompactionR
 	wrappedText := wrapAnchoredSummary(summaryText)
 	now := c.now().UTC()
 	compJSON, _ := json.Marshal(map[string]any{
-		"type":            "compaction",
-		"content":         wrappedText,
 		"compacted_turns": compactCount,
 		"kept_turns":      keepCount,
 		"merged_prior":    mergedPrior,
@@ -134,14 +132,14 @@ func (c *Compactor) Compact(ctx context.Context, sessionID string) (*CompactionR
 		return nil, fmt.Errorf("reset branch head for compaction: %w", err)
 	}
 
-	// 2. 追加全新锚点摘要作为活跃分支根节点
+	// 2. 追加全新锚点摘要作为活跃分支根节点（以 Type="text" 输出确保 Anthropic/OpenAI/Gemini 全协议合法，同时保留 CompactionData 元数据）
 	anchorEntry, err := c.sessions.Append(sessionID, store.SessionEntry{
 		Role:      "user",
 		ModelID:   modelID,
 		AgentRole: "utility",
 		Blocks: []store.ContentBlock{
 			{
-				Type:           "compaction",
+				Type:           "text",
 				Text:           wrappedText,
 				CompactionData: json.RawMessage(compJSON),
 			},
@@ -282,7 +280,9 @@ func isCompactionAnchorEntry(e store.SessionEntry) bool {
 		return false
 	}
 	for _, b := range e.Blocks {
-		if b.Type == "compaction" || strings.HasPrefix(strings.TrimSpace(b.Text), "<anchored_summary>") {
+		if b.Type == "compaction" ||
+			strings.HasPrefix(strings.TrimSpace(b.Text), "<anchored_summary>") ||
+			(e.Role == "user" && b.Type == "text" && len(b.CompactionData) > 0) {
 			return true
 		}
 	}

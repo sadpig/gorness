@@ -726,7 +726,8 @@ func (l *AgentLoop) runParallelReadBatch(
 
 		grp.Go(func(gCtx context.Context) error {
 			started := l.cfg.now()
-			callCtx := l.makeToolCallContext(stepSeq, false, nil)
+			// 批次内所有工具均已通过 PermissionGate 第 1..9 步返回 GateAllow（含 saved-grant / AllowPaths / yolo 授权的工作区外读取）
+			callCtx := l.makeToolCallContext(stepSeq, true, nil)
 			callCtx.ActivatedTools = localActTools
 			callCtx.ActivatedSkills = localActSkills
 
@@ -801,10 +802,30 @@ func (l *AgentLoop) runSerialTool(
 	stepSeq uint64,
 	inv ToolInvocation,
 ) (store.ContentBlock, string, *DeferredToolPayload, error) {
-	// 针对 edit_file / write_file 先尝试计算暂存 DiffHunk，以便：
-	// 1) 将 Hunk 指纹纳入 PermissionGate 内容哈希计算；
-	// 2) 在 500ms 审批卡或无人值守 Deferred 卡中直接展示逐块 Diff；
-	// 3) 若 old_string 未命中或前置 SHA-256 已过期，直接将清晰错误返回模型而无需无意义弹窗打扰用户。
+	// 1. 先执行 PreToolUse 钩子与首轮 PermissionGate 拒绝检查（Step 1 Hard-Floor / ACL / Step 2 Plan / Step 3 Unattended Tampered / Step 4 Hook Deny）：
+	// 任何应被拒绝的调用立即返回 Permission denied，严禁提前读取磁盘文件或泄露 old_string 是否匹配！
+	hookDec, hErr := l.runPreToolHooks(ctx, step, inv)
+	if hErr != nil && !hookDec.RequiresAction() {
+		hookDec = GateResult{
+			Action:     GateDeny,
+			ReasonCode: "hook-error",
+			Reason:     hErr.Error(),
+		}
+	}
+
+	gateRes := l.evaluateGate(inv, hookDec)
+	if gateRes.Action == GateDeny {
+		msg := fmt.Sprintf("Permission denied [%s]: %s", gateRes.ReasonCode, gateRes.Reason)
+		return store.ContentBlock{
+			Type:       "tool_result",
+			ToolCallID: inv.ToolCallID,
+			ToolName:   inv.ToolName,
+			Text:       msg,
+			IsError:    true,
+		}, "", nil, nil
+	}
+
+	// 2. 通过拒绝预检后，为 edit_file / write_file 计算暂存 DiffHunk，并重新评估 GateResult 以将 Hunk 指纹纳入内容指纹
 	if inv.ToolName == "edit_file" || inv.ToolName == "write_file" {
 		staged, stageErr := l.tryStageForGate(inv)
 		if stageErr != nil {
@@ -822,19 +843,9 @@ func (l *AgentLoop) runSerialTool(
 			if staged.PreconditionHash != "" {
 				l.cfg.reg.RecordReadHash(l.cfg.sessionID, staged.AbsPath, staged.PreconditionHash)
 			}
+			gateRes = l.evaluateGate(inv, hookDec)
 		}
 	}
-
-	hookDec, hErr := l.runPreToolHooks(ctx, step, inv)
-	if hErr != nil && !hookDec.RequiresAction() {
-		hookDec = GateResult{
-			Action:     GateDeny,
-			ReasonCode: "hook-error",
-			Reason:     hErr.Error(),
-		}
-	}
-
-	gateRes := l.evaluateGate(inv, hookDec)
 
 	var (
 		allowOutside    bool
@@ -957,9 +968,7 @@ func (l *AgentLoop) runSerialTool(
 		}
 
 	case GateAllow:
-		if gateRes.ReasonCode == "saved-grant" || gateRes.ReasonCode == "mode-yolo" || gateRes.ReasonCode == "rule-allow" {
-			allowOutside = true
-		}
+		allowOutside = true
 	}
 
 	started := l.cfg.now()
@@ -1063,14 +1072,7 @@ func (l *AgentLoop) evaluateGate(inv ToolInvocation, hookDec GateResult) GateRes
 }
 
 func (l *AgentLoop) prepareInitialSessionState(ctx context.Context, branch []store.SessionEntry) error {
-	var danglingUses []store.ContentBlock
-	if len(branch) > 0 && branch[len(branch)-1].Role == "assistant" {
-		for _, b := range branch[len(branch)-1].Blocks {
-			if b.Type == "tool_use" && b.ToolCallID != "" {
-				danglingUses = append(danglingUses, b)
-			}
-		}
-	}
+	danglingUses := findUnansweredToolUses(branch)
 
 	if l.cfg.resumeApproval != nil {
 		resReq := *l.cfg.resumeApproval
@@ -1415,6 +1417,32 @@ func filterSchemasForRun(
 			continue
 		}
 		out = append(out, sc)
+	}
+	return out
+}
+
+func findUnansweredToolUses(branch []store.SessionEntry) []store.ContentBlock {
+	if len(branch) == 0 {
+		return nil
+	}
+	answered := make(map[string]bool)
+	idx := len(branch) - 1
+	for idx >= 0 && (branch[idx].Role == "tool" || isToolResultOnlyEntry(branch[idx])) {
+		for _, b := range branch[idx].Blocks {
+			if b.Type == "tool_result" && b.ToolCallID != "" {
+				answered[b.ToolCallID] = true
+			}
+		}
+		idx--
+	}
+	if idx < 0 || branch[idx].Role != "assistant" {
+		return nil
+	}
+	var out []store.ContentBlock
+	for _, b := range branch[idx].Blocks {
+		if b.Type == "tool_use" && b.ToolCallID != "" && !answered[b.ToolCallID] {
+			out = append(out, b)
+		}
 	}
 	return out
 }
