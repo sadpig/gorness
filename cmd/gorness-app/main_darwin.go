@@ -16,11 +16,14 @@ import (
 	"os/exec"
 	"runtime"
 	"unsafe"
+
+	"gorness.dev/gorness/internal/daemonctl"
 )
 
 var (
-	activeDaemonBaseURL string
-	activeVaultRoot     string
+	activeDaemonEndpoint *daemonctl.Endpoint
+	activeDaemonBaseURL  string
+	activeVaultRoot      string
 )
 
 //export goDecideNavigation
@@ -37,9 +40,22 @@ func goDecideNavigation(cURL *C.char) C.int {
 }
 
 //export goOnFolderChosen
-func goOnFolderChosen(cPath *C.char) {
+func goOnFolderChosen(cPath *C.char) *C.char {
 	folder := C.GoString(cPath)
-	_ = registerProjectDirectory(activeDaemonBaseURL, folder)
+	rawJSON, err := registerProjectDirectory(nil, activeDaemonEndpoint, activeDaemonBaseURL, folder)
+	if err != nil || rawJSON == "" {
+		return nil
+	}
+	return C.CString(rawJSON)
+}
+
+//export goPollAttentionCount
+func goPollAttentionCount() C.int {
+	count, err := PollAttentionCount(nil, activeDaemonEndpoint, activeDaemonBaseURL)
+	if err != nil || count <= 0 {
+		return 0
+	}
+	return C.int(count)
 }
 
 //export goOpenVaultInFinder
@@ -51,7 +67,8 @@ func goOpenVaultInFinder() {
 
 func main() {
 	runtime.LockOSThread()
-	baseURL, vaultRoot, err := ensureDesktopDaemon()
+	ep, baseURL, vaultRoot, err := ensureDesktopDaemon()
+	activeDaemonEndpoint = ep
 	activeDaemonBaseURL = baseURL
 	activeVaultRoot = vaultRoot
 

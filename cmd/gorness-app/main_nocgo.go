@@ -9,7 +9,7 @@ import (
 )
 
 func main() {
-	baseURL, _, err := ensureDesktopDaemon()
+	_, baseURL, _, err := ensureDesktopDaemon()
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Gorness failed to start daemon: %v\n", err)
 		os.Exit(1)

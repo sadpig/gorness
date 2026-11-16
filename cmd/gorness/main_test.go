@@ -18,7 +18,9 @@ import (
 
 	"gorness.dev/gorness/internal/config"
 	"gorness.dev/gorness/internal/core"
+	"gorness.dev/gorness/internal/daemonctl"
 	"gorness.dev/gorness/internal/llm"
+	"gorness.dev/gorness/internal/store"
 	"gorness.dev/gorness/internal/tui"
 )
 
@@ -678,4 +680,433 @@ func TestInteractiveLaunchFromHomeSkipsVaultContainingCwdAndWritesDaemonLog(t *t
 
 	dCancel()
 	<-dDone
+}
+
+func TestCLILiveDaemonUDSRoutingACPSetModeCancelAndStandalone(t *testing.T) {
+	slowStartedCh := make(chan struct{}, 4)
+	mockLLM := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		rawReq, _ := io.ReadAll(r.Body)
+		bodyStr := string(rawReq)
+
+		w.Header().Set("Content-Type", "text/event-stream")
+		flusher, _ := w.(http.Flusher)
+		writeSSE := func(event string, data any) {
+			raw, _ := json.Marshal(data)
+			fmt.Fprintf(w, "event: %s\ndata: %s\n\n", event, string(raw))
+			if flusher != nil {
+				flusher.Flush()
+			}
+		}
+
+		if strings.Contains(bodyStr, "SLOW_DAEMON_STREAM") {
+			writeSSE("message_start", map[string]any{
+				"type":    "message_start",
+				"message": map[string]any{"usage": map[string]any{"input_tokens": 10}},
+			})
+			writeSSE("content_block_start", map[string]any{
+				"type":          "content_block_start",
+				"index":         0,
+				"content_block": map[string]any{"type": "text", "text": ""},
+			})
+			writeSSE("content_block_delta", map[string]any{
+				"type":  "content_block_delta",
+				"index": 0,
+				"delta": map[string]any{"type": "text_delta", "text": "Streaming via live daemon..."},
+			})
+			select {
+			case slowStartedCh <- struct{}{}:
+			default:
+			}
+			<-r.Context().Done()
+			return
+		}
+
+		if strings.Contains(bodyStr, "TRIGGER_SHELL_TOOL") {
+			writeSSE("message_start", map[string]any{
+				"type":    "message_start",
+				"message": map[string]any{"usage": map[string]any{"input_tokens": 12}},
+			})
+			writeSSE("content_block_start", map[string]any{
+				"type":  "content_block_start",
+				"index": 0,
+				"content_block": map[string]any{
+					"type":  "tool_use",
+					"id":    "toolu_live_push_1",
+					"name":  "run_command",
+					"input": map[string]any{},
+				},
+			})
+			writeSSE("content_block_delta", map[string]any{
+				"type":  "content_block_delta",
+				"index": 0,
+				"delta": map[string]any{
+					"type":         "input_json_delta",
+					"partial_json": `{"command":"git push origin main"}`,
+				},
+			})
+			writeSSE("content_block_stop", map[string]any{"type": "content_block_stop", "index": 0})
+			writeSSE("message_delta", map[string]any{
+				"type":  "message_delta",
+				"delta": map[string]any{"stop_reason": "tool_use"},
+				"usage": map[string]any{"output_tokens": 10},
+			})
+			writeSSE("message_stop", map[string]any{"type": "message_stop"})
+			return
+		}
+
+		writeSSE("message_start", map[string]any{
+			"type":    "message_start",
+			"message": map[string]any{"usage": map[string]any{"input_tokens": 16}},
+		})
+		writeSSE("content_block_start", map[string]any{
+			"type":          "content_block_start",
+			"index":         0,
+			"content_block": map[string]any{"type": "text", "text": ""},
+		})
+		writeSSE("content_block_delta", map[string]any{
+			"type":  "content_block_delta",
+			"index": 0,
+			"delta": map[string]any{"type": "text_delta", "text": "Live daemon response ok."},
+		})
+		writeSSE("content_block_stop", map[string]any{"type": "content_block_stop", "index": 0})
+		writeSSE("message_delta", map[string]any{
+			"type":  "message_delta",
+			"delta": map[string]any{"stop_reason": "end_turn"},
+			"usage": map[string]any{"output_tokens": 6},
+		})
+		writeSSE("message_stop", map[string]any{"type": "message_stop"})
+	}))
+	defer mockLLM.Close()
+
+	// Short /tmp directory so runtime/daemon.sock fits well within macOS 104-byte sun_path limit!
+	shortBase, err := os.MkdirTemp("/tmp", "gcli-*")
+	if err != nil {
+		t.Fatalf("MkdirTemp: %v", err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(shortBase) })
+
+	homeDir := filepath.Join(shortBase, "h")
+	vaultDir := filepath.Join(homeDir, ".gorness")
+	wsDir := filepath.Join(shortBase, "ws")
+	if err := os.MkdirAll(homeDir, 0o700); err != nil {
+		t.Fatalf("mkdir homeDir: %v", err)
+	}
+	if err := os.MkdirAll(wsDir, 0o755); err != nil {
+		t.Fatalf("mkdir wsDir: %v", err)
+	}
+	if _, err := config.NewManager(config.Options{VaultRoot: vaultDir, UserHomeDir: homeDir}); err != nil {
+		t.Fatalf("bootstrap short vault: %v", err)
+	}
+	providersTOML := fmt.Sprintf(`[providers.anthropic]
+name = "Mock Anthropic"
+protocol = "anthropic"
+base_url = %q
+api_key = "env:GORNESS_TEST_MOCK_KEY"
+timeout_sec = 30
+
+[providers.anthropic.models."claude-sonnet-5-5"]
+name = "Claude Sonnet 5.5"
+context_window = 200000
+max_output_tokens = 8192
+
+[providers.anthropic.models."claude-haiku-5-5"]
+name = "Claude Haiku 5.5"
+context_window = 200000
+max_output_tokens = 4096
+`, mockLLM.URL)
+	if err := os.WriteFile(filepath.Join(vaultDir, "providers.toml"), []byte(providersTOML), 0o600); err != nil {
+		t.Fatalf("write providers.toml: %v", err)
+	}
+	t.Setenv("GORNESS_TEST_MOCK_KEY", "sk-mock-live-daemon-key")
+
+	// 1. Check `gorness --version` references config.Version
+	var verOut, verErr bytes.Buffer
+	if code := runCLI(context.Background(), []string{"--version"}, strings.NewReader(""), &verOut, &verErr, cliOptions{}); code != 0 {
+		t.Fatalf("--version failed: %d", code)
+	}
+	if !strings.Contains(verOut.String(), "gorness v"+config.Version) {
+		t.Fatalf("expected --version to report config.Version %q, got %q", config.Version, verOut.String())
+	}
+
+	// 2. Start live daemon serving UDS + loopback TCP
+	dCtx, dCancel := context.WithCancel(context.Background())
+	defer dCancel()
+	var dOut, dErr bytes.Buffer
+	dDone := make(chan int, 1)
+	go func() {
+		dDone <- runCLI(dCtx, []string{
+			"daemon", "serve",
+			"--vault", vaultDir,
+			"--host", "127.0.0.1",
+			"--port", "0",
+		}, strings.NewReader(""), &dOut, &dErr, cliOptions{userHomeDir: homeDir})
+	}()
+
+	var ep *daemonctl.Endpoint
+	deadline := time.Now().Add(4 * time.Second)
+	for time.Now().Before(deadline) {
+		if probed, ok := daemonctl.Probe(dCtx, vaultDir); ok {
+			ep = probed
+			break
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+	if ep == nil {
+		t.Fatalf("live daemon failed to become healthy: %s", dErr.String())
+	}
+	if ep.BaseURL != daemonctl.UDSBaseURL || ep.SocketPath == "" {
+		t.Fatalf("expected live daemon Probe to prefer UDS socket, got BaseURL=%q SocketPath=%q", ep.BaseURL, ep.SocketPath)
+	}
+
+	// 3. Execute `gorness run` without injected streamer and without --standalone -> routes through live daemon!
+	var runOut, runErr bytes.Buffer
+	runCode := runCLI(dCtx, []string{
+		"run",
+		"--vault", vaultDir,
+		"--workspace", wsDir,
+		"Hello live daemon",
+	}, strings.NewReader(""), &runOut, &runErr, cliOptions{userHomeDir: homeDir})
+	if runCode != 0 {
+		t.Fatalf("gorness run over live daemon failed: code=%d stderr=%s", runCode, runErr.String())
+	}
+	if !strings.Contains(runOut.String(), "Live daemon response ok.") {
+		t.Fatalf("unexpected gorness run output: %q", runOut.String())
+	}
+
+	var daemonSessions []*store.SessionMeta
+	if _, err := ep.DoJSON(dCtx, http.MethodGet, "/api/sessions", nil, &daemonSessions); err != nil {
+		t.Fatalf("GET /api/sessions on live daemon: %v", err)
+	}
+	if len(daemonSessions) != 1 {
+		t.Fatalf("expected 1 session persisted inside live daemon after `gorness run`, got %d", len(daemonSessions))
+	}
+
+	// 4. Execute `gorness acp` over live daemon: test session/new, session/set_mode, deferred ask mode, and mid-run session/cancel!
+	inR, inW := io.Pipe()
+	outR, outW := io.Pipe()
+	var acpErr bytes.Buffer
+	acpDone := make(chan int, 1)
+	go func() {
+		code := runCLI(dCtx, []string{"acp", "--vault", vaultDir}, inR, outW, &acpErr, cliOptions{userHomeDir: homeDir})
+		_ = outW.Close()
+		acpDone <- code
+	}()
+
+	var (
+		rpcMu         sync.Mutex
+		responsesByID = make(map[int]map[string]any)
+		modeUpdates   []map[string]any
+		rpcSig        = make(chan struct{}, 64)
+	)
+	go func() {
+		r := bufio.NewReader(outR)
+		for {
+			line, err := r.ReadBytes('\n')
+			if err != nil {
+				return
+			}
+			var obj map[string]any
+			if json.Unmarshal(bytes.TrimSpace(line), &obj) != nil {
+				continue
+			}
+			rpcMu.Lock()
+			if idVal, ok := obj["id"].(float64); ok {
+				responsesByID[int(idVal)] = obj
+			} else if obj["method"] == "session/update" {
+				if params, ok := obj["params"].(map[string]any); ok {
+					if upd, ok := params["update"].(map[string]any); ok && upd["sessionUpdate"] == "current_mode_update" {
+						modeUpdates = append(modeUpdates, upd)
+					}
+				}
+			}
+			rpcMu.Unlock()
+			select {
+			case rpcSig <- struct{}{}:
+			default:
+			}
+		}
+	}()
+
+	sendRPC := func(msg map[string]any) {
+		t.Helper()
+		b, _ := json.Marshal(msg)
+		if _, err := inW.Write(append(b, '\n')); err != nil {
+			t.Fatalf("write rpc: %v", err)
+		}
+	}
+	waitRPC := func(wantID int) map[string]any {
+		t.Helper()
+		timeout := time.After(5 * time.Second)
+		for {
+			rpcMu.Lock()
+			got, ok := responsesByID[wantID]
+			rpcMu.Unlock()
+			if ok {
+				return got
+			}
+			select {
+			case <-rpcSig:
+			case <-timeout:
+				t.Fatalf("timeout waiting for ACP id=%d (stderr=%s)", wantID, acpErr.String())
+			}
+		}
+	}
+
+	sendRPC(map[string]any{"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": map[string]any{"protocolVersion": 1}})
+	initRes := waitRPC(1)["result"].(map[string]any)
+	if srvInfo, _ := initRes["serverInfo"].(map[string]any); srvInfo["version"] != config.Version {
+		t.Fatalf("expected ACP initialize version %q, got %+v", config.Version, srvInfo)
+	}
+
+	sendRPC(map[string]any{"jsonrpc": "2.0", "id": 2, "method": "session/new", "params": map[string]any{"cwd": wsDir, "agentRole": "coder"}})
+	acpSessID := waitRPC(2)["result"].(map[string]any)["sessionId"].(string)
+
+	// Switch ACP session mode to "ask" and agentRole to "verifier" via session/set_mode
+	sendRPC(map[string]any{
+		"jsonrpc": "2.0",
+		"id":      3,
+		"method":  "session/set_mode",
+		"params": map[string]any{
+			"sessionId": acpSessID,
+			"modeId":    "ask",
+			"agentRole": "verifier",
+		},
+	})
+	setModeResp := waitRPC(3)
+	if setModeResp["error"] != nil {
+		t.Fatalf("session/set_mode returned error: %+v", setModeResp["error"])
+	}
+	setModeRes := setModeResp["result"].(map[string]any)
+	if setModeRes["currentModeId"] != "ask" || setModeRes["agentRole"] != "verifier" {
+		t.Fatalf("unexpected session/set_mode result: %+v", setModeRes)
+	}
+
+	rpcMu.Lock()
+	gotModeNotifs := len(modeUpdates)
+	rpcMu.Unlock()
+	if gotModeNotifs == 0 {
+		t.Fatal("expected session/update current_mode_update notification from session/set_mode")
+	}
+
+	// Verify live daemon persisted agent_role = "verifier"
+	var sessDetail struct {
+		Meta *store.SessionMeta `json:"meta"`
+	}
+	if _, err := ep.DoJSON(dCtx, http.MethodGet, "/api/sessions/"+acpSessID, nil, &sessDetail); err != nil {
+		t.Fatalf("GET /api/sessions/%s: %v", acpSessID, err)
+	}
+	if sessDetail.Meta == nil || sessDetail.Meta.AgentRole != "verifier" {
+		t.Fatalf("expected live daemon session role 'verifier', got %+v", sessDetail.Meta)
+	}
+
+	// Verify invalid modeId returns JSON-RPC -32602 error
+	sendRPC(map[string]any{
+		"jsonrpc": "2.0",
+		"id":      4,
+		"method":  "session/set_mode",
+		"params": map[string]any{
+			"sessionId": acpSessID,
+			"modeId":    "bogus_nonexistent_mode",
+		},
+	})
+	badModeResp := waitRPC(4)
+	if badModeResp["error"] == nil {
+		t.Fatalf("expected error for invalid modeId, got %+v", badModeResp)
+	}
+
+	// Switch back to coder role while keeping "ask" permission mode, then verify TRIGGER_SHELL_TOOL defers on live daemon!
+	sendRPC(map[string]any{
+		"jsonrpc": "2.0",
+		"id":      5,
+		"method":  "session/set_mode",
+		"params": map[string]any{
+			"sessionId": acpSessID,
+			"modeId":    "role:coder",
+		},
+	})
+	_ = waitRPC(5)
+
+	sendRPC(map[string]any{
+		"jsonrpc": "2.0",
+		"id":      6,
+		"method":  "session/prompt",
+		"params": map[string]any{
+			"sessionId": acpSessID,
+			"prompt":    "TRIGGER_SHELL_TOOL",
+		},
+	})
+	deferResp := waitRPC(6)
+	if sr, _ := deferResp["result"].(map[string]any)["stopReason"].(string); sr != "deferred" {
+		t.Fatalf("expected stopReason=deferred after session/set_mode(ask) on live daemon, got %+v", deferResp)
+	}
+
+	// Mid-run cancellation over live daemon HTTP/SSE (`POST /api/runs/{id}/stop`)
+	sendRPC(map[string]any{
+		"jsonrpc": "2.0",
+		"id":      7,
+		"method":  "session/prompt",
+		"params": map[string]any{
+			"sessionId": acpSessID,
+			"prompt":    "SLOW_DAEMON_STREAM",
+		},
+	})
+	select {
+	case <-slowStartedCh:
+	case <-time.After(4 * time.Second):
+		t.Fatal("slow daemon run never started")
+	}
+
+	sendRPC(map[string]any{
+		"jsonrpc": "2.0",
+		"id":      8,
+		"method":  "session/cancel",
+		"params":  map[string]any{"sessionId": acpSessID},
+	})
+	cancelRes := waitRPC(8)["result"].(map[string]any)
+	if cancelled, _ := cancelRes["cancelled"].(bool); !cancelled {
+		t.Fatalf("expected live daemon session/cancel cancelled=true, got %+v", cancelRes)
+	}
+	slowPromptRes := waitRPC(7)["result"].(map[string]any)
+	if slowPromptRes["stopReason"] != "cancelled" {
+		t.Fatalf("expected stopReason=cancelled for stopped daemon run, got %+v", slowPromptRes)
+	}
+
+	_ = inW.Close()
+	if code := <-acpDone; code != 0 {
+		t.Fatalf("expected acp exit code 0, got %d (stderr=%s)", code, acpErr.String())
+	}
+
+	dCancel()
+	if code := <-dDone; code != 0 {
+		t.Fatalf("expected daemon serve exit 0, got %d (stderr=%s)", code, dErr.String())
+	}
+
+	// 5. Verify `--standalone` runs directly in-process with no daemon running
+	standaloneVault, standaloneHome, standaloneWS := prepareTempVaultWithMockProvider(t, mockLLM.URL)
+	var saOut, saErr bytes.Buffer
+	saCode := runCLI(context.Background(), []string{
+		"run",
+		"--standalone",
+		"--vault", standaloneVault,
+		"--workspace", standaloneWS,
+		"Standalone execution check",
+	}, strings.NewReader(""), &saOut, &saErr, cliOptions{userHomeDir: standaloneHome})
+	if saCode != 0 || !strings.Contains(saOut.String(), "Live daemon response ok.") {
+		t.Fatalf("standalone gorness run failed: code=%d out=%q err=%q", saCode, saOut.String(), saErr.String())
+	}
+
+	// 6. Enforce strict Zero-DB invariant (zero .json files inside vaultDir)
+	for _, vDir := range []string{vaultDir, standaloneVault} {
+		if err := filepath.WalkDir(vDir, func(path string, d os.DirEntry, wErr error) error {
+			if wErr != nil {
+				return wErr
+			}
+			if !d.IsDir() && strings.EqualFold(filepath.Ext(d.Name()), ".json") {
+				t.Fatalf("Zero-DB violation: forbidden .json file in vault: %s", path)
+			}
+			return nil
+		}); err != nil {
+			t.Fatalf("walk %s: %v", vDir, err)
+		}
+	}
 }

@@ -11,10 +11,10 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"os/signal"
-	"path/filepath"
 	"runtime"
 	"strconv"
 	"strings"
@@ -22,27 +22,16 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/pelletier/go-toml/v2"
 	"gorness.dev/gorness/internal/alwayson"
 	"gorness.dev/gorness/internal/config"
 	"gorness.dev/gorness/internal/core"
+	"gorness.dev/gorness/internal/daemonctl"
 	"gorness.dev/gorness/internal/fleet"
 	"gorness.dev/gorness/internal/llm"
 	"gorness.dev/gorness/internal/server"
 	"gorness.dev/gorness/internal/store"
 	"gorness.dev/gorness/internal/tui"
 )
-
-const Version = "1.0.0"
-
-type daemonRuntimeInfo struct {
-	PID        int       `toml:"pid"`
-	Host       string    `toml:"host"`
-	Port       int       `toml:"port"`
-	URL        string    `toml:"url"`
-	SocketPath string    `toml:"socket_path"`
-	StartedAt  time.Time `toml:"started_at"`
-}
 
 type cliOptions struct {
 	userHomeDir     string
@@ -78,7 +67,7 @@ func runCLI(
 	first := strings.TrimSpace(args[0])
 	switch first {
 	case "-v", "--version", "version":
-		fmt.Fprintf(stdout, "gorness v%s (%s/%s, zero-db)\n", Version, runtime.GOOS, runtime.GOARCH)
+		fmt.Fprintf(stdout, "gorness v%s (%s/%s, zero-db)\n", config.Version, runtime.GOOS, runtime.GOARCH)
 		return 0
 	case "-h", "--help", "help":
 		printUsage(stdout)
@@ -109,9 +98,9 @@ Usage:
   gorness studio [flags]                 Open Apple HIG Workbench & Visual Multi-Agent Studio
   gorness run [flags] "<prompt>"         Execute headless single-session turn (--json for NDJSON)
   gorness daemon <serve|status|stop|install|uninstall>
-  gorness acp [flags]                    Start stdio JSON-RPC 2.0 ACP server backed by Engine
+  gorness acp [flags]                    Start stdio JSON-RPC 2.0 ACP server (routes via daemon)
   gorness --version                      Print version
-`, Version)
+`, config.Version)
 }
 
 // ============================================================================
@@ -137,6 +126,7 @@ func cmdRun(
 		sandboxMode string
 		sessionID   string
 		jsonOutput  bool
+		standalone  bool
 	)
 	fs.StringVar(&vaultFlag, "vault", "", "Path to ~/.gorness vault directory")
 	fs.StringVar(&wsFlag, "workspace", "", "Target workspace directory (defaults to cwd)")
@@ -146,9 +136,11 @@ func cmdRun(
 	fs.StringVar(&sandboxMode, "sandbox", "", "Seatbelt sandbox mode override")
 	fs.StringVar(&sessionID, "session", "", "Resume existing session ID")
 	fs.BoolVar(&jsonOutput, "json", false, "Stream NDJSON RunEvent objects to stdout")
+	fs.BoolVar(&standalone, "standalone", false, "Run directly in-process without connecting to daemon")
 
 	reordered := reorderFlagsBeforePositional(args, map[string]bool{
 		"--json": true, "-json": true,
+		"--standalone": true, "-standalone": true,
 		"--help": true, "-help": true, "-h": true,
 	})
 	if err := fs.Parse(reordered); err != nil {
@@ -164,22 +156,19 @@ func cmdRun(
 	wsPath := resolveWorkspaceDir(wsFlag)
 	vaultRoot := resolveVaultRoot(vaultFlag, opts.userHomeDir)
 
-	cfgMgr, eng, err := buildCoreEngine(vaultRoot, opts)
-	if err != nil {
-		fmt.Fprintf(stderr, "bootstrap engine error: %v\n", err)
-		return 1
-	}
-	defer func() { _ = eng.Close() }()
-	_ = cfgMgr
-
-	ws, err := eng.Workspaces().Register(wsPath, "")
-	if err != nil {
-		fmt.Fprintf(stderr, "register workspace %s: %v\n", wsPath, err)
-		return 1
+	if opts.streamer != nil || standalone {
+		return runInProcessHeadless(ctx, vaultRoot, wsPath, core.RunRequest{
+			SessionID:     sessionID,
+			Prompt:        prompt,
+			AgentRole:     agentRole,
+			ModelOverride: modelOver,
+			PermMode:      permMode,
+			SandboxMode:   sandboxMode,
+			Unattended:    true,
+		}, jsonOutput, stdout, stderr, opts)
 	}
 
-	_, evCh, err := eng.StartRun(ctx, core.RunRequest{
-		WorkspaceID:   ws.ID,
+	return runDaemonHeadless(ctx, vaultRoot, wsPath, core.RunRequest{
 		SessionID:     sessionID,
 		Prompt:        prompt,
 		AgentRole:     agentRole,
@@ -187,12 +176,98 @@ func cmdRun(
 		PermMode:      permMode,
 		SandboxMode:   sandboxMode,
 		Unattended:    true,
-	})
+	}, jsonOutput, stdout, stderr, opts)
+}
+
+func runInProcessHeadless(
+	ctx context.Context,
+	vaultRoot string,
+	wsPath string,
+	req core.RunRequest,
+	jsonOutput bool,
+	stdout io.Writer,
+	stderr io.Writer,
+	opts cliOptions,
+) int {
+	_, eng, err := buildCoreEngine(vaultRoot, opts)
+	if err != nil {
+		fmt.Fprintf(stderr, "bootstrap engine error: %v\n", err)
+		return 1
+	}
+	defer func() { _ = eng.Close() }()
+
+	ws, err := eng.Workspaces().Register(wsPath, "")
+	if err != nil {
+		fmt.Fprintf(stderr, "register workspace %s: %v\n", wsPath, err)
+		return 1
+	}
+	req.WorkspaceID = ws.ID
+
+	_, evCh, err := eng.StartRun(ctx, req)
 	if err != nil {
 		fmt.Fprintf(stderr, "start run failed: %v\n", err)
 		return 1
 	}
 
+	exitCode := consumeHeadlessRunEvents(evCh, jsonOutput, stdout, stderr)
+	eng.WaitBackground()
+	return exitCode
+}
+
+func runDaemonHeadless(
+	ctx context.Context,
+	vaultRoot string,
+	wsPath string,
+	req core.RunRequest,
+	jsonOutput bool,
+	stdout io.Writer,
+	stderr io.Writer,
+	opts cliOptions,
+) int {
+	ep, cleanup, err := connectOrStartDaemon(ctx, vaultRoot, opts)
+	if err != nil {
+		fmt.Fprintf(stderr, "connect gorness daemon: %v\n", err)
+		return 1
+	}
+	defer cleanup()
+
+	ws, _, err := daemonctl.RegisterWorkspace(ctx, ep, wsPath, "")
+	if err != nil {
+		fmt.Fprintf(stderr, "register workspace %s: %v\n", wsPath, err)
+		return 1
+	}
+	req.WorkspaceID = ws.ID
+
+	runID, evCh, err := openDaemonRunStream(ctx, ep, req)
+	if err != nil {
+		fmt.Fprintf(stderr, "start run failed: %v\n", err)
+		return 1
+	}
+
+	streamDone := make(chan struct{})
+	if runID != "" {
+		go func() {
+			select {
+			case <-ctx.Done():
+				stopCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+				_, _ = ep.DoJSON(stopCtx, http.MethodPost, "/api/runs/"+url.PathEscape(runID)+"/stop", map[string]any{}, nil)
+				cancel()
+			case <-streamDone:
+			}
+		}()
+	}
+
+	exitCode := consumeHeadlessRunEvents(evCh, jsonOutput, stdout, stderr)
+	close(streamDone)
+	return exitCode
+}
+
+func consumeHeadlessRunEvents(
+	evCh <-chan core.RunEvent,
+	jsonOutput bool,
+	stdout io.Writer,
+	stderr io.Writer,
+) int {
 	var enc *json.Encoder
 	if jsonOutput {
 		enc = json.NewEncoder(stdout)
@@ -215,15 +290,15 @@ func cmdRun(
 					}
 				}
 			case core.EventToolCall:
-				if tc, ok := ev.Payload.(core.ToolCallPayload); ok {
+				if tc, ok := decodeEventPayload[core.ToolCallPayload](ev.Payload); ok {
 					fmt.Fprintf(stderr, "[tool] %s\n", tc.ToolName)
 				}
 			case core.EventToolDeferred:
-				if td, ok := ev.Payload.(core.DeferredToolPayload); ok {
+				if td, ok := decodeEventPayload[core.DeferredToolPayload](ev.Payload); ok {
 					fmt.Fprintf(stderr, "[deferred] %s (%s): %s\n", td.ToolName, td.ReasonCode, td.Reason)
 				}
 			case core.EventRunFailed:
-				if pe, ok := ev.Payload.(core.RunErrorPayload); ok {
+				if pe, ok := decodeEventPayload[core.RunErrorPayload](ev.Payload); ok && pe.Message != "" {
 					fmt.Fprintf(stderr, "run failed: %s\n", pe.Message)
 				}
 			}
@@ -236,7 +311,6 @@ func cmdRun(
 	if !jsonOutput && !printedTextNL {
 		_, _ = io.WriteString(stdout, "\n")
 	}
-	eng.WaitBackground()
 	return exitCode
 }
 
@@ -254,7 +328,7 @@ func cmdTUI(ctx context.Context, args []string, stderr io.Writer, opts cliOption
 	)
 	fs.StringVar(&vaultFlag, "vault", "", "Path to ~/.gorness vault directory")
 	fs.StringVar(&wsFlag, "workspace", "", "Initial workspace directory")
-	fs.StringVar(&serverURL, "server", "", "Existing loopback server URL")
+	fs.StringVar(&serverURL, "server", "", "Existing loopback server URL or unix:///path/to/daemon.sock")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
@@ -266,17 +340,24 @@ func cmdTUI(ctx context.Context, args []string, stderr io.Writer, opts cliOption
 		return 1
 	}
 
-	targetURL := strings.TrimSpace(serverURL)
-	if targetURL == "" {
-		var err error
-		targetURL, err = ensureBackgroundDaemon(ctx, vaultRoot, opts)
-		if err != nil {
-			fmt.Fprintf(stderr, "failed to start gorness daemon: %v\n", err)
+	trimmedServer := strings.TrimSpace(serverURL)
+	if trimmedServer != "" {
+		httpClient, baseURL := daemonctl.ClientForURL(trimmedServer, vaultRoot, 0)
+		if err := tui.RunWithClient(ctx, baseURL, wsPath, httpClient, nil...); err != nil {
+			fmt.Fprintf(stderr, "tui exited with error: %v\n", err)
 			return 1
 		}
+		return 0
 	}
 
-	if err := tui.Run(ctx, targetURL, wsPath); err != nil {
+	ep, cleanup, err := connectOrStartDaemon(ctx, vaultRoot, opts)
+	if err != nil {
+		fmt.Fprintf(stderr, "failed to start gorness daemon: %v\n", err)
+		return 1
+	}
+	defer cleanup()
+
+	if err := tui.RunWithClient(ctx, ep.EffectiveBaseURL(), wsPath, ep.HTTPClient(0)); err != nil {
 		fmt.Fprintf(stderr, "tui exited with error: %v\n", err)
 		return 1
 	}
@@ -311,42 +392,38 @@ func cmdStudio(
 		return 1
 	}
 
-	daemonURL, err := ensureBackgroundDaemon(ctx, vaultRoot, opts)
+	ep, cleanup, err := connectOrStartDaemon(ctx, vaultRoot, opts)
 	if err != nil {
 		fmt.Fprintf(stderr, "failed to ensure gorness daemon: %v\n", err)
 		return 1
 	}
+	defer cleanup()
 
-	// Register current workspace into daemon so Studio opens directly onto it
 	if wsPath != "" {
-		regBody, _ := json.Marshal(map[string]string{"path": wsPath})
-		resp, pErr := http.Post(daemonURL+"/api/workspaces", "application/json", bytes.NewReader(regBody))
-		if pErr == nil {
-			if resp.StatusCode >= 400 && strings.TrimSpace(wsFlag) != "" {
-				rawErr, _ := io.ReadAll(resp.Body)
-				_ = resp.Body.Close()
-				fmt.Fprintf(stderr, "register workspace %s: HTTP %d: %s\n", wsPath, resp.StatusCode, strings.TrimSpace(string(rawErr)))
-				return 1
-			}
-			_ = resp.Body.Close()
+		if _, _, regErr := daemonctl.RegisterWorkspace(ctx, ep, wsPath, ""); regErr != nil && strings.TrimSpace(wsFlag) != "" {
+			fmt.Fprintf(stderr, "register workspace %s: %v\n", wsPath, regErr)
+			return 1
 		}
 	}
 
-	fmt.Fprintf(stdout, "Gorness Studio ready at %s\n", daemonURL)
+	webURL := ep.WebURL
+	if webURL == "" {
+		webURL = ep.EffectiveBaseURL()
+	}
+	fmt.Fprintf(stdout, "Gorness Studio ready at %s\n", webURL)
 	if !noOpen {
 		launcher := opts.browserLauncher
 		if launcher == nil {
 			launcher = openMacStudioWindow
 		}
-		if err := launcher(daemonURL); err != nil {
-			fmt.Fprintf(stderr, "warning: could not launch browser automatically (%v); open %s manually.\n", err, daemonURL)
+		if err := launcher(webURL); err != nil {
+			fmt.Fprintf(stderr, "warning: could not launch browser automatically (%v); open %s manually.\n", err, webURL)
 		}
 	}
 	return 0
 }
 
 func openMacStudioWindow(targetURL string) error {
-	// Prefer dedicated chromeless macOS app-mode window when available; fall back cleanly to default browser.
 	appBinaries := []string{
 		"/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
 		"/Applications/Brave Browser.app/Contents/MacOS/Brave Browser",
@@ -385,9 +462,9 @@ func cmdDaemon(
 	case "serve":
 		return daemonServe(ctx, subArgs, stdout, stderr, opts)
 	case "status":
-		return daemonStatus(subArgs, stdout, stderr, opts)
+		return daemonStatus(ctx, subArgs, stdout, stderr, opts)
 	case "stop":
-		return daemonStop(subArgs, stdout, stderr, opts)
+		return daemonStop(ctx, subArgs, stdout, stderr, opts)
 	case "install":
 		return daemonInstall(ctx, subArgs, stdout, stderr, opts)
 	case "uninstall":
@@ -396,14 +473,6 @@ func cmdDaemon(
 		fmt.Fprintf(stderr, "unknown daemon action %q (expected serve|status|stop|install|uninstall)\n", sub)
 		return 2
 	}
-}
-
-func daemonInfoPath(paths config.VaultPaths) string {
-	return filepath.Join(paths.RuntimeDir(), "daemon.toml")
-}
-
-func daemonLockPath(paths config.VaultPaths) string {
-	return filepath.Join(paths.RuntimeDir(), "locks", "daemon.lock")
 }
 
 func daemonServe(
@@ -436,7 +505,7 @@ func daemonServe(
 	defer func() { _ = eng.Close() }()
 
 	paths := cfgMgr.Paths()
-	unlock, ok, err := store.TryFlock(daemonLockPath(paths))
+	unlock, ok, err := store.TryFlock(daemonctl.DaemonLockPath(paths))
 	if err != nil {
 		fmt.Fprintf(stderr, "acquire daemon lock: %v\n", err)
 		return 1
@@ -453,7 +522,7 @@ func daemonServe(
 		host = strings.TrimSpace(snap.Global.Host)
 	}
 	if host == "" {
-		host = "127.0.0.1"
+		host = daemonctl.DefaultHost
 	}
 	if host != "127.0.0.1" && host != "localhost" && host != "::1" {
 		fmt.Fprintf(stderr, "refusing to bind non-loopback host %q\n", host)
@@ -463,7 +532,7 @@ func daemonServe(
 	if port < 0 {
 		port = snap.Global.Port
 		if port <= 0 {
-			port = 3456
+			port = daemonctl.DefaultPort
 		}
 	}
 
@@ -498,12 +567,16 @@ func daemonServe(
 		AlwaysOn: aoSvc,
 		Fleet:    fleetMgr,
 		Opener:   opts.opener,
-		Version:  Version,
+		Version:  config.Version,
 	})
 	defer func() { _ = srv.Close() }()
 
 	tcpAddr := net.JoinHostPort(host, strconv.Itoa(port))
 	tcpLn, err := net.Listen("tcp", tcpAddr)
+	if err != nil && portFlag < 0 {
+		// Fall back cleanly to an ephemeral loopback port when another vault already holds default port 3456.
+		tcpLn, err = net.Listen("tcp", net.JoinHostPort(host, "0"))
+	}
 	if err != nil {
 		fmt.Fprintf(stderr, "listen %s: %v\n", tcpAddr, err)
 		return 1
@@ -515,8 +588,10 @@ func daemonServe(
 
 	sockPath := paths.SocketPath()
 	_ = os.Remove(sockPath)
+	var activeSockPath string
 	unixLn, unixErr := net.Listen("unix", sockPath)
 	if unixErr == nil {
+		activeSockPath = sockPath
 		_ = os.Chmod(sockPath, 0o600)
 		defer func() {
 			_ = unixLn.Close()
@@ -524,17 +599,18 @@ func daemonServe(
 		}()
 	}
 
-	info := daemonRuntimeInfo{
+	rec := daemonctl.RuntimeRecord{
 		PID:        os.Getpid(),
+		VaultRoot:  daemonctl.CanonicalVaultPath(paths.Root),
 		Host:       host,
 		Port:       actualPort,
 		URL:        urlStr,
-		SocketPath: sockPath,
+		SocketPath: activeSockPath,
+		Version:    config.Version,
 		StartedAt:  time.Now().UTC(),
 	}
-	if rawTOML, mErr := toml.Marshal(info); mErr == nil {
-		_ = store.AtomicWriteFile(daemonInfoPath(paths), rawTOML, 0o600)
-		defer func() { _ = os.Remove(daemonInfoPath(paths)) }()
+	if err := daemonctl.WriteRuntimeRecord(paths, rec); err == nil {
+		defer func() { _ = daemonctl.RemoveRuntimeRecord(paths) }()
 	}
 
 	httpSrv := &http.Server{
@@ -556,7 +632,7 @@ func daemonServe(
 		}()
 	}
 
-	fmt.Fprintf(stdout, "gorness daemon serving at %s (pid=%d, vault=%s)\n", urlStr, info.PID, paths.Root)
+	fmt.Fprintf(stdout, "gorness daemon serving at %s (pid=%d, vault=%s)\n", urlStr, rec.PID, paths.Root)
 
 	select {
 	case <-ctx.Done():
@@ -568,10 +644,11 @@ func daemonServe(
 	shutCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	_ = httpSrv.Shutdown(shutCtx)
+	eng.WaitBackground()
 	return 0
 }
 
-func daemonStatus(args []string, stdout, stderr io.Writer, opts cliOptions) int {
+func daemonStatus(ctx context.Context, args []string, stdout, stderr io.Writer, opts cliOptions) int {
 	fs := flag.NewFlagSet("daemon status", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	var vaultFlag string
@@ -580,16 +657,20 @@ func daemonStatus(args []string, stdout, stderr io.Writer, opts cliOptions) int 
 		return 2
 	}
 	vaultRoot := resolveVaultRoot(vaultFlag, opts.userHomeDir)
-	urlStr, info := probeRunningDaemon(vaultRoot)
-	if urlStr == "" {
+	ep, ok := daemonctl.Probe(ctx, vaultRoot)
+	if !ok {
 		fmt.Fprintln(stdout, "gorness daemon: stopped")
 		return 1
 	}
-	fmt.Fprintf(stdout, "gorness daemon: running at %s (pid=%d)\n", urlStr, info.PID)
+	displayURL := ep.WebURL
+	if displayURL == "" {
+		displayURL = ep.EffectiveBaseURL()
+	}
+	fmt.Fprintf(stdout, "gorness daemon: running at %s (pid=%d)\n", displayURL, ep.Record.PID)
 	return 0
 }
 
-func daemonStop(args []string, stdout, stderr io.Writer, opts cliOptions) int {
+func daemonStop(ctx context.Context, args []string, stdout, stderr io.Writer, opts cliOptions) int {
 	fs := flag.NewFlagSet("daemon stop", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	var vaultFlag string
@@ -598,29 +679,16 @@ func daemonStop(args []string, stdout, stderr io.Writer, opts cliOptions) int {
 		return 2
 	}
 	vaultRoot := resolveVaultRoot(vaultFlag, opts.userHomeDir)
-	paths := config.VaultPaths{Root: vaultRoot}
-	raw, err := os.ReadFile(daemonInfoPath(paths))
+	pid, stopped, err := daemonctl.StopDaemon(ctx, vaultRoot, 3*time.Second)
 	if err != nil {
+		fmt.Fprintln(stderr, err.Error())
+		return 1
+	}
+	if !stopped {
 		fmt.Fprintln(stdout, "gorness daemon is not running")
 		return 0
 	}
-	var info daemonRuntimeInfo
-	if err := toml.Unmarshal(raw, &info); err != nil || info.PID <= 0 {
-		fmt.Fprintln(stderr, "invalid daemon.toml metadata")
-		return 1
-	}
-	proc, err := os.FindProcess(info.PID)
-	if err == nil {
-		_ = proc.Signal(syscall.SIGTERM)
-	}
-	deadline := time.Now().Add(3 * time.Second)
-	for time.Now().Before(deadline) {
-		if urlStr, _ := probeRunningDaemon(vaultRoot); urlStr == "" {
-			break
-		}
-		time.Sleep(60 * time.Millisecond)
-	}
-	fmt.Fprintf(stdout, "stopped gorness daemon (pid=%d)\n", info.PID)
+	fmt.Fprintf(stdout, "stopped gorness daemon (pid=%d)\n", pid)
 	return 0
 }
 
@@ -678,98 +746,126 @@ func daemonUninstall(ctx context.Context, args []string, stdout, stderr io.Write
 }
 
 func daemonBackgroundLogPath(paths config.VaultPaths) string {
-	return filepath.Join(paths.LogsDir(), "daemon.log")
+	return daemonctl.DaemonLogPath(paths)
 }
 
-func ensureBackgroundDaemon(ctx context.Context, vaultRoot string, opts cliOptions) (string, error) {
-	if urlStr, _ := probeRunningDaemon(vaultRoot); urlStr != "" {
-		return urlStr, nil
+func probeRunningDaemon(vaultRoot string) (string, daemonctl.RuntimeRecord) {
+	ep, ok := daemonctl.Probe(context.Background(), vaultRoot)
+	if !ok || ep == nil {
+		return "", daemonctl.RuntimeRecord{}
 	}
+	if ep.WebURL != "" {
+		return ep.WebURL, ep.Record
+	}
+	return ep.EffectiveBaseURL(), ep.Record
+}
 
+func connectOrStartDaemon(ctx context.Context, vaultRoot string, opts cliOptions) (*daemonctl.Endpoint, func(), error) {
+	if ep, ok := daemonctl.Probe(ctx, vaultRoot); ok {
+		return ep, func() {}, nil
+	}
+	if isGoTestBinary() {
+		return startEphemeralTestDaemon(ctx, vaultRoot, opts)
+	}
+	ep, err := daemonctl.EnsureDaemon(ctx, daemonctl.EnsureOptions{
+		VaultRoot: vaultRoot,
+		HomeDir:   opts.userHomeDir,
+	})
+	if err != nil {
+		return nil, func() {}, err
+	}
+	return ep, func() {}, nil
+}
+
+func isGoTestBinary() bool {
+	if flag.Lookup("test.v") != nil {
+		return true
+	}
 	exe, err := os.Executable()
 	if err != nil {
-		return "", fmt.Errorf("locate gorness binary: %w", err)
+		return false
 	}
-	paths := config.VaultPaths{Root: vaultRoot}
-	if err := os.MkdirAll(paths.LogsDir(), 0o700); err != nil {
-		return "", err
-	}
-	logFile, err := os.OpenFile(daemonBackgroundLogPath(paths), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
-	if err != nil {
-		return "", err
-	}
+	return strings.HasSuffix(exe, ".test") || strings.HasSuffix(exe, ".test.exe")
+}
 
-	cmd := exec.Command(exe, "daemon", "serve", "--vault", vaultRoot)
-	cmd.Stdout = logFile
-	cmd.Stderr = logFile
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
-	if err := cmd.Start(); err != nil {
-		_ = logFile.Close()
-		return "", err
+func startEphemeralTestDaemon(parentCtx context.Context, vaultRoot string, opts cliOptions) (*daemonctl.Endpoint, func(), error) {
+	dCtx, dCancel := context.WithCancel(context.Background())
+	var dOut, dErr bytes.Buffer
+	doneCh := make(chan int, 1)
+	go func() {
+		doneCh <- daemonServe(dCtx, []string{
+			"--vault", vaultRoot,
+			"--host", "127.0.0.1",
+			"--port", "0",
+		}, &dOut, &dErr, opts)
+	}()
+
+	cleanup := func() {
+		dCancel()
+		<-doneCh
 	}
-	_ = cmd.Process.Release()
-	_ = logFile.Close()
 
 	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
-		if ctx.Err() != nil {
-			return "", ctx.Err()
+		if parentCtx.Err() != nil {
+			cleanup()
+			return nil, func() {}, parentCtx.Err()
 		}
-		if urlStr, _ := probeRunningDaemon(vaultRoot); urlStr != "" {
-			return urlStr, nil
+		if ep, ok := daemonctl.Probe(parentCtx, vaultRoot); ok {
+			return ep, cleanup, nil
 		}
-		time.Sleep(60 * time.Millisecond)
+		select {
+		case code := <-doneCh:
+			return nil, func() {}, fmt.Errorf("daemon exited early (code=%d): %s", code, strings.TrimSpace(dErr.String()))
+		case <-parentCtx.Done():
+			cleanup()
+			return nil, func() {}, parentCtx.Err()
+		case <-time.After(25 * time.Millisecond):
+		}
 	}
-	return "", errors.New("timed out waiting for background gorness daemon to become healthy")
+	cleanup()
+	return nil, func() {}, fmt.Errorf("timed out waiting for daemon: %s", strings.TrimSpace(dErr.String()))
 }
 
-func probeRunningDaemon(vaultRoot string) (string, daemonRuntimeInfo) {
-	paths := config.VaultPaths{Root: vaultRoot}
-	var info daemonRuntimeInfo
-	candidates := []string{}
-	if raw, err := os.ReadFile(daemonInfoPath(paths)); err == nil {
-		if toml.Unmarshal(raw, &info) == nil && strings.TrimSpace(info.URL) != "" {
-			candidates = append(candidates, strings.TrimRight(info.URL, "/"))
-		}
+func openDaemonRunStream(ctx context.Context, ep *daemonctl.Endpoint, req core.RunRequest) (string, <-chan core.RunEvent, error) {
+	resp, err := ep.OpenStream(ctx, http.MethodPost, "/api/runs/stream", req)
+	if err != nil {
+		return "", nil, err
 	}
-	candidates = append(candidates, "http://127.0.0.1:3456")
-
-	wantCanon := canonicalOrCleanPath(vaultRoot)
-	client := &http.Client{Timeout: 600 * time.Millisecond}
-	for _, base := range candidates {
-		resp, err := client.Get(base + "/api/health")
-		if err != nil {
-			continue
-		}
-		var h struct {
-			OK        bool   `json:"ok"`
-			PID       int    `json:"pid"`
-			VaultRoot string `json:"vault_root"`
-		}
-		_ = json.NewDecoder(resp.Body).Decode(&h)
+	if resp.StatusCode != http.StatusOK {
+		raw, _ := io.ReadAll(resp.Body)
 		_ = resp.Body.Close()
-		if resp.StatusCode == http.StatusOK && h.OK {
-			if wantCanon != "" && h.VaultRoot != "" && canonicalOrCleanPath(h.VaultRoot) != wantCanon {
+		return "", nil, fmt.Errorf("HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(raw)))
+	}
+
+	runID := strings.TrimSpace(resp.Header.Get("X-Gorness-Run-ID"))
+	evCh := make(chan core.RunEvent, 64)
+	go func() {
+		defer close(evCh)
+		defer resp.Body.Close()
+		sc := bufio.NewScanner(resp.Body)
+		sc.Buffer(make([]byte, 0, 64*1024), 4*1024*1024)
+		for sc.Scan() {
+			line := sc.Text()
+			if !strings.HasPrefix(line, "data:") {
 				continue
 			}
-			if info.PID == 0 {
-				info.PID = h.PID
+			raw := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
+			if raw == "" {
+				continue
 			}
-			return base, info
+			var ev core.RunEvent
+			if json.Unmarshal([]byte(raw), &ev) != nil || ev.Type == "heartbeat" || ev.Type == "connected" {
+				continue
+			}
+			select {
+			case evCh <- ev:
+			case <-ctx.Done():
+				return
+			}
 		}
-	}
-	return "", daemonRuntimeInfo{}
-}
-
-func canonicalOrCleanPath(p string) string {
-	trimmed := strings.TrimSpace(p)
-	if trimmed == "" {
-		return ""
-	}
-	if resolved, err := filepath.EvalSymlinks(trimmed); err == nil {
-		return filepath.Clean(resolved)
-	}
-	return filepath.Clean(trimmed)
+	}()
+	return runID, evCh, nil
 }
 
 // ============================================================================
@@ -783,6 +879,154 @@ type jsonRPCMessage struct {
 	Params  json.RawMessage `json:"params,omitempty"`
 }
 
+type acpBackend interface {
+	RegisterWorkspace(ctx context.Context, wsDir string) (*store.Workspace, error)
+	CreateSession(ctx context.Context, wsID, title, agentRole string) (*store.SessionMeta, error)
+	LoadSession(ctx context.Context, sessionID string) (*store.SessionMeta, []store.SessionEntry, error)
+	UpdateSessionAgentRole(ctx context.Context, sessionID, agentRole string) (*store.SessionMeta, error)
+	StartRun(ctx context.Context, req core.RunRequest) (string, <-chan core.RunEvent, error)
+	StopRun(ctx context.Context, runID string) error
+	Close()
+}
+
+type engineACPBackend struct {
+	eng *core.Engine
+}
+
+func (b *engineACPBackend) RegisterWorkspace(_ context.Context, wsDir string) (*store.Workspace, error) {
+	return b.eng.Workspaces().Register(wsDir, "")
+}
+
+func (b *engineACPBackend) CreateSession(_ context.Context, wsID, title, agentRole string) (*store.SessionMeta, error) {
+	return b.eng.Sessions().Create(wsID, title, agentRole)
+}
+
+func (b *engineACPBackend) LoadSession(_ context.Context, sessionID string) (*store.SessionMeta, []store.SessionEntry, error) {
+	meta, err := b.eng.Sessions().GetMeta(sessionID)
+	if err != nil {
+		return nil, nil, err
+	}
+	entries, _ := b.eng.Sessions().LoadActiveBranch(meta.ID)
+	return meta, entries, nil
+}
+
+func (b *engineACPBackend) UpdateSessionAgentRole(_ context.Context, sessionID, agentRole string) (*store.SessionMeta, error) {
+	return b.eng.Sessions().UpdateMeta(sessionID, func(m *store.SessionMeta) {
+		m.AgentRole = strings.TrimSpace(agentRole)
+	})
+}
+
+func (b *engineACPBackend) StartRun(ctx context.Context, req core.RunRequest) (string, <-chan core.RunEvent, error) {
+	return b.eng.StartRun(ctx, req)
+}
+
+func (b *engineACPBackend) StopRun(_ context.Context, runID string) error {
+	return b.eng.StopRun(runID)
+}
+
+func (b *engineACPBackend) Close() {
+	b.eng.WaitBackground()
+	_ = b.eng.Close()
+}
+
+type daemonACPBackend struct {
+	ep      *daemonctl.Endpoint
+	cleanup func()
+}
+
+func (b *daemonACPBackend) RegisterWorkspace(ctx context.Context, wsDir string) (*store.Workspace, error) {
+	ws, _, err := daemonctl.RegisterWorkspace(ctx, b.ep, wsDir, "")
+	return ws, err
+}
+
+func (b *daemonACPBackend) CreateSession(ctx context.Context, wsID, title, agentRole string) (*store.SessionMeta, error) {
+	var meta store.SessionMeta
+	_, err := b.ep.DoJSON(ctx, http.MethodPost, "/api/sessions", map[string]any{
+		"workspace_id": wsID,
+		"title":        title,
+		"agent_role":   agentRole,
+	}, &meta)
+	if err != nil {
+		return nil, err
+	}
+	return &meta, nil
+}
+
+func (b *daemonACPBackend) LoadSession(ctx context.Context, sessionID string) (*store.SessionMeta, []store.SessionEntry, error) {
+	var detail struct {
+		Meta    *store.SessionMeta   `json:"meta"`
+		Entries []store.SessionEntry `json:"entries"`
+	}
+	_, err := b.ep.DoJSON(ctx, http.MethodGet, "/api/sessions/"+url.PathEscape(sessionID), nil, &detail)
+	if err != nil {
+		return nil, nil, err
+	}
+	if detail.Meta == nil {
+		return nil, nil, errors.New("session not found")
+	}
+	return detail.Meta, detail.Entries, nil
+}
+
+func (b *daemonACPBackend) UpdateSessionAgentRole(ctx context.Context, sessionID, agentRole string) (*store.SessionMeta, error) {
+	var updated store.SessionMeta
+	_, err := b.ep.DoJSON(ctx, http.MethodPatch, "/api/sessions/"+url.PathEscape(sessionID), map[string]any{
+		"agent_role": strings.TrimSpace(agentRole),
+	}, &updated)
+	if err != nil {
+		return nil, err
+	}
+	return &updated, nil
+}
+
+func (b *daemonACPBackend) StartRun(ctx context.Context, req core.RunRequest) (string, <-chan core.RunEvent, error) {
+	return openDaemonRunStream(ctx, b.ep, req)
+}
+
+func (b *daemonACPBackend) StopRun(ctx context.Context, runID string) error {
+	stopCtx := ctx
+	if stopCtx == nil || stopCtx.Err() != nil {
+		var cancel context.CancelFunc
+		stopCtx, cancel = context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+	}
+	_, err := b.ep.DoJSON(stopCtx, http.MethodPost, "/api/runs/"+url.PathEscape(runID)+"/stop", map[string]any{}, nil)
+	return err
+}
+
+func (b *daemonACPBackend) Close() {
+	if b.cleanup != nil {
+		b.cleanup()
+	}
+}
+
+func availableACPModes() []map[string]string {
+	return []map[string]string{
+		{"id": "plan", "name": "Plan"},
+		{"id": "ask", "name": "Ask"},
+		{"id": "accept_edits", "name": "Accept Edits"},
+		{"id": "auto", "name": "Auto"},
+		{"id": "yolo", "name": "YOLO"},
+	}
+}
+
+func isACPPermMode(modeID string) bool {
+	switch strings.ToLower(strings.TrimSpace(modeID)) {
+	case "plan", "ask", "accept_edits", "auto", "yolo":
+		return true
+	default:
+		return false
+	}
+}
+
+func isKnownBuiltinAgentRole(role string) bool {
+	switch strings.ToLower(strings.TrimSpace(role)) {
+	case "coder", "lead", "explorer", "debugger", "verifier":
+		return true
+	default:
+		return false
+	}
+}
+
 func cmdACP(
 	ctx context.Context,
 	args []string,
@@ -794,11 +1038,13 @@ func cmdACP(
 	fs := flag.NewFlagSet("acp", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	var (
-		vaultFlag string
-		wsFlag    string
+		vaultFlag  string
+		wsFlag     string
+		standalone bool
 	)
 	fs.StringVar(&vaultFlag, "vault", "", "Path to ~/.gorness vault")
 	fs.StringVar(&wsFlag, "workspace", "", "Default workspace directory")
+	fs.BoolVar(&standalone, "standalone", false, "Run ACP directly in-process without connecting to daemon")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
@@ -806,12 +1052,23 @@ func cmdACP(
 	vaultRoot := resolveVaultRoot(vaultFlag, opts.userHomeDir)
 	defaultWS := resolveWorkspaceDir(wsFlag)
 
-	_, eng, err := buildCoreEngine(vaultRoot, opts)
-	if err != nil {
-		fmt.Fprintf(stderr, "acp bootstrap failed: %v\n", err)
-		return 1
+	var backend acpBackend
+	if opts.streamer != nil || standalone {
+		_, eng, err := buildCoreEngine(vaultRoot, opts)
+		if err != nil {
+			fmt.Fprintf(stderr, "acp bootstrap failed: %v\n", err)
+			return 1
+		}
+		backend = &engineACPBackend{eng: eng}
+	} else {
+		ep, cleanup, err := connectOrStartDaemon(ctx, vaultRoot, opts)
+		if err != nil {
+			fmt.Fprintf(stderr, "acp connect daemon failed: %v\n", err)
+			return 1
+		}
+		backend = &daemonACPBackend{ep: ep, cleanup: cleanup}
 	}
-	defer func() { _ = eng.Close() }()
+	defer backend.Close()
 
 	var writeMu sync.Mutex
 	sendJSON := func(payload map[string]any) {
@@ -854,10 +1111,26 @@ func cmdACP(
 	}
 
 	var (
-		activeRunMu        sync.Mutex
+		stateMu            sync.Mutex
 		activeRunBySession = make(map[string]string)
+		modeBySession      = make(map[string]string)
 		promptWG           sync.WaitGroup
 	)
+
+	getSessionMode := func(sessID string) string {
+		stateMu.Lock()
+		defer stateMu.Unlock()
+		if m := modeBySession[sessID]; m != "" {
+			return m
+		}
+		return "auto"
+	}
+
+	setSessionMode := func(sessID, modeID string) {
+		stateMu.Lock()
+		modeBySession[sessID] = modeID
+		stateMu.Unlock()
+	}
 
 	scanner := bufio.NewScanner(stdin)
 	scanner.Buffer(make([]byte, 0, 64*1024), 8*1024*1024)
@@ -893,10 +1166,11 @@ func cmdACP(
 				"protocolVersion": protoVer,
 				"serverInfo": map[string]any{
 					"name":    "gorness",
-					"version": Version,
+					"version": config.Version,
 				},
 				"agentCapabilities": map[string]any{
 					"loadSession": true,
+					"setMode":     true,
 					"promptCapabilities": map[string]any{
 						"embeddedContext": true,
 					},
@@ -911,6 +1185,7 @@ func cmdACP(
 				Cwd       string `json:"cwd"`
 				Workspace string `json:"workspace"`
 				AgentRole string `json:"agentRole"`
+				ModeID    string `json:"modeId"`
 				Title     string `json:"title"`
 			}
 			_ = json.Unmarshal(msg.Params, &params)
@@ -921,7 +1196,7 @@ func cmdACP(
 			if wsDir == "" {
 				wsDir = defaultWS
 			}
-			ws, wErr := eng.Workspaces().Register(wsDir, "")
+			ws, wErr := backend.RegisterWorkspace(ctx, wsDir)
 			if wErr != nil {
 				sendError(msg.ID, -32602, "register workspace failed: "+wErr.Error())
 				continue
@@ -934,22 +1209,24 @@ func cmdACP(
 			if title == "" {
 				title = "ACP Session"
 			}
-			meta, cErr := eng.Sessions().Create(ws.ID, title, role)
+			meta, cErr := backend.CreateSession(ctx, ws.ID, title, role)
 			if cErr != nil {
 				sendError(msg.ID, -32603, "create session failed: "+cErr.Error())
 				continue
 			}
+			initialMode := "auto"
+			if isACPPermMode(params.ModeID) {
+				initialMode = strings.ToLower(strings.TrimSpace(params.ModeID))
+			}
+			setSessionMode(meta.ID, initialMode)
+
 			sendResult(msg.ID, map[string]any{
 				"sessionId":   meta.ID,
 				"workspaceId": ws.ID,
+				"agentRole":   meta.AgentRole,
 				"modes": map[string]any{
-					"currentModeId": "auto",
-					"availableModes": []map[string]string{
-						{"id": "plan", "name": "Plan"},
-						{"id": "ask", "name": "Ask"},
-						{"id": "accept_edits", "name": "Accept Edits"},
-						{"id": "auto", "name": "Auto"},
-					},
+					"currentModeId":  initialMode,
+					"availableModes": availableACPModes(),
 				},
 			})
 
@@ -958,30 +1235,116 @@ func cmdACP(
 				SessionID string `json:"sessionId"`
 			}
 			_ = json.Unmarshal(msg.Params, &params)
-			meta, gErr := eng.Sessions().GetMeta(params.SessionID)
+			meta, entries, gErr := backend.LoadSession(ctx, params.SessionID)
 			if gErr != nil {
 				sendError(msg.ID, -32602, gErr.Error())
 				continue
 			}
-			entries, _ := eng.Sessions().LoadActiveBranch(meta.ID)
+			curMode := getSessionMode(meta.ID)
 			sendResult(msg.ID, map[string]any{
 				"sessionId":   meta.ID,
 				"workspaceId": meta.WorkspaceID,
+				"agentRole":   meta.AgentRole,
 				"entries":     entries,
+				"modes": map[string]any{
+					"currentModeId":  curMode,
+					"availableModes": availableACPModes(),
+				},
 			})
+
+		case "session/set_mode":
+			var params struct {
+				SessionID string `json:"sessionId"`
+				ModeID    string `json:"modeId"`
+				Mode      string `json:"mode"`
+				AgentRole string `json:"agentRole"`
+			}
+			if err := json.Unmarshal(msg.Params, &params); err != nil {
+				sendError(msg.ID, -32602, "invalid session/set_mode params: "+err.Error())
+				continue
+			}
+			if strings.TrimSpace(params.SessionID) == "" {
+				sendError(msg.ID, -32602, "sessionId is required")
+				continue
+			}
+			meta, _, gErr := backend.LoadSession(ctx, params.SessionID)
+			if gErr != nil {
+				sendError(msg.ID, -32602, gErr.Error())
+				continue
+			}
+
+			rawMode := strings.TrimSpace(params.ModeID)
+			if rawMode == "" {
+				rawMode = strings.TrimSpace(params.Mode)
+			}
+			reqRole := strings.TrimSpace(params.AgentRole)
+			if rawMode == "" && reqRole == "" {
+				sendError(msg.ID, -32602, "modeId or agentRole is required")
+				continue
+			}
+
+			effectiveMode := getSessionMode(meta.ID)
+			effectiveRole := meta.AgentRole
+
+			if strings.HasPrefix(strings.ToLower(rawMode), "role:") {
+				roleFromMode := strings.TrimSpace(rawMode[len("role:"):])
+				if roleFromMode == "" {
+					sendError(msg.ID, -32602, "empty role in modeId")
+					continue
+				}
+				reqRole = roleFromMode
+			} else if rawMode != "" {
+				lowerMode := strings.ToLower(rawMode)
+				if isACPPermMode(lowerMode) {
+					effectiveMode = lowerMode
+					setSessionMode(meta.ID, effectiveMode)
+				} else if isKnownBuiltinAgentRole(lowerMode) && reqRole == "" {
+					reqRole = lowerMode
+				} else {
+					sendError(msg.ID, -32602, fmt.Sprintf("unsupported modeId %q", rawMode))
+					continue
+				}
+			}
+
+			if reqRole != "" {
+				updatedMeta, uErr := backend.UpdateSessionAgentRole(ctx, meta.ID, reqRole)
+				if uErr != nil {
+					sendError(msg.ID, -32603, "update session role failed: "+uErr.Error())
+					continue
+				}
+				effectiveRole = updatedMeta.AgentRole
+			}
+
+			sendNotification("session/update", map[string]any{
+				"sessionId": meta.ID,
+				"update": map[string]any{
+					"sessionUpdate": "current_mode_update",
+					"currentModeId": effectiveMode,
+					"agentRole":     effectiveRole,
+				},
+			})
+			if hasID {
+				sendResult(msg.ID, map[string]any{
+					"sessionId":     meta.ID,
+					"currentModeId": effectiveMode,
+					"agentRole":     effectiveRole,
+				})
+			}
 
 		case "session/prompt", "session/run":
 			var params struct {
 				SessionID string          `json:"sessionId"`
 				AgentRole string          `json:"agentRole"`
 				Model     string          `json:"model"`
+				ModeID    string          `json:"modeId"`
+				PermMode  string          `json:"permMode"`
 				Prompt    json.RawMessage `json:"prompt"`
 			}
 			if err := json.Unmarshal(msg.Params, &params); err != nil {
 				sendError(msg.ID, -32602, "invalid session/prompt params: "+err.Error())
 				continue
 			}
-			meta, gErr := eng.Sessions().GetMeta(params.SessionID)
+			meta, _, gErr := backend.LoadSession(ctx, params.SessionID)
 			if gErr != nil {
 				sendError(msg.ID, -32602, gErr.Error())
 				continue
@@ -992,12 +1355,25 @@ func cmdACP(
 				continue
 			}
 
-			runID, evCh, rErr := eng.StartRun(ctx, core.RunRequest{
+			role := strings.TrimSpace(params.AgentRole)
+			if role == "" {
+				role = meta.AgentRole
+			}
+			permMode := strings.TrimSpace(params.PermMode)
+			if permMode == "" && isACPPermMode(params.ModeID) {
+				permMode = strings.ToLower(strings.TrimSpace(params.ModeID))
+			}
+			if permMode == "" {
+				permMode = getSessionMode(meta.ID)
+			}
+
+			runID, evCh, rErr := backend.StartRun(ctx, core.RunRequest{
 				WorkspaceID:   meta.WorkspaceID,
 				SessionID:     meta.ID,
 				Prompt:        promptText,
-				AgentRole:     params.AgentRole,
+				AgentRole:     role,
 				ModelOverride: params.Model,
+				PermMode:      permMode,
 				Unattended:    true,
 			})
 			if rErr != nil {
@@ -1008,11 +1384,10 @@ func cmdACP(
 			sessID := meta.ID
 			reqID := append(json.RawMessage(nil), msg.ID...)
 
-			activeRunMu.Lock()
+			stateMu.Lock()
 			activeRunBySession[sessID] = runID
-			activeRunMu.Unlock()
+			stateMu.Unlock()
 
-			// 异步消费单轮 evCh，使主协程继续读取 stdin 并即时响应 session/cancel 中途取消请求。
 			promptWG.Add(1)
 			go func() {
 				defer promptWG.Done()
@@ -1022,6 +1397,14 @@ func cmdACP(
 					failedErr  string
 				)
 				for ev := range evCh {
+					if runID == "" && ev.RunID != "" {
+						stateMu.Lock()
+						if activeRunBySession[sessID] == "" {
+							activeRunBySession[sessID] = ev.RunID
+						}
+						runID = ev.RunID
+						stateMu.Unlock()
+					}
 					switch ev.Type {
 					case core.EventThinkingDelta:
 						if mp, ok := ev.Payload.(map[string]any); ok {
@@ -1048,7 +1431,7 @@ func cmdACP(
 							}
 						}
 					case core.EventToolCall:
-						if tc, ok := ev.Payload.(core.ToolCallPayload); ok {
+						if tc, ok := decodeEventPayload[core.ToolCallPayload](ev.Payload); ok {
 							sendNotification("session/update", map[string]any{
 								"sessionId": sessID,
 								"update": map[string]any{
@@ -1060,7 +1443,7 @@ func cmdACP(
 							})
 						}
 					case core.EventToolResult:
-						if tr, ok := ev.Payload.(core.ToolResultPayload); ok {
+						if tr, ok := decodeEventPayload[core.ToolResultPayload](ev.Payload); ok {
 							sendNotification("session/update", map[string]any{
 								"sessionId": sessID,
 								"update": map[string]any{
@@ -1073,7 +1456,7 @@ func cmdACP(
 						}
 					case core.EventToolDeferred:
 						stopReason = "deferred"
-						if td, ok := ev.Payload.(core.DeferredToolPayload); ok {
+						if td, ok := decodeEventPayload[core.DeferredToolPayload](ev.Payload); ok {
 							sendNotification("session/update", map[string]any{
 								"sessionId": sessID,
 								"update": map[string]any{
@@ -1086,7 +1469,7 @@ func cmdACP(
 							})
 						}
 					case core.EventRunCompleted:
-						if out, ok := ev.Payload.(core.RunOutcome); ok {
+						if out, ok := decodeEventPayload[core.RunOutcome](ev.Payload); ok {
 							finalText = out.FinalText
 							if out.Status == "deferred" {
 								stopReason = "deferred"
@@ -1097,7 +1480,7 @@ func cmdACP(
 					case core.EventRunCancelled:
 						stopReason = "cancelled"
 					case core.EventRunFailed:
-						if pe, ok := ev.Payload.(core.RunErrorPayload); ok {
+						if pe, ok := decodeEventPayload[core.RunErrorPayload](ev.Payload); ok && pe.Message != "" {
 							failedErr = pe.Message
 						} else {
 							failedErr = "engine run failed"
@@ -1105,11 +1488,11 @@ func cmdACP(
 					}
 				}
 
-				activeRunMu.Lock()
+				stateMu.Lock()
 				if activeRunBySession[sessID] == runID {
 					delete(activeRunBySession, sessID)
 				}
-				activeRunMu.Unlock()
+				stateMu.Unlock()
 
 				if failedErr != "" {
 					sendError(reqID, -32603, failedErr)
@@ -1127,11 +1510,11 @@ func cmdACP(
 				SessionID string `json:"sessionId"`
 			}
 			_ = json.Unmarshal(msg.Params, &params)
-			activeRunMu.Lock()
+			stateMu.Lock()
 			runID := activeRunBySession[params.SessionID]
-			activeRunMu.Unlock()
+			stateMu.Unlock()
 			if runID != "" {
-				_ = eng.StopRun(runID)
+				_ = backend.StopRun(ctx, runID)
 			}
 			if hasID {
 				sendResult(msg.ID, map[string]any{"cancelled": runID != ""})
@@ -1150,7 +1533,6 @@ func cmdACP(
 	}
 
 	promptWG.Wait()
-	eng.WaitBackground()
 	return 0
 }
 
@@ -1177,6 +1559,25 @@ func extractACPPromptText(raw json.RawMessage) string {
 		return strings.Join(parts, "\n")
 	}
 	return ""
+}
+
+func decodeEventPayload[T any](payload any) (T, bool) {
+	var zero T
+	if payload == nil {
+		return zero, false
+	}
+	if typed, ok := payload.(T); ok {
+		return typed, true
+	}
+	raw, err := json.Marshal(payload)
+	if err != nil {
+		return zero, false
+	}
+	var out T
+	if err := json.Unmarshal(raw, &out); err != nil {
+		return zero, false
+	}
+	return out, true
 }
 
 // ============================================================================
@@ -1207,20 +1608,7 @@ func buildCoreEngine(vaultRoot string, opts cliOptions) (*config.Manager, *core.
 }
 
 func resolveVaultRoot(flagVal, injectedHome string) string {
-	if trimmed := strings.TrimSpace(flagVal); trimmed != "" {
-		return filepath.Clean(trimmed)
-	}
-	if envVal := strings.TrimSpace(os.Getenv("GORNESS_VAULT")); envVal != "" {
-		return filepath.Clean(envVal)
-	}
-	home := strings.TrimSpace(injectedHome)
-	if home == "" {
-		home, _ = os.UserHomeDir()
-	}
-	if home == "" {
-		return filepath.Join(os.TempDir(), ".gorness")
-	}
-	return filepath.Join(home, ".gorness")
+	return daemonctl.ResolveVaultRoot(flagVal, nil, injectedHome)
 }
 
 func resolveWorkspaceDir(flagVal string) string {
@@ -1237,61 +1625,13 @@ func resolveWorkspaceDir(flagVal string) string {
 func resolveInteractiveWorkspaceDir(wsFlag, vaultRoot string) (string, error) {
 	explicit := strings.TrimSpace(wsFlag) != ""
 	wsPath := resolveWorkspaceDir(wsFlag)
-	if !pathsOverlapVault(wsPath, vaultRoot) {
+	if !daemonctl.PathsOverlapVault(wsPath, vaultRoot) {
 		return wsPath, nil
 	}
 	if explicit {
 		return "", fmt.Errorf("workspace %q overlaps Gorness vault %q", wsPath, vaultRoot)
 	}
-	// 未显式指定 --workspace 且当前目录为 $HOME 或 ~/.gorness 时，跳过自动注册当前目录以保证正常启动。
 	return "", nil
-}
-
-func pathsOverlapVault(wsPath, vaultRoot string) bool {
-	canonWS := canonicalizeWithAncestors(wsPath)
-	canonVault := canonicalizeWithAncestors(vaultRoot)
-	if canonWS == "" || canonVault == "" {
-		return false
-	}
-	return isPathInsideOrEqualCLI(canonWS, canonVault) || isPathInsideOrEqualCLI(canonVault, canonWS)
-}
-
-func canonicalizeWithAncestors(raw string) string {
-	trimmed := strings.TrimSpace(raw)
-	if trimmed == "" {
-		return ""
-	}
-	abs, err := filepath.Abs(trimmed)
-	if err != nil {
-		abs = filepath.Clean(trimmed)
-	}
-	if resolved, err := filepath.EvalSymlinks(abs); err == nil {
-		return filepath.Clean(resolved)
-	}
-	cur := abs
-	var tail []string
-	for cur != "/" && cur != "." {
-		tail = append(tail, filepath.Base(cur))
-		cur = filepath.Dir(cur)
-		if resolved, err := filepath.EvalSymlinks(cur); err == nil {
-			out := filepath.Clean(resolved)
-			for i := len(tail) - 1; i >= 0; i-- {
-				out = filepath.Join(out, tail[i])
-			}
-			return filepath.Clean(out)
-		}
-	}
-	return filepath.Clean(abs)
-}
-
-func isPathInsideOrEqualCLI(target, root string) bool {
-	if target == root {
-		return true
-	}
-	if root == string(filepath.Separator) {
-		return strings.HasPrefix(target, root)
-	}
-	return strings.HasPrefix(target, root+string(filepath.Separator))
 }
 
 func defaultExecRunner(ctx context.Context, name string, args ...string) error {

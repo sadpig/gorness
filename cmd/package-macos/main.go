@@ -11,15 +11,19 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"strings"
+
+	"gorness.dev/gorness/internal/config"
 )
 
 const (
 	AppBundleName = "Gorness.app"
 	BundleID      = "dev.gorness.desktop"
-	AppVersion    = "1.0.0"
 	MinMacOS      = "13.0"
 )
+
+type CmdRunner func(dir string, env []string, name string, args ...string) error
 
 var reDevID = regexp.MustCompile(`"(Developer ID Application:[^"]+)"`)
 
@@ -42,10 +46,114 @@ func SelectSigningIdentity(envOverride string, securityOutput string) string {
 	return "-"
 }
 
+// NormalizeTargetArch validates --arch ("arm64", "amd64", or "universal"), defaulting to hostArch when empty,
+// and returns the canonical target label and the GOARCH slice list to compile.
+func NormalizeTargetArch(rawArch, hostArch string) (string, []string, error) {
+	cand := strings.ToLower(strings.TrimSpace(rawArch))
+	if cand == "" {
+		cand = strings.ToLower(strings.TrimSpace(hostArch))
+	}
+	switch cand {
+	case "aarch64":
+		cand = "arm64"
+	case "x86_64":
+		cand = "amd64"
+	}
+
+	switch cand {
+	case "arm64":
+		return "arm64", []string{"arm64"}, nil
+	case "amd64":
+		return "amd64", []string{"amd64"}, nil
+	case "universal":
+		return "universal", []string{"arm64", "amd64"}, nil
+	default:
+		return "", nil, fmt.Errorf("unsupported --arch %q (expected arm64, amd64, or universal)", rawArch)
+	}
+}
+
+func clangArchForGOARCH(goarch string) string {
+	if goarch == "amd64" {
+		return "x86_64"
+	}
+	return "arm64"
+}
+
+func DMGFileName(version, targetArch string) string {
+	v := strings.TrimSpace(version)
+	if v == "" {
+		v = config.Version
+	}
+	arch := strings.TrimSpace(targetArch)
+	if arch == "" {
+		arch = runtime.GOARCH
+	}
+	return fmt.Sprintf("Gorness-v%s-macOS-%s.dmg", v, arch)
+}
+
+func buildSliceEnv(baseEnv []string, goarch string, enableCGO bool) []string {
+	env := make([]string, 0, len(baseEnv)+5)
+	env = append(env, baseEnv...)
+	if !enableCGO {
+		return append(env, "CGO_ENABLED=0", "GOOS=darwin", "GOARCH="+goarch)
+	}
+	cArch := clangArchForGOARCH(goarch)
+	cFlags := fmt.Sprintf("-arch %s -mmacosx-version-min=%s", cArch, MinMacOS)
+	return append(env,
+		"CGO_ENABLED=1",
+		"GOOS=darwin",
+		"GOARCH="+goarch,
+		"CGO_CFLAGS="+cFlags,
+		"CGO_LDFLAGS="+cFlags,
+	)
+}
+
+// BuildBinaryForTarget builds pkgPath for either a single GOARCH slice or assembles a universal fat binary via lipo -create.
+func BuildBinaryForTarget(
+	runner CmdRunner,
+	baseEnv []string,
+	repoRoot string,
+	tmpDir string,
+	outPath string,
+	pkgPath string,
+	slices []string,
+	enableCGO bool,
+) error {
+	if len(slices) == 0 {
+		return fmt.Errorf("no target architecture slices provided")
+	}
+	if len(slices) == 1 {
+		env := buildSliceEnv(baseEnv, slices[0], enableCGO)
+		return runner(repoRoot, env, "go", "build", "-trimpath", "-ldflags=-s -w", "-o", outPath, pkgPath)
+	}
+
+	sliceOutputs := make([]string, 0, len(slices))
+	baseName := filepath.Base(outPath)
+	for _, goarch := range slices {
+		sliceOut := filepath.Join(tmpDir, fmt.Sprintf("%s-%s", baseName, goarch))
+		env := buildSliceEnv(baseEnv, goarch, enableCGO)
+		if err := runner(repoRoot, env, "go", "build", "-trimpath", "-ldflags=-s -w", "-o", sliceOut, pkgPath); err != nil {
+			return fmt.Errorf("build %s (%s): %w", baseName, goarch, err)
+		}
+		sliceOutputs = append(sliceOutputs, sliceOut)
+	}
+
+	lipoArgs := make([]string, 0, 3+len(sliceOutputs))
+	lipoArgs = append(lipoArgs, "-create", "-output", outPath)
+	lipoArgs = append(lipoArgs, sliceOutputs...)
+	if err := runner(repoRoot, nil, "/usr/bin/lipo", lipoArgs...); err != nil {
+		return fmt.Errorf("lipo universal %s: %w", baseName, err)
+	}
+	for _, p := range sliceOutputs {
+		_ = os.Remove(p)
+	}
+	return nil
+}
+
 func RenderInfoPlist(version string) string {
 	v := strings.TrimSpace(version)
 	if v == "" {
-		v = AppVersion
+		v = config.Version
 	}
 	return fmt.Sprintf(`<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -91,7 +199,7 @@ func RenderInfoPlist(version string) string {
 `, BundleID, v, v, MinMacOS)
 }
 
-// GenerateIconset 使用纯 Go 4x 超采样渲染 Apple Squircle 质感图标并生成全尺寸 Retina iconset。
+// GenerateIconset renders the Apple Squircle Retina iconset in pure Go.
 func GenerateIconset(iconsetDir string) error {
 	if err := os.MkdirAll(iconsetDir, 0o755); err != nil {
 		return err
@@ -166,7 +274,6 @@ func renderMasterIcon(size int) *image.NRGBA {
 }
 
 func sampleIconPixel(u, v float64) (r, g, b, a float64) {
-	// Apple macOS Big Sur+ squircle inset (~82% canvas) with superellipse n=4.5
 	const halfExtent = 0.825
 	ax := math.Abs(u) / halfExtent
 	ay := math.Abs(v) / halfExtent
@@ -175,13 +282,11 @@ func sampleIconPixel(u, v float64) (r, g, b, a float64) {
 		return 0, 0, 0, 0
 	}
 
-	// Deep Apple Space-Black anodized body with subtle vertical sheen
 	t := (v + halfExtent) / (2 * halfExtent)
 	r = 0.085 - 0.035*t
 	g = 0.090 - 0.035*t
 	b = 0.115 - 0.035*t
 
-	// Subtle crisp inner rim highlight
 	if squircle > 0.945 {
 		rim := (squircle - 0.945) / 0.055
 		shine := 0.20 * (1.0 - 0.65*t) * rim
@@ -190,30 +295,24 @@ func sampleIconPixel(u, v float64) (r, g, b, a float64) {
 		b += shine * 1.15
 	}
 
-	// Precision geometric "G" + Microkernel Core Ring + Active Cyan Node
 	dist := math.Hypot(u, v)
-	angle := math.Atan2(v, u) // [-pi, pi], 0 is right (+x), +pi/2 is down (+y)
+	angle := math.Atan2(v, u)
 
-	// Outer precision C-arc of the "G" (gap on upper-right [-0.62, -0.06] rad)
 	inRing := dist >= 0.31 && dist <= 0.46
 	inGap := angle > -0.64 && angle < -0.04
-	// Horizontal crossbar of "G" from center-right (u in [0.02, 0.46], v in [-0.065, 0.075])
 	inBar := u >= 0.02 && u <= 0.46 && v >= -0.068 && v <= 0.072
 
 	if (inRing && !inGap) || inBar {
-		// Clean titanium white glyph
 		r, g, b = 0.96, 0.97, 0.99
 	}
 
-	// Central Cupertino Blue / Cyan microkernel pulse core
 	if dist <= 0.125 {
-		r, g, b = 0.16, 0.59, 1.00 // #2997FF
+		r, g, b = 0.16, 0.59, 1.00
 	}
 
-	// Orbiting multi-agent node in the G's upper-right aperture
 	nodeDist := math.Hypot(u-0.33, v+0.25)
 	if nodeDist <= 0.078 {
-		r, g, b = 0.19, 0.82, 0.35 // #30D158 Apple vibrant green node
+		r, g, b = 0.19, 0.82, 0.35
 	}
 
 	return clamp01(r), clamp01(g), clamp01(b), 1.0
@@ -293,13 +392,21 @@ func signTarget(identity, identifier, targetPath string) error {
 func main() {
 	var (
 		outDirFlag  string
+		archFlag    string
 		installApps bool
 		skipDMG     bool
 	)
 	flag.StringVar(&outDirFlag, "out", "dist", "Output directory for Gorness.app and .dmg")
+	flag.StringVar(&archFlag, "arch", runtime.GOARCH, "Target macOS architecture (arm64, amd64, or universal)")
 	flag.BoolVar(&installApps, "install", false, "Also install Gorness.app into /Applications")
 	flag.BoolVar(&skipDMG, "skip-dmg", false, "Skip building .dmg disk image")
 	flag.Parse()
+
+	targetArch, archSlices, err := NormalizeTargetArch(archFlag, runtime.GOARCH)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "%v\n", err)
+		os.Exit(2)
+	}
 
 	repoRoot, err := os.Getwd()
 	if err != nil {
@@ -345,22 +452,39 @@ func main() {
 		os.Exit(1)
 	}
 
-	fmt.Println("[2/6] Building pure-static Go engine (Contents/MacOS/gorness-engine)...")
-	noCGOEnv := append(os.Environ(), "CGO_ENABLED=0", "GOOS=darwin", "GOARCH=arm64")
-	if err := runCmd(repoRoot, noCGOEnv, "go", "build", "-trimpath", "-ldflags=-s -w", "-o", filepath.Join(macosDir, "gorness-engine"), "./cmd/gorness"); err != nil {
+	baseEnv := os.Environ()
+	fmt.Printf("[2/6] Building pure-static Go engine (Contents/MacOS/gorness-engine, arch=%s)...\n", targetArch)
+	if err := BuildBinaryForTarget(
+		runCmd,
+		baseEnv,
+		repoRoot,
+		tmpDir,
+		filepath.Join(macosDir, "gorness-engine"),
+		"./cmd/gorness",
+		archSlices,
+		false,
+	); err != nil {
 		fmt.Fprintf(os.Stderr, "build gorness engine failed: %v\n", err)
 		os.Exit(1)
 	}
 
-	fmt.Println("[3/6] Building native macOS Cocoa/WKWebView host (Contents/MacOS/Gorness)...")
-	cgoEnv := append(os.Environ(), "CGO_ENABLED=1", "GOOS=darwin", "GOARCH=arm64", "CGO_CFLAGS=-mmacosx-version-min="+MinMacOS, "CGO_LDFLAGS=-mmacosx-version-min="+MinMacOS)
-	if err := runCmd(repoRoot, cgoEnv, "go", "build", "-trimpath", "-ldflags=-s -w", "-o", filepath.Join(macosDir, "Gorness"), "./cmd/gorness-app"); err != nil {
+	fmt.Printf("[3/6] Building native macOS Cocoa/WKWebView host (Contents/MacOS/Gorness, arch=%s)...\n", targetArch)
+	if err := BuildBinaryForTarget(
+		runCmd,
+		baseEnv,
+		repoRoot,
+		tmpDir,
+		filepath.Join(macosDir, "Gorness"),
+		"./cmd/gorness-app",
+		archSlices,
+		true,
+	); err != nil {
 		fmt.Fprintf(os.Stderr, "build Gorness native host failed: %v\n", err)
 		os.Exit(1)
 	}
 
-	fmt.Println("[4/6] Writing Info.plist & signing bundle...")
-	if err := os.WriteFile(filepath.Join(contentsDir, "Info.plist"), []byte(RenderInfoPlist(AppVersion)), 0o644); err != nil {
+	fmt.Printf("[4/6] Writing Info.plist (v%s) & signing bundle...\n", config.Version)
+	if err := os.WriteFile(filepath.Join(contentsDir, "Info.plist"), []byte(RenderInfoPlist(config.Version)), 0o644); err != nil {
 		fmt.Fprintf(os.Stderr, "write Info.plist: %v\n", err)
 		os.Exit(1)
 	}
@@ -394,7 +518,7 @@ func main() {
 			os.Exit(1)
 		}
 		_ = os.Symlink("/Applications", filepath.Join(dmgRoot, "Applications"))
-		dmgPath := filepath.Join(outDir, fmt.Sprintf("Gorness-v%s-macOS-arm64.dmg", AppVersion))
+		dmgPath := filepath.Join(outDir, DMGFileName(config.Version, targetArch))
 		_ = os.Remove(dmgPath)
 		if err := runCmd(repoRoot, nil, "/usr/bin/hdiutil", "create", "-volname", "Gorness", "-srcfolder", dmgRoot, "-ov", "-format", "UDZO", dmgPath); err != nil {
 			fmt.Fprintf(os.Stderr, "hdiutil create failed: %v\n", err)

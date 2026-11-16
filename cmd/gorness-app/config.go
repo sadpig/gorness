@@ -1,80 +1,38 @@
 package main
 
 import (
-	"bytes"
+	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"net"
 	"net/http"
 	"net/url"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
-	"syscall"
 	"time"
 
-	"github.com/pelletier/go-toml/v2"
-	"gorness.dev/gorness/internal/config"
+	"gorness.dev/gorness/internal/alwayson"
+	"gorness.dev/gorness/internal/core"
+	"gorness.dev/gorness/internal/daemonctl"
 )
 
-type daemonRuntimeRecord struct {
-	PID       int    `toml:"pid"`
-	URL       string `toml:"url"`
-	VaultRoot string `toml:"vault_root"`
-}
-
 func ResolveVaultRoot(env map[string]string, homeDir string) string {
-	if v := strings.TrimSpace(env["GORNESS_VAULT"]); v != "" {
-		if strings.HasPrefix(v, "~/") {
-			return filepath.Join(homeDir, v[2:])
-		}
-		return filepath.Clean(v)
-	}
-	return filepath.Join(homeDir, ".gorness")
+	return daemonctl.ResolveVaultRoot("", env, homeDir)
 }
 
-// EnrichDesktopPATH 补齐 Finder/Dock 启动 .app 时缺失的常用开发工具链目录，确保沙箱内 git/go/node/rg 可用。
+// EnrichDesktopPATH prepends standard macOS developer toolchain directories without duplicates
+// so Finder/Dock-launched Gorness.app sandboxes can locate git, go, node, and rg.
 func EnrichDesktopPATH(currentPATH, homeDir string) string {
-	priority := []string{
-		"/opt/homebrew/bin",
-		"/opt/homebrew/sbin",
-		"/usr/local/bin",
-	}
-	if strings.TrimSpace(homeDir) != "" {
-		priority = append(priority,
-			filepath.Join(homeDir, "go", "bin"),
-			filepath.Join(homeDir, ".local", "bin"),
-		)
-	}
-	priority = append(priority, "/usr/bin", "/bin", "/usr/sbin", "/sbin")
-
-	seen := make(map[string]bool, len(priority)+8)
-	var out []string
-	add := func(dir string) {
-		d := strings.TrimSpace(dir)
-		if d == "" || seen[d] {
-			return
-		}
-		seen[d] = true
-		out = append(out, d)
-	}
-	for _, p := range priority {
-		add(p)
-	}
-	for _, p := range strings.Split(currentPATH, ":") {
-		add(p)
-	}
-	return strings.Join(out, ":")
+	return daemonctl.EnrichDesktopPATH(currentPATH, homeDir)
 }
 
 func BundledDaemonBinary(appExecutablePath string) string {
-	dir := filepath.Dir(appExecutablePath)
-	return filepath.Join(dir, "gorness-engine")
+	return daemonctl.BundledDaemonBinary(appExecutablePath)
 }
 
-// IsAllowedLoopbackNavigation 限制 WKWebView 严格停留在本地守护进程同一 Origin；外链仅允许交由系统浏览器打开。
+// IsAllowedLoopbackNavigation restricts WKWebView navigation strictly to the local daemon's origin;
+// external http/https/mailto links are handed off to NSWorkspace, and cross-port loopback or file:// URLs are blocked.
 func IsAllowedLoopbackNavigation(targetURL, daemonBaseURL string) (inApp bool, openExternal bool) {
 	u, err := url.Parse(strings.TrimSpace(targetURL))
 	if err != nil || u.Scheme == "" {
@@ -103,122 +61,142 @@ func IsAllowedLoopbackNavigation(targetURL, daemonBaseURL string) (inApp bool, o
 	return false, false
 }
 
-func canonicalPath(p string) string {
-	if resolved, err := filepath.EvalSymlinks(p); err == nil {
-		return filepath.Clean(resolved)
-	}
-	return filepath.Clean(p)
-}
-
-func probeHealthyDaemon(vaultRoot string) string {
-	paths := config.VaultPaths{Root: vaultRoot}
-	var candidates []string
-	infoFile := filepath.Join(paths.RuntimeDir(), "daemon.toml")
-	if raw, err := os.ReadFile(infoFile); err == nil {
-		var rec daemonRuntimeRecord
-		if toml.Unmarshal(raw, &rec) == nil && strings.TrimSpace(rec.URL) != "" {
-			candidates = append(candidates, strings.TrimRight(rec.URL, "/"))
-		}
-	}
-	candidates = append(candidates, "http://127.0.0.1:3456")
-
-	wantVault := canonicalPath(vaultRoot)
-	client := &http.Client{Timeout: 600 * time.Millisecond}
-	for _, base := range candidates {
-		resp, err := client.Get(base + "/api/health")
-		if err != nil {
-			continue
-		}
-		var h struct {
-			OK        bool   `json:"ok"`
-			VaultRoot string `json:"vault_root"`
-		}
-		_ = json.NewDecoder(resp.Body).Decode(&h)
-		_ = resp.Body.Close()
-		if resp.StatusCode == http.StatusOK && h.OK && canonicalPath(h.VaultRoot) == wantVault {
-			return base
-		}
-	}
-	return ""
-}
-
-func ensureDesktopDaemon() (string, string, error) {
+func ensureDesktopDaemon() (*daemonctl.Endpoint, string, string, error) {
 	homeDir, err := os.UserHomeDir()
 	if err != nil {
-		return "", "", fmt.Errorf("resolve home dir: %w", err)
+		return nil, "", "", fmt.Errorf("resolve home dir: %w", err)
 	}
 	envMap := map[string]string{"GORNESS_VAULT": os.Getenv("GORNESS_VAULT")}
 	vaultRoot := ResolveVaultRoot(envMap, homeDir)
-	_ = os.Setenv("PATH", EnrichDesktopPATH(os.Getenv("PATH"), homeDir))
 
-	if existing := probeHealthyDaemon(vaultRoot); existing != "" {
-		return existing, vaultRoot, nil
-	}
-
-	exe, err := os.Executable()
-	if err != nil {
-		return "", vaultRoot, err
-	}
-	if resolvedExe, err := filepath.EvalSymlinks(exe); err == nil {
-		exe = resolvedExe
-	}
-	daemonBin := BundledDaemonBinary(exe)
-	if _, stErr := os.Stat(daemonBin); stErr != nil {
-		if pathBin, lookErr := exec.LookPath("gorness"); lookErr == nil {
-			daemonBin = pathBin
-		} else {
-			return "", vaultRoot, fmt.Errorf("bundled engine not found at %s", daemonBin)
+	var daemonBin string
+	if exe, exeErr := os.Executable(); exeErr == nil && exe != "" {
+		if resolvedExe, symErr := filepath.EvalSymlinks(exe); symErr == nil {
+			exe = resolvedExe
 		}
+		daemonBin = BundledDaemonBinary(exe)
 	}
 
-	paths := config.VaultPaths{Root: vaultRoot}
-	if err := os.MkdirAll(paths.LogsDir(), 0o700); err != nil {
-		return "", vaultRoot, err
-	}
-	logFile, err := os.OpenFile(filepath.Join(paths.LogsDir(), "daemon.log"), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
+	ep, err := daemonctl.EnsureDaemon(context.Background(), daemonctl.EnsureOptions{
+		VaultRoot:    vaultRoot,
+		DaemonBinary: daemonBin,
+		HomeDir:      homeDir,
+		EnrichPATH:   true,
+		WaitTimeout:  8 * time.Second,
+	})
 	if err != nil {
-		return "", vaultRoot, err
+		return nil, "", vaultRoot, err
 	}
-
-	cmd := exec.Command(daemonBin, "daemon", "serve", "--vault", vaultRoot)
-	cmd.Stdout = logFile
-	cmd.Stderr = logFile
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
-	if err := cmd.Start(); err != nil {
-		_ = logFile.Close()
-		return "", vaultRoot, fmt.Errorf("start gorness daemon: %w", err)
+	webURL := ep.WebURL
+	if webURL == "" {
+		webURL = ep.EffectiveBaseURL()
 	}
-	_ = cmd.Process.Release()
-	_ = logFile.Close()
-
-	deadline := time.Now().Add(8 * time.Second)
-	for time.Now().Before(deadline) {
-		if ready := probeHealthyDaemon(vaultRoot); ready != "" {
-			return ready, vaultRoot, nil
-		}
-		time.Sleep(60 * time.Millisecond)
-	}
-	return "", vaultRoot, errors.New("timed out waiting for gornessd on 127.0.0.1")
+	return ep, webURL, vaultRoot, nil
 }
 
-func registerProjectDirectory(daemonBaseURL, dirPath string) error {
-	payload, _ := json.Marshal(map[string]string{
-		"path": dirPath,
-		"name": filepath.Base(dirPath),
-	})
-	req, err := http.NewRequest(http.MethodPost, strings.TrimRight(daemonBaseURL, "/")+"/api/workspaces", bytes.NewReader(payload))
+func registerProjectDirectory(ctx context.Context, ep *daemonctl.Endpoint, fallbackBaseURL, dirPath string) (string, error) {
+	if ctx == nil {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+	}
+	cleanDir := strings.TrimSpace(dirPath)
+	name := filepath.Base(cleanDir)
+	if ep != nil {
+		_, raw, err := daemonctl.RegisterWorkspace(ctx, ep, cleanDir, name)
+		if err != nil {
+			return "", err
+		}
+		return string(raw), nil
+	}
+	client, baseURL := daemonctl.ClientForURL(fallbackBaseURL, "", 5*time.Second)
+	_, raw, err := daemonctl.RegisterWorkspaceURL(ctx, client, baseURL, cleanDir, name)
 	if err != nil {
-		return err
+		return "", err
 	}
-	req.Header.Set("Content-Type", "application/json")
-	client := &http.Client{Timeout: 4 * time.Second}
-	resp, err := client.Do(req)
+	return string(raw), nil
+}
+
+// FormatWorkspaceJSInvocation builds a safe JavaScript snippet for WKWebView.evaluateJavaScript:
+// that passes the registered workspace JSON into window.onNativeWorkspaceRegistered(...) and returns
+// true when handled (avoiding Promise return type errors in WebKit), or false if undefined so Cocoa
+// falls back to reloading the webview.
+func FormatWorkspaceJSInvocation(rawWorkspaceJSON string) string {
+	trimmed := strings.TrimSpace(rawWorkspaceJSON)
+	if trimmed == "" {
+		return "false"
+	}
+	quotedJSONLiteral, err := json.Marshal(trimmed)
 	if err != nil {
-		return err
+		return "false"
 	}
-	defer resp.Body.Close()
-	if resp.StatusCode >= 300 {
-		return fmt.Errorf("register workspace HTTP %d", resp.StatusCode)
+	return fmt.Sprintf(
+		`(function(){if(typeof window.onNativeWorkspaceRegistered==="function"){void window.onNativeWorkspaceRegistered(%s);return true;}return false;})()`,
+		string(quotedJSONLiteral),
+	)
+}
+
+// PollAttentionCount queries GET /api/approvals and GET /api/alwayson via daemonctl (preferring UDS)
+// and returns the combined count of live pending approvals plus pending deferred items.
+func PollAttentionCount(ctx context.Context, ep *daemonctl.Endpoint, fallbackBaseURL string) (int, error) {
+	if ctx == nil {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(context.Background(), 1500*time.Millisecond)
+		defer cancel()
 	}
-	return nil
+
+	doGet := func(path string, dst any) error {
+		if ep != nil {
+			_, err := ep.DoJSON(ctx, http.MethodGet, path, nil, dst)
+			return err
+		}
+		client, baseURL := daemonctl.ClientForURL(fallbackBaseURL, "", 1500*time.Millisecond)
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, baseURL+path, nil)
+		if err != nil {
+			return err
+		}
+		resp, err := client.Do(req)
+		if err != nil {
+			return err
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode >= 400 {
+			return fmt.Errorf("HTTP %d", resp.StatusCode)
+		}
+		return json.NewDecoder(resp.Body).Decode(dst)
+	}
+
+	var approvals []core.PendingApproval
+	apprErr := doGet("/api/approvals", &approvals)
+
+	var aoState alwayson.AlwaysOnState
+	aoErr := doGet("/api/alwayson", &aoState)
+
+	if apprErr != nil && aoErr != nil {
+		return 0, apprErr
+	}
+
+	deferredCount := aoState.DeferredCount
+	if deferredCount == 0 && len(aoState.Deferred) > 0 {
+		for _, d := range aoState.Deferred {
+			st := strings.ToLower(strings.TrimSpace(d.Status))
+			if st == "" || st == "pending" {
+				deferredCount++
+			}
+		}
+	}
+
+	total := len(approvals) + deferredCount
+	if total < 0 {
+		total = 0
+	}
+	return total, nil
+}
+
+// FormatStatusBarTitle formats the macOS NSStatusItem button title with a live attention badge.
+func FormatStatusBarTitle(attentionCount int) string {
+	if attentionCount <= 0 {
+		return "G·"
+	}
+	return fmt.Sprintf("G·%d", attentionCount)
 }

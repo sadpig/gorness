@@ -6,13 +6,17 @@
 #include <string.h>
 
 extern int goDecideNavigation(char *targetURL);
-extern void goOnFolderChosen(char *folderPath);
+extern char *goOnFolderChosen(char *folderPath);
+extern int goPollAttentionCount(void);
 extern void goOpenVaultInFinder(void);
 
-@interface GornessAppDelegate : NSObject <NSApplicationDelegate, WKNavigationDelegate, WKUIDelegate>
+@interface GornessAppDelegate : NSObject <NSApplicationDelegate, NSWindowDelegate, WKNavigationDelegate, WKUIDelegate>
 @property (strong, nonatomic) NSWindow *mainWindow;
 @property (strong, nonatomic) WKWebView *webView;
 @property (strong, nonatomic) NSStatusItem *statusItem;
+@property (strong, nonatomic) NSMenuItem *attentionMenuItem;
+@property (strong, nonatomic) NSTimer *attentionPollTimer;
+@property (assign, nonatomic) BOOL attentionPollInFlight;
 @property (strong, nonatomic) NSMutableArray<NSWindow *> *previewWindows;
 @property (copy, nonatomic) NSString *baseURLString;
 @end
@@ -24,6 +28,7 @@ extern void goOpenVaultInFinder(void);
 	if (self) {
 		_baseURLString = [urlStr copy];
 		_previewWindows = [NSMutableArray array];
+		_attentionPollInFlight = NO;
 	}
 	return self;
 }
@@ -110,6 +115,11 @@ extern void goOpenVaultInFinder(void);
 	self.statusItem.button.font = [NSFont monospacedSystemFontOfSize:12.5 weight:NSFontWeightBold];
 
 	NSMenu *menu = [[NSMenu alloc] init];
+	self.attentionMenuItem = [[NSMenuItem alloc] initWithTitle:@"All Clear (0 pending)" action:@selector(showMainWindow:) keyEquivalent:@""];
+	[self.attentionMenuItem setTarget:self];
+	[menu addItem:self.attentionMenuItem];
+	[menu addItem:[NSMenuItem separatorItem]];
+
 	NSMenuItem *showItem = [[NSMenuItem alloc] initWithTitle:@"Open Gorness Studio" action:@selector(showMainWindow:) keyEquivalent:@""];
 	[showItem setTarget:self];
 	[menu addItem:showItem];
@@ -129,6 +139,42 @@ extern void goOpenVaultInFinder(void);
 	[menu addItem:[NSMenuItem separatorItem]];
 	[menu addItemWithTitle:@"Quit Gorness" action:@selector(terminate:) keyEquivalent:@""];
 	self.statusItem.menu = menu;
+}
+
+- (void)updateAttentionBadgeWithCount:(int)count {
+	if (self.statusItem == nil || self.statusItem.button == nil) {
+		return;
+	}
+	if (count > 0) {
+		self.statusItem.button.title = [NSString stringWithFormat:@"G·%d", count];
+		if (self.attentionMenuItem != nil) {
+			self.attentionMenuItem.title = [NSString stringWithFormat:@"Attention Required: %d pending", count];
+		}
+	} else {
+		self.statusItem.button.title = @"G·";
+		if (self.attentionMenuItem != nil) {
+			self.attentionMenuItem.title = @"All Clear (0 pending)";
+		}
+	}
+}
+
+- (void)pollAttentionBadge:(NSTimer *)timer {
+	if (self.attentionPollInFlight) {
+		return;
+	}
+	self.attentionPollInFlight = YES;
+	__weak typeof(self) weakSelf = self;
+	dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+		int count = goPollAttentionCount();
+		dispatch_async(dispatch_get_main_queue(), ^{
+			__strong typeof(weakSelf) strongSelf = weakSelf;
+			if (strongSelf == nil) {
+				return;
+			}
+			strongSelf.attentionPollInFlight = NO;
+			[strongSelf updateAttentionBadgeWithCount:count];
+		});
+	});
 }
 
 - (void)applicationDidFinishLaunching:(NSNotification *)notification {
@@ -156,6 +202,32 @@ extern void goOpenVaultInFinder(void);
 
 	[self.mainWindow makeKeyAndOrderFront:nil];
 	[NSApp activateIgnoringOtherApps:YES];
+
+	[self pollAttentionBadge:nil];
+	self.attentionPollTimer = [NSTimer scheduledTimerWithTimeInterval:2.0
+	                                                           target:self
+	                                                         selector:@selector(pollAttentionBadge:)
+	                                                         userInfo:nil
+	                                                          repeats:YES];
+}
+
+- (void)applicationWillTerminate:(NSNotification *)notification {
+	if (self.attentionPollTimer != nil) {
+		[self.attentionPollTimer invalidate];
+		self.attentionPollTimer = nil;
+	}
+	for (NSWindow *win in [self.previewWindows copy]) {
+		[win setDelegate:nil];
+	}
+	[self.previewWindows removeAllObjects];
+}
+
+- (void)windowWillClose:(NSNotification *)notification {
+	NSWindow *closingWindow = [notification object];
+	if (closingWindow != nil && closingWindow != self.mainWindow) {
+		[closingWindow setDelegate:nil];
+		[self.previewWindows removeObjectIdenticalTo:closingWindow];
+	}
 }
 
 - (BOOL)applicationShouldHandleReopen:(NSApplication *)sender hasVisibleWindows:(BOOL)flag {
@@ -217,8 +289,38 @@ extern void goOpenVaultInFinder(void);
 		NSURL *chosen = [[panel URLs] firstObject];
 		if (chosen != nil && [chosen path] != nil) {
 			const char *cstr = [[chosen path] UTF8String];
-			goOnFolderChosen((char *)cstr);
-			[self.webView reload];
+			char *rawWorkspaceJSON = goOnFolderChosen((char *)cstr);
+			if (rawWorkspaceJSON == NULL) {
+				return;
+			}
+			NSString *wsJSON = [NSString stringWithUTF8String:rawWorkspaceJSON];
+			free(rawWorkspaceJSON);
+
+			if (wsJSON.length == 0 || self.webView == nil) {
+				[self.webView reload];
+				return;
+			}
+
+			NSError *serErr = nil;
+			NSData *arrData = [NSJSONSerialization dataWithJSONObject:@[wsJSON] options:0 error:&serErr];
+			NSString *arrLiteral = (arrData != nil && serErr == nil)
+				? [[NSString alloc] initWithData:arrData encoding:NSUTF8StringEncoding]
+				: nil;
+			if (arrLiteral.length == 0) {
+				[self.webView reload];
+				return;
+			}
+
+			NSString *js = [NSString stringWithFormat:
+				@"(function(){ if (typeof window.onNativeWorkspaceRegistered === 'function') { void window.onNativeWorkspaceRegistered((%@)[0]); return true; } return false; })()",
+				arrLiteral];
+			__weak typeof(self) weakSelf = self;
+			[self.webView evaluateJavaScript:js completionHandler:^(id result, NSError *error) {
+				if (error != nil || ![result respondsToSelector:@selector(boolValue)] || ![result boolValue]) {
+					[weakSelf.webView reload];
+				}
+			}];
+			[self pollAttentionBadge:nil];
 		}
 	}
 }
@@ -263,6 +365,8 @@ extern void goOpenVaultInFinder(void);
 	NSWindowStyleMask style = NSWindowStyleMaskTitled | NSWindowStyleMaskClosable | NSWindowStyleMaskMiniaturizable | NSWindowStyleMaskResizable;
 	NSWindow *childWin = [[NSWindow alloc] initWithContentRect:pFrame styleMask:style backing:NSBackingStoreBuffered defer:NO];
 	[childWin setTitle:@"Gorness Isolated Preview"];
+	[childWin setReleasedWhenClosed:NO];
+	[childWin setDelegate:self];
 	[childWin center];
 	WKWebView *childWeb = [[WKWebView alloc] initWithFrame:[[childWin contentView] bounds] configuration:configuration];
 	[childWeb setAutoresizingMask:(NSViewWidthSizable | NSViewHeightSizable)];
