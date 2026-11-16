@@ -306,15 +306,20 @@ func buildGeminiContents(history []store.SessionEntry) []geminiContentWire {
 	for _, entry := range history {
 		switch entry.Role {
 		case "assistant":
+			allowSig := isGeminiOrUnspecifiedModel(entry.ModelID)
 			var parts []geminiPartWire
 			for _, b := range entry.Blocks {
 				switch b.Type {
 				case "thinking":
-					if b.Thinking != "" || b.Signature != "" {
+					sig := ""
+					if allowSig {
+						sig = b.Signature
+					}
+					if b.Thinking != "" || sig != "" {
 						parts = append(parts, geminiPartWire{
 							Text:             b.Thinking,
 							Thought:          true,
-							ThoughtSignature: b.Signature,
+							ThoughtSignature: sig,
 						})
 					}
 				case "text":
@@ -326,8 +331,12 @@ func buildGeminiContents(history []store.SessionEntry) []geminiContentWire {
 					if len(args) == 0 || !json.Valid(args) {
 						args = []byte("{}")
 					}
+					sig := ""
+					if allowSig {
+						sig = b.Signature
+					}
 					parts = append(parts, geminiPartWire{
-						ThoughtSignature: b.Signature,
+						ThoughtSignature: sig,
 						FunctionCall: &geminiFunctionCallWire{
 							ID:   b.ToolCallID,
 							Name: b.ToolName,
@@ -421,4 +430,9 @@ func geminiStreamURL(baseURL, model string) (string, error) {
 	q.Set("alt", "sse")
 	parsed.RawQuery = q.Encode()
 	return parsed.String(), nil
+}
+
+func isGeminiOrUnspecifiedModel(modelID string) bool {
+	m := strings.ToLower(strings.TrimSpace(modelID))
+	return m == "" || strings.Contains(m, "gemini")
 }

@@ -12,6 +12,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -885,15 +886,10 @@ func TestRunCommandSubdirWorkdirAndExtraWriteDirs(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 
-	// Initialize git repository at workspace root so subdirectory run_command can verify root git_status reporting.
-	initRes, err := reg.Execute(ctx, "run_command", CallContext{
-		WorkspaceRoot: wsRoot,
-		VaultRoot:     vaultRoot,
-		SandboxMode:   SandboxStrict,
-		PathGuard:     pg,
-	}, json.RawMessage(`{"command":"git init -q"}`))
-	if err != nil || initRes.IsError {
-		t.Fatalf("git init failed: res=%+v err=%v", initRes, err)
+	// Initialize git repository on host at workspace root so subdirectory run_command can verify root git_status reporting.
+	gitInitCmd := exec.CommandContext(ctx, "git", "-C", wsRoot, "init", "-q")
+	if out, err := gitInitCmd.CombinedOutput(); err != nil {
+		t.Fatalf("host git init failed: %v (%s)", err, string(out))
 	}
 
 	extraFile := filepath.Join(extraWriteDir, "extra_allowed.txt")
@@ -1120,4 +1116,153 @@ func TestMCPStdioHelperProcess(t *testing.T) {
 		}
 	}
 	os.Exit(0)
+}
+
+func TestSeatbeltWriteDenyRulesQuickGitStatusFsmonitorAndPartialMCP(t *testing.T) {
+	wsRoot := t.TempDir()
+	vaultRoot := t.TempDir()
+	markerDir := t.TempDir()
+	fsmonitorMarker := filepath.Join(markerDir, "quick_status_fsmonitor_fired")
+
+	t.Setenv("OPENAI_API_KEY", "sk-openai-super-secret-host-key")
+	for _, kv := range buildCleanCommandEnv(t.TempDir(), nil) {
+		if strings.HasPrefix(kv, "OPENAI_API_KEY=") {
+			t.Fatalf("buildCleanCommandEnv leaked OPENAI_API_KEY: %s", kv)
+		}
+	}
+
+	if !IsAutoRunConfigPath("", ".git/config") || !IsAutoRunConfigPath("/tmp/repo/.git/config", "") {
+		t.Fatal("expected IsAutoRunConfigPath to flag .git/config")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	if out, err := exec.CommandContext(ctx, "git", "-C", wsRoot, "init", "-q").CombinedOutput(); err != nil {
+		t.Fatalf("git init: %v (%s)", err, string(out))
+	}
+	gitCfgPath := filepath.Join(wsRoot, ".git", "config")
+	rawCfg, err := os.ReadFile(gitCfgPath)
+	if err != nil {
+		t.Fatalf("read .git/config: %v", err)
+	}
+	if err := os.WriteFile(gitCfgPath, append(rawCfg, []byte(fmt.Sprintf("\n[core]\n\tfsmonitor = /usr/bin/touch %s\n", fsmonitorMarker))...), 0o644); err != nil {
+		t.Fatalf("write .git/config: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Join(wsRoot, ".gorness"), 0o755); err != nil {
+		t.Fatalf("mkdir .gorness: %v", err)
+	}
+
+	runner := NewSeatbeltRunner(WithRunnerVaultRoot(vaultRoot))
+	profile := runner.BuildProfile(wsRoot, nil, SandboxStrict, 0)
+	for _, mustRule := range []string{
+		".ssh",
+		"Library/Keychains",
+		".gorness",
+		".git/hooks",
+		".git/config",
+	} {
+		if !strings.Contains(profile, mustRule) {
+			t.Fatalf("BuildProfile missing expected deny rule %q:\n%s", mustRule, profile)
+		}
+	}
+
+	// Verify Seatbelt kernel denies writes to <wsRoot>/.gorness, <wsRoot>/.git/hooks, and <wsRoot>/.git/config!
+	for _, relForbidden := range []string{
+		".gorness/mcp.toml",
+		".git/hooks/pre-commit",
+		".git/config",
+	} {
+		target := filepath.Join(wsRoot, filepath.FromSlash(relForbidden))
+		res, rErr := runner.Run(ctx, fmt.Sprintf("printf 'tamper' >> %q", target), wsRoot, SandboxStrict, nil)
+		if rErr != nil {
+			t.Fatalf("Seatbelt Run error on %s: %v", relForbidden, rErr)
+		}
+		if res.ExitCode == 0 {
+			t.Fatalf("expected Seatbelt write-deny on %s, got exit 0", relForbidden)
+		}
+	}
+
+	// Verify quickGitStatus via run_command disables core.fsmonitor on host git!
+	pg, err := NewPathGuard(wsRoot, vaultRoot)
+	if err != nil {
+		t.Fatalf("NewPathGuard: %v", err)
+	}
+	reg, err := NewRegistry(RegistryOptions{
+		WorkspaceRoot: wsRoot,
+		VaultPaths:    config.VaultPaths{Root: vaultRoot},
+		PathGuard:     pg,
+		Seatbelt:      runner,
+	})
+	if err != nil {
+		t.Fatalf("NewRegistry: %v", err)
+	}
+	cmdRes, err := reg.Execute(ctx, "run_command", CallContext{
+		WorkspaceRoot: wsRoot,
+		VaultRoot:     vaultRoot,
+		SandboxMode:   SandboxStrict,
+		PathGuard:     pg,
+	}, json.RawMessage(`{"command":"printf 'ok' > safe.txt"}`))
+	if err != nil || cmdRes.IsError {
+		t.Fatalf("run_command safe write failed: res=%+v err=%v", cmdRes, err)
+	}
+	if _, err := os.Stat(fsmonitorMarker); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("SECURITY VIOLATION: quickGitStatus executed malicious core.fsmonitor!")
+	}
+
+	// Verify MCPManager.ConnectAll keeps tools from healthy servers when another server fails to connect!
+	healthyMCP := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var rpc struct {
+			ID     any    `json:"id"`
+			Method string `json:"method"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&rpc)
+		w.Header().Set("Content-Type", "application/json")
+		switch rpc.Method {
+		case "initialize":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"jsonrpc": "2.0",
+				"id":      rpc.ID,
+				"result":  map[string]any{"protocolVersion": "2024-11-05", "capabilities": map[string]any{}},
+			})
+		case "notifications/initialized":
+			w.WriteHeader(http.StatusAccepted)
+		case "tools/list":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"jsonrpc": "2.0",
+				"id":      rpc.ID,
+				"result": map[string]any{
+					"tools": []map[string]any{
+						{"name": "ping_healthy", "description": "Healthy MCP ping tool"},
+					},
+				},
+			})
+		}
+	}))
+	defer healthyMCP.Close()
+
+	mgr := NewMCPManager(nil, "", wsRoot)
+	defer func() { _ = mgr.Close() }()
+
+	joinErr := mgr.ConnectAll(ctx, config.MCPConfig{
+		Servers: map[string]config.MCPServerConfig{
+			"a_broken": {
+				ID:        "a_broken",
+				Transport: "stdio",
+				Command:   "/nonexistent/gorness-missing-mcp-bin",
+			},
+			"z_healthy": {
+				ID:        "z_healthy",
+				Transport: "http",
+				URL:       healthyMCP.URL,
+			},
+		},
+	})
+	if joinErr == nil || !strings.Contains(joinErr.Error(), "a_broken") {
+		t.Fatalf("expected joined warning error naming a_broken, got %v", joinErr)
+	}
+	kept := mgr.Tools()
+	if len(kept) != 1 || kept[0].Name != "mcp__z_healthy__ping_healthy" {
+		t.Fatalf("expected healthy MCP server tool preserved despite sibling failure, got %+v", kept)
+	}
 }

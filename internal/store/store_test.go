@@ -831,3 +831,36 @@ func TestCrossWorkspaceSearchAndExports(t *testing.T) {
 		t.Fatal("expected GetMeta on deleted session to fail")
 	}
 }
+
+func TestWorkspaceRegisterRejectsVaultContainingRoot(t *testing.T) {
+	base := t.TempDir()
+	homeDir := filepath.Join(base, "home")
+	vaultRoot := filepath.Join(homeDir, ".gorness")
+	if err := os.MkdirAll(homeDir, 0o700); err != nil {
+		t.Fatalf("mkdir home: %v", err)
+	}
+	wsStore, err := NewWorkspaceStore(config.VaultPaths{Root: vaultRoot})
+	if err != nil {
+		t.Fatalf("NewWorkspaceStore: %v", err)
+	}
+
+	// Registering $HOME (which contains ~/.gorness) or its parent MUST fail with ErrInvalidPath.
+	if _, err := wsStore.Register(homeDir, "HomeDir"); !errors.Is(err, ErrInvalidPath) {
+		t.Fatalf("expected ErrInvalidPath when registering vault-containing $HOME, got %v", err)
+	}
+	if _, err := wsStore.Register(base, "BaseParent"); !errors.Is(err, ErrInvalidPath) {
+		t.Fatalf("expected ErrInvalidPath when registering parent of vault, got %v", err)
+	}
+	if _, err := wsStore.Register(vaultRoot, "VaultSelf"); !errors.Is(err, ErrInvalidPath) {
+		t.Fatalf("expected ErrInvalidPath when registering vault itself, got %v", err)
+	}
+
+	// Sibling project directory succeeds cleanly.
+	siblingProj := filepath.Join(homeDir, "projects", "demo")
+	if err := os.MkdirAll(siblingProj, 0o755); err != nil {
+		t.Fatalf("mkdir siblingProj: %v", err)
+	}
+	if ws, err := wsStore.Register(siblingProj, "Demo"); err != nil || ws == nil {
+		t.Fatalf("expected sibling project registration to succeed, got ws=%+v err=%v", ws, err)
+	}
+}

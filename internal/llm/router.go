@@ -383,6 +383,9 @@ func (r *Router) StreamWithRetry(ctx context.Context, route ResolvedRoute, req R
 				attemptCtx, cancel := context.WithTimeout(ctx, attemptTimeout)
 				attemptReq := req
 				attemptReq.Provider = resolvedProv
+				if strings.TrimSpace(attemptReq.Provider.ID) == "" {
+					attemptReq.Provider.ID = cur.ProviderID
+				}
 				attemptReq.APIKey = apiKey
 				if cur.ModelID != "" {
 					attemptReq.Model = cur.ModelID
@@ -480,6 +483,8 @@ func (r *Router) runSingleAttempt(
 		return false, false, sErr
 	}
 
+	resolvedProviderID := strings.TrimSpace(attemptReq.Provider.ID)
+
 	for ev := range upstream {
 		if ev.Attempt == 0 {
 			ev.Attempt = attemptNum
@@ -494,6 +499,12 @@ func (r *Router) runSingleAttempt(
 				return emittedPartial, false, context.Canceled
 			}
 		case StreamDone:
+			if ev.ProviderID == "" {
+				ev.ProviderID = resolvedProviderID
+			}
+			if ev.ModelID == "" {
+				ev.ModelID = strings.TrimSpace(attemptReq.Model)
+			}
 			if !emitEvent(parentCtx, out, ev) {
 				if parentCtx.Err() != nil {
 					return emittedPartial, false, parentCtx.Err()

@@ -88,7 +88,7 @@ func NormalizeSandboxMode(raw string) SandboxMode {
 
 // BuildProfile 生成 macOS Seatbelt SBPL 策略：
 // 放行基础系统库与工具链只读访问，封堵 AppleEvents 与钥匙串，严格将写权限收敛至规范化 wsRoot 与指定临时目录，
-// 并按需将出站 TCP 限制在本地 EgressProxy 监听端口。
+// 支持隔离 Git Worktree 读取父仓库 commondir 及受控写入自身 worktree gitdir，并在策略末尾显式封堵高危凭据与自执行配置写入。
 func (s *SeatbeltRunner) BuildProfile(wsRoot string, extraWriteDirs []string, mode SandboxMode, proxyPort int) string {
 	canonWs := canonicalizeExistingOrClean(wsRoot)
 	var canonVault string
@@ -98,6 +98,8 @@ func (s *SeatbeltRunner) BuildProfile(wsRoot string, extraWriteDirs []string, mo
 
 	homeDir, _ := os.UserHomeDir()
 	canonHome := canonicalizeExistingOrClean(homeDir)
+
+	worktreeGitDir, commonGitDir := resolveGitWorktreeDirs(canonWs, canonHome, canonVault)
 
 	var b strings.Builder
 	b.WriteString("(version 1)\n")
@@ -151,6 +153,12 @@ func (s *SeatbeltRunner) BuildProfile(wsRoot string, extraWriteDirs []string, mo
 	if canonWs != "" {
 		fmt.Fprintf(&b, "  (subpath %q)\n", escapeSBPL(canonWs))
 	}
+	if commonGitDir != "" {
+		fmt.Fprintf(&b, "  (subpath %q)\n", escapeSBPL(commonGitDir))
+	}
+	if worktreeGitDir != "" && (commonGitDir == "" || !isWithinOrEqualPath(worktreeGitDir, commonGitDir)) {
+		fmt.Fprintf(&b, "  (subpath %q)\n", escapeSBPL(worktreeGitDir))
+	}
 	b.WriteString(")\n")
 
 	// 显式封堵敏感目录读取（~/.gorness、~/.ssh、~/Library/Keychains）；
@@ -161,6 +169,9 @@ func (s *SeatbeltRunner) BuildProfile(wsRoot string, extraWriteDirs []string, mo
 		fmt.Fprintf(&b, "  (subpath %q)\n", escapeSBPL(filepath.Join(canonHome, "Library", "Keychains")))
 		fmt.Fprintf(&b, "  (subpath %q)\n", escapeSBPL(filepath.Join(canonHome, ".gorness")))
 		b.WriteString(")\n")
+		if canonVault == "" && canonWs != "" && isStrictlyWithinPath(canonWs, filepath.Join(canonHome, ".gorness", "runtime", "worktrees")) {
+			fmt.Fprintf(&b, "(allow file-read* (subpath %q))\n", escapeSBPL(canonWs))
+		}
 	}
 	if canonVault != "" {
 		fmt.Fprintf(&b, "(deny file-read* (subpath %q))\n", escapeSBPL(canonVault))
@@ -169,7 +180,7 @@ func (s *SeatbeltRunner) BuildProfile(wsRoot string, extraWriteDirs []string, mo
 		}
 	}
 
-	// 文件写权限：仅限 /dev 空设备、专用隔离临时目录与（非只读模式下）规范化工作区。
+	// 文件写权限：仅限 /dev 空设备、专用隔离临时目录与（非只读模式下）规范化工作区及隔离 worktree gitdir。
 	b.WriteString("(allow file-write*\n")
 	for _, devLit := range []string{
 		"/dev/null",
@@ -192,6 +203,9 @@ func (s *SeatbeltRunner) BuildProfile(wsRoot string, extraWriteDirs []string, mo
 	if mode != SandboxReadOnly && canonWs != "" {
 		fmt.Fprintf(&b, "  (subpath %q)\n", escapeSBPL(canonWs))
 	}
+	if mode != SandboxReadOnly && worktreeGitDir != "" {
+		fmt.Fprintf(&b, "  (subpath %q)\n", escapeSBPL(worktreeGitDir))
+	}
 	b.WriteString(")\n")
 
 	// 网络策略：network_allow 放行网络；strict/readonly 仅在启动本地 EgressProxy 时放行 127.0.0.1:<proxyPort>。
@@ -204,7 +218,129 @@ func (s *SeatbeltRunner) BuildProfile(wsRoot string, extraWriteDirs []string, mo
 		}
 	}
 
+	// 末尾显式写封堵规则（最高优先级覆盖任何宽泛目录写授权）：
+	// 无条件禁止写入 ~/.ssh、~/Library/Keychains、~/.gorness、canonVault（仅对 runtime/worktrees 下受管工作树恢复自身写权限），
+	// 并封死 <canonWs>/.gorness、.git/hooks、.git/config 以及父仓库 <commonGitDir>/hooks 与 <commonGitDir>/config。
+	if canonHome != "" {
+		b.WriteString("(deny file-write*\n")
+		fmt.Fprintf(&b, "  (subpath %q)\n", escapeSBPL(filepath.Join(canonHome, ".ssh")))
+		fmt.Fprintf(&b, "  (subpath %q)\n", escapeSBPL(filepath.Join(canonHome, "Library", "Keychains")))
+		fmt.Fprintf(&b, "  (subpath %q)\n", escapeSBPL(filepath.Join(canonHome, ".gorness")))
+		b.WriteString(")\n")
+		if canonVault == "" && mode != SandboxReadOnly && canonWs != "" &&
+			isStrictlyWithinPath(canonWs, filepath.Join(canonHome, ".gorness", "runtime", "worktrees")) {
+			fmt.Fprintf(&b, "(allow file-write* (subpath %q))\n", escapeSBPL(canonWs))
+		}
+	}
+	if canonVault != "" {
+		fmt.Fprintf(&b, "(deny file-write* (subpath %q))\n", escapeSBPL(canonVault))
+		if mode != SandboxReadOnly && canonWs != "" &&
+			isStrictlyWithinPath(canonWs, filepath.Join(canonVault, "runtime", "worktrees")) {
+			fmt.Fprintf(&b, "(allow file-write* (subpath %q))\n", escapeSBPL(canonWs))
+		}
+	}
+	if canonWs != "" {
+		b.WriteString("(deny file-write*\n")
+		fmt.Fprintf(&b, "  (subpath %q)\n", escapeSBPL(filepath.Join(canonWs, ".gorness")))
+		fmt.Fprintf(&b, "  (subpath %q)\n", escapeSBPL(filepath.Join(canonWs, ".git", "hooks")))
+		fmt.Fprintf(&b, "  (subpath %q)\n", escapeSBPL(filepath.Join(canonWs, ".git", "config")))
+		fmt.Fprintf(&b, "  (literal %q)\n", escapeSBPL(filepath.Join(canonWs, ".git", "config.lock")))
+		if worktreeGitDir != "" {
+			fmt.Fprintf(&b, "  (literal %q)\n", escapeSBPL(filepath.Join(canonWs, ".git")))
+			fmt.Fprintf(&b, "  (subpath %q)\n", escapeSBPL(filepath.Join(worktreeGitDir, "hooks")))
+			fmt.Fprintf(&b, "  (subpath %q)\n", escapeSBPL(filepath.Join(worktreeGitDir, "config")))
+			fmt.Fprintf(&b, "  (subpath %q)\n", escapeSBPL(filepath.Join(worktreeGitDir, "config.worktree")))
+		}
+		if commonGitDir != "" {
+			fmt.Fprintf(&b, "  (subpath %q)\n", escapeSBPL(filepath.Join(commonGitDir, "hooks")))
+			fmt.Fprintf(&b, "  (subpath %q)\n", escapeSBPL(filepath.Join(commonGitDir, "config")))
+			fmt.Fprintf(&b, "  (literal %q)\n", escapeSBPL(filepath.Join(commonGitDir, "config.lock")))
+		}
+		b.WriteString(")\n")
+	}
+
 	return b.String()
+}
+
+// resolveGitWorktreeDirs 检查 <canonWs>/.git 是否为指向父仓库 worktree 元数据的 gitdir 指针文件，
+// 安全解析出当前工作树专属 <worktreeGitDir> 与父级共享 <commonGitDir>。
+func resolveGitWorktreeDirs(canonWs, canonHome, canonVault string) (worktreeGitDir, commonGitDir string) {
+	if canonWs == "" {
+		return "", ""
+	}
+	dotGit := filepath.Join(canonWs, ".git")
+	st, err := os.Lstat(dotGit)
+	if err != nil || st.Mode()&os.ModeSymlink != 0 || !st.Mode().IsRegular() || st.Size() <= 0 || st.Size() > 8192 {
+		return "", ""
+	}
+	raw, err := os.ReadFile(dotGit)
+	if err != nil {
+		return "", ""
+	}
+	firstLine := strings.TrimSpace(strings.SplitN(string(raw), "\n", 2)[0])
+	if !strings.HasPrefix(firstLine, "gitdir:") {
+		return "", ""
+	}
+	rawGitDir := strings.TrimSpace(strings.TrimPrefix(firstLine, "gitdir:"))
+	if rawGitDir == "" {
+		return "", ""
+	}
+	if !filepath.IsAbs(rawGitDir) {
+		rawGitDir = filepath.Join(canonWs, rawGitDir)
+	}
+	wtDir := canonicalizeExistingOrClean(rawGitDir)
+	if wtDir == "" || wtDir == "/" {
+		return "", ""
+	}
+
+	cDir := ""
+	commonFile := filepath.Join(wtDir, "commondir")
+	if cst, cErr := os.Lstat(commonFile); cErr == nil && cst.Mode()&os.ModeSymlink == 0 && cst.Mode().IsRegular() && cst.Size() <= 8192 {
+		if cRaw, rErr := os.ReadFile(commonFile); rErr == nil {
+			relCommon := strings.TrimSpace(strings.SplitN(string(cRaw), "\n", 2)[0])
+			if relCommon != "" {
+				cand := relCommon
+				if !filepath.IsAbs(cand) {
+					cand = filepath.Join(wtDir, cand)
+				}
+				cDir = canonicalizeExistingOrClean(cand)
+			}
+		}
+	}
+	if cDir == "" && filepath.Base(filepath.Dir(wtDir)) == "worktrees" {
+		cDir = canonicalizeExistingOrClean(filepath.Dir(filepath.Dir(wtDir)))
+	}
+	if cDir == "" || cDir == "/" {
+		return "", ""
+	}
+	if !isStrictlyWithinPath(wtDir, filepath.Join(cDir, "worktrees")) {
+		return "", ""
+	}
+
+	isForbiddenGitMeta := func(target string) bool {
+		if target == "" || target == "/" || (canonHome != "" && target == canonHome) {
+			return true
+		}
+		if canonHome != "" {
+			for _, sens := range []string{
+				filepath.Join(canonHome, ".ssh"),
+				filepath.Join(canonHome, "Library", "Keychains"),
+				filepath.Join(canonHome, ".gorness"),
+			} {
+				if isWithinOrEqualPath(target, sens) || isWithinOrEqualPath(sens, target) {
+					return true
+				}
+			}
+		}
+		if canonVault != "" && (isWithinOrEqualPath(target, canonVault) || isWithinOrEqualPath(canonVault, target)) {
+			return true
+		}
+		return false
+	}
+	if isForbiddenGitMeta(wtDir) || isForbiddenGitMeta(cDir) {
+		return "", ""
+	}
+	return wtDir, cDir
 }
 
 type seatbeltRunParams struct {

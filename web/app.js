@@ -264,6 +264,7 @@ export const state = {
   liveStreamText: "",
   liveStreamTools: [],
   missionSSE: null,
+  missionSSEId: "",
   globalSSE: null
 };
 
@@ -323,7 +324,7 @@ function applyI18nInPlace() {
   renderTopologyCardsGrid();
 }
 
-function setCenterMode(mode) {
+export function setCenterMode(mode) {
   state.centerMode = mode;
   document.getElementById("mode-chat-btn")?.classList.toggle("active", mode === "chat");
   document.getElementById("mode-fleet-btn")?.classList.toggle("active", mode === "fleet");
@@ -332,6 +333,10 @@ function setCenterMode(mode) {
   if (mode === "fleet") {
     renderFleetMissionSelector();
     renderFleetStudio();
+    const snap = activeMissionSnapshot();
+    if (snap && snap.status === "running") {
+      subscribeToMissionStream(snap.id);
+    }
   }
 }
 
@@ -409,6 +414,10 @@ export async function loadBootstrap() {
   renderPreviewTabList();
   renderFleetMissionSelector();
   renderFleetStudio();
+  const bootMission = activeMissionSnapshot();
+  if (bootMission && bootMission.status === "running") {
+    subscribeToMissionStream(bootMission.id);
+  }
 
   if (state.activeWorkspaceId) {
     refreshWorkspaceContext(state.activeWorkspaceId);
@@ -1274,7 +1283,10 @@ export async function sendPromptOrSteer() {
   state.liveStreamText = "";
   state.liveStreamTools = [];
   renderLiveStreamCard();
-  if (state.activeSessionId) await loadSessionDetail(state.activeSessionId);
+  if (state.activeSessionId) {
+    await loadSessionDetail(state.activeSessionId);
+    state.sessionLoaded = true;
+  }
   await refreshActiveStatusQuietly();
 }
 
@@ -1519,14 +1531,19 @@ function renderFleetMissionSelector() {
 }
 
 function subscribeToMissionStream(missionId) {
+  if (state.missionSSE && state.missionSSEId === missionId && state.missionSSE.readyState !== 2) {
+    return;
+  }
   if (state.missionSSE) {
     state.missionSSE.close();
     state.missionSSE = null;
+    state.missionSSEId = "";
   }
-  if (!missionId) return;
+  if (!missionId || typeof EventSource === "undefined") return;
 
   const es = new EventSource(`/api/fleet/missions/${encodeURIComponent(missionId)}/stream`);
   state.missionSSE = es;
+  state.missionSSEId = missionId;
 
   const handleMissionEvent = (raw) => {
     let ev;
@@ -1554,7 +1571,10 @@ function subscribeToMissionStream(missionId) {
     }
     if (ev.type === "mission_completed" || ev.type === "mission_failed" || ev.type === "mission_cancelled") {
       es.close();
-      if (state.missionSSE === es) state.missionSSE = null;
+      if (state.missionSSE === es) {
+        state.missionSSE = null;
+        state.missionSSEId = "";
+      }
     }
   };
 
@@ -2539,6 +2559,10 @@ function bindWorkbenchEvents() {
       if (msnId) {
         state.activeMissionId = msnId;
         setCenterMode("fleet");
+        const snap = activeMissionSnapshot();
+        if (snap && snap.status === "running") {
+          subscribeToMissionStream(snap.id);
+        }
       }
       return;
     }

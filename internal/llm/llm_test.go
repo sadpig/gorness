@@ -1540,3 +1540,122 @@ func TestFixRound1FailClosedEmptySourceAndCancelDeterminism(t *testing.T) {
 		t.Fatalf("runSingleAttempt deadlocked sending StreamDone to full channel after parent ctx cancellation")
 	}
 }
+
+func TestCrossModelThinkingSignatureIsolationAndFallbackAnsweringModel(t *testing.T) {
+	t.Parallel()
+
+	history := []store.SessionEntry{
+		{
+			Seq:  1,
+			ID:   "u1",
+			Role: "user",
+			Blocks: []store.ContentBlock{
+				{Type: "text", Text: "Inspect repo"},
+			},
+		},
+		{
+			Seq:     2,
+			ID:      "a_gem",
+			Role:    "assistant",
+			ModelID: "gemini-2.5-pro",
+			Blocks: []store.ContentBlock{
+				{Type: "thinking", Thinking: "Gemini thought", Signature: "gem_thought_sig_1"},
+				{Type: "tool_use", ToolCallID: "call_g1", ToolName: "read_file", ToolInput: json.RawMessage(`{"path":"a.go"}`), Signature: "gem_fc_sig_1"},
+			},
+		},
+		{
+			Seq:  3,
+			ID:   "t_gem",
+			Role: "tool",
+			Blocks: []store.ContentBlock{
+				{Type: "tool_result", ToolCallID: "call_g1", ToolName: "read_file", Text: "package a"},
+			},
+		},
+		{
+			Seq:     4,
+			ID:      "a_claude",
+			Role:    "assistant",
+			ModelID: "claude-opus-5-5",
+			Blocks: []store.ContentBlock{
+				{Type: "thinking", Thinking: "Claude thought", Signature: "claude_sig_v1"},
+				{Type: "tool_use", ToolCallID: "call_c1", ToolName: "read_file", ToolInput: json.RawMessage(`{"path":"b.go"}`), Signature: "claude_foreign_tool_sig"},
+			},
+		},
+		{
+			Seq:  5,
+			ID:   "t_claude",
+			Role: "tool",
+			Blocks: []store.ContentBlock{
+				{Type: "tool_result", ToolCallID: "call_c1", ToolName: "read_file", Text: "package b"},
+			},
+		},
+	}
+
+	// 1. Anthropic with enableThinking=true MUST drop gemini-2.5-pro thinking blocks while keeping claude-opus-5-5 signed thinking!
+	antThinkOn := buildAnthropicMessages(history, true)
+	rawAntOn, _ := json.Marshal(antThinkOn)
+	if strings.Contains(string(rawAntOn), "gem_thought_sig_1") || strings.Contains(string(rawAntOn), "Gemini thought") {
+		t.Fatalf("buildAnthropicMessages(enableThinking=true) leaked foreign Gemini thinking/signature:\n%s", string(rawAntOn))
+	}
+	if !strings.Contains(string(rawAntOn), "claude_sig_v1") {
+		t.Fatalf("buildAnthropicMessages(enableThinking=true) dropped native Claude thinking signature:\n%s", string(rawAntOn))
+	}
+
+	// 2. Anthropic with enableThinking=false (e.g. Haiku) MUST omit ALL thinking blocks!
+	antThinkOff := buildAnthropicMessages(history, false)
+	rawAntOff, _ := json.Marshal(antThinkOff)
+	if strings.Contains(string(rawAntOff), `"type":"thinking"`) || strings.Contains(string(rawAntOff), "claude_sig_v1") {
+		t.Fatalf("buildAnthropicMessages(enableThinking=false) emitted thinking block:\n%s", string(rawAntOff))
+	}
+
+	// 3. Gemini MUST replay ThoughtSignature for gemini-2.5-pro (both thinking & tool_use) and strip Claude signatures!
+	gemContents := buildGeminiContents(history)
+	rawGem, _ := json.Marshal(gemContents)
+	if !strings.Contains(string(rawGem), "gem_thought_sig_1") || !strings.Contains(string(rawGem), "gem_fc_sig_1") {
+		t.Fatalf("buildGeminiContents dropped native Gemini thoughtSignature:\n%s", string(rawGem))
+	}
+	if strings.Contains(string(rawGem), "claude_sig_v1") || strings.Contains(string(rawGem), "claude_foreign_tool_sig") {
+		t.Fatalf("buildGeminiContents leaked foreign Claude signature into thoughtSignature:\n%s", string(rawGem))
+	}
+
+	// 4. Router.StreamWithRetry attaches the fallback route's ProviderID & ModelID on StreamDone!
+	vaultDir := filepath.Join(t.TempDir(), "vault")
+	mgr, err := config.NewManager(config.Options{
+		VaultRoot: vaultDir,
+		EnvLookup: func(k string) (string, bool) { return "test-key-" + k, true },
+	})
+	if err != nil {
+		t.Fatalf("NewManager: %v", err)
+	}
+	failoverStreamer := StreamerFunc(func(ctx context.Context, req Request) (<-chan StreamEvent, error) {
+		if req.Provider.ID == "anthropic" {
+			return nil, &APIError{ProviderID: "anthropic", StatusCode: 400, Message: "primary rejected", Retryable: false}
+		}
+		ch := make(chan StreamEvent, 2)
+		ch <- StreamEvent{Type: StreamTextDelta, Text: "Answered by fallback"}
+		ch <- StreamEvent{Type: StreamDone, StopReason: "completed", InputTokens: 100, OutputTokens: 50}
+		close(ch)
+		return ch, nil
+	})
+	router := NewRouter(mgr, mgr.Secrets(), failoverStreamer)
+	route, err := router.Resolve("coder", "", "", mgr.Current())
+	if err != nil {
+		t.Fatalf("Resolve coder: %v", err)
+	}
+	ch, err := router.StreamWithRetry(context.Background(), route, Request{
+		History: []store.SessionEntry{{Seq: 1, ID: "u1", Role: "user", Blocks: []store.ContentBlock{{Type: "text", Text: "hi"}}}},
+	})
+	if err != nil {
+		t.Fatalf("StreamWithRetry: %v", err)
+	}
+	var doneEv *StreamEvent
+	for ev := range ch {
+		if ev.Type == StreamDone {
+			cp := ev
+			doneEv = &cp
+		}
+	}
+	if doneEv == nil || doneEv.ProviderID != "openai" || doneEv.ModelID != "gpt-5.5" {
+		t.Fatalf("expected StreamDone to report fallback openai/gpt-5.5, got %#v", doneEv)
+	}
+}

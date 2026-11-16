@@ -1192,10 +1192,275 @@ await mod.sendPromptOrSteer();
 assert.match(mod.state.lastRunError, /502 authentication failure/, "state.lastRunError must capture run_failed message");
 assert.match(getEl("reload-diag-banner").textContent, /502 authentication failure/, "diag banner must retain run_failed message");
 assert.match(getEl("chat-history-entries").innerHTML, /502 authentication failure/, "timeline error card must retain run_failed message");
+
+// 5. Verify first auto-created session on a fresh workspace sets state.sessionLoaded = true after stream ends!
+mod.state.activeSessionId = "";
+mod.state.sessionLoaded = false;
+getEl("composer-input").value = "First prompt on empty workspace";
+await mod.sendPromptOrSteer();
+assert.ok(mod.state.activeSessionId, "auto-created session ID must be adopted");
+assert.equal(mod.state.sessionLoaded, true, "state.sessionLoaded must be set to true after first auto-created session stream completes");
+
+// 6. Verify Fleet Studio SSE auto-attach in loadBootstrap(), setCenterMode("fleet"), and [data-open-fleet-mission] when mission is running!
+const sseUrls = [];
+globalThis.EventSource = class MockEventSource {
+  constructor(url) {
+    this.url = url;
+    this.readyState = 1;
+    sseUrls.push(url);
+  }
+  addEventListener() {}
+  close() {
+    this.readyState = 2;
+  }
+};
+mod.state.missions = [{ id: "msn_live_99", workspace_id: mod.state.activeWorkspaceId, topology: "hybrid-fleet", goal: "Live mission", status: "running", nodes: [], edges: [] }];
+mod.state.activeMissionId = "msn_live_99";
+mod.setCenterMode("fleet");
+assert.equal(sseUrls.includes("/api/fleet/missions/msn_live_99/stream"), true, "setCenterMode('fleet') must auto-subscribe to running mission SSE");
+
+// Also verify loadBootstrap() auto-subscribes when server bootstrap returns a running mission!
+const origFetch2 = globalThis.fetch;
+globalThis.fetch = async (input, init = {}) => {
+  const resp = await origFetch2(input, init);
+  if (typeof input === "string" && input === "/api/bootstrap") {
+    const data = await resp.json();
+    data.missions = [{ id: "msn_boot_live_1", workspace_id: mod.state.activeWorkspaceId, topology: "hybrid-fleet", goal: "Boot live mission", status: "running", nodes: [], edges: [] }];
+    return new Response(JSON.stringify(data), { status: 200, headers: { "Content-Type": "application/json" } });
+  }
+  return resp;
+};
+mod.state.activeMissionId = "";
+if (mod.state.missionSSE) { mod.state.missionSSE.close(); mod.state.missionSSE = null; mod.state.missionSSEId = ""; }
+await mod.loadBootstrap();
+assert.equal(sseUrls.includes("/api/fleet/missions/msn_boot_live_1/stream"), true, "loadBootstrap() must auto-subscribe when active mission is running");
 `, ts.URL, appJSPath, wantDraft, sess.ID, wantDraft)
 
 	cmd := exec.Command(nodeBin, "--input-type=module", "-e", nodeScript)
 	if out, err := cmd.CombinedOutput(); err != nil {
 		t.Fatalf("node workbench UI verification failed: %v\n%s", err, string(out))
+	}
+}
+
+func TestConfigMatrixPatchPreservationSkillFilesAndSessionRunLockGuards(t *testing.T) {
+	blockCh := make(chan struct{})
+	startedRunCh := make(chan struct{})
+	var startOnce sync.Once
+
+	blockingStreamer := llm.StreamerFunc(func(ctx context.Context, req llm.Request) (<-chan llm.StreamEvent, error) {
+		var lastText string
+		if len(req.History) > 0 {
+			for _, b := range req.History[len(req.History)-1].Blocks {
+				if b.Text != "" {
+					lastText = b.Text
+				}
+			}
+		}
+		if strings.Contains(lastText, "HOLD_SESSION_RUN_LOCK") {
+			startOnce.Do(func() { close(startedRunCh) })
+			select {
+			case <-blockCh:
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			}
+		}
+		ch := make(chan llm.StreamEvent, 2)
+		ch <- llm.StreamEvent{Type: llm.StreamTextDelta, Text: "done"}
+		ch <- llm.StreamEvent{Type: llm.StreamDone, StopReason: "end_turn"}
+		close(ch)
+		return ch, nil
+	})
+
+	srv, vaultDir, cleanup := newTestStack(t, blockingStreamer, nil)
+	defer cleanup()
+
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+	client := ts.Client()
+
+	// 1. Studio Agent-Model Matrix save MUST preserve read_only, allowed_tools (including empty [] on utility!), disallowed_tools, fallbacks, description, name!
+	postJSON := func(method, path string, body any) (int, []byte) {
+		t.Helper()
+		var rdr io.Reader
+		if body != nil {
+			raw, _ := json.Marshal(body)
+			rdr = bytes.NewReader(raw)
+		}
+		req, err := http.NewRequest(method, ts.URL+path, rdr)
+		if err != nil {
+			t.Fatalf("NewRequest %s %s: %v", method, path, err)
+		}
+		req.Header.Set("Origin", ts.URL)
+		if body != nil {
+			req.Header.Set("Content-Type", "application/json")
+		}
+		resp, err := client.Do(req)
+		if err != nil {
+			t.Fatalf("Do %s %s: %v", method, path, err)
+		}
+		defer resp.Body.Close()
+		out, _ := io.ReadAll(resp.Body)
+		return resp.StatusCode, out
+	}
+
+	// Matrix save on verifier (omits read_only, allowed_tools, fallbacks)
+	if st, raw := postJSON(http.MethodPost, "/api/config/agents", map[string]any{
+		"id":       "verifier",
+		"provider": "anthropic",
+		"model":    "claude-opus-5-5",
+		"effort":   "max",
+	}); st != http.StatusOK {
+		t.Fatalf("upsert verifier status=%d: %s", st, string(raw))
+	}
+
+	// Matrix save on utility (omits read_only and empty allowed_tools = []!)
+	if st, raw := postJSON(http.MethodPost, "/api/config/agents", map[string]any{
+		"id":       "utility",
+		"provider": "anthropic",
+		"model":    "claude-sonnet-5-5",
+		"effort":   "low",
+	}); st != http.StatusOK {
+		t.Fatalf("upsert utility status=%d: %s", st, string(raw))
+	}
+
+	// Reload from disk via fresh config.Manager to verify exact persisted TOML frontmatter!
+	reloadedMgr, err := config.NewManager(config.Options{VaultRoot: vaultDir})
+	if err != nil {
+		t.Fatalf("reload config.Manager: %v", err)
+	}
+	verProf := reloadedMgr.Current().Agents["verifier"]
+	if !verProf.ReadOnly || len(verProf.AllowedTools) != 3 || len(verProf.Fallbacks) != 2 || verProf.Model != "claude-opus-5-5" || verProf.Effort != "max" {
+		t.Fatalf("verifier fields wiped by matrix save: %+v", verProf)
+	}
+	utilProf := reloadedMgr.Current().Agents["utility"]
+	if !utilProf.ReadOnly || utilProf.AllowedTools == nil || len(utilProf.AllowedTools) != 0 || utilProf.Model != "claude-sonnet-5-5" {
+		t.Fatalf("utility read_only or empty allowed_tools=[] wiped by matrix save: %#v", utilProf)
+	}
+
+	// Provider partial patch preservation + concurrent configMu race check
+	if st, raw := postJSON(http.MethodPost, "/api/config/providers", map[string]any{
+		"id":          "matrix_gw",
+		"name":        "Matrix Gateway",
+		"protocol":    "openai-compat",
+		"base_url":    "http://127.0.0.1:18100/v1",
+		"api_key":     "sk-real-matrix-secret",
+		"timeout_sec": 95,
+		"headers":     map[string]string{"X-Team": "core", "Authorization": "Bearer secret-tok"},
+		"models":      map[string]any{"m-alpha": map[string]any{"name": "Alpha"}},
+	}); st != http.StatusOK {
+		t.Fatalf("seed matrix_gw status=%d: %s", st, string(raw))
+	}
+	if st, raw := postJSON(http.MethodPost, "/api/config/providers", map[string]any{
+		"id":       "matrix_gw",
+		"base_url": "http://127.0.0.1:18200/v1",
+		"api_key":  "[REDACTED]",
+	}); st != http.StatusOK {
+		t.Fatalf("patch matrix_gw status=%d: %s", st, string(raw))
+	}
+	if _, err := reloadedMgr.Reload(); err != nil {
+		t.Fatalf("Reload after provider patch: %v", err)
+	}
+	gw := reloadedMgr.Current().Providers["matrix_gw"]
+	if gw.BaseURL != "http://127.0.0.1:18200/v1" || gw.APIKeyRef != "sk-real-matrix-secret" || gw.TimeoutSec != 95 || gw.Headers["X-Team"] != "core" || len(gw.Models) != 1 {
+		t.Fatalf("provider patch wiped existing fields: %+v", gw)
+	}
+
+	var cfgWG sync.WaitGroup
+	for i := 0; i < 6; i++ {
+		cfgWG.Add(1)
+		go func(idx int) {
+			defer cfgWG.Done()
+			ef := "high"
+			if idx%2 == 0 {
+				ef = "medium"
+			}
+			st, _ := postJSON(http.MethodPost, "/api/config/agents", map[string]any{
+				"id":     "coder",
+				"effort": ef,
+			})
+			if st != http.StatusOK {
+				t.Errorf("concurrent agent patch failed with status %d", st)
+			}
+		}(i)
+	}
+	cfgWG.Wait()
+
+	// 2. skills/*/SKILL.md and skills/_candidates/*/SKILL.md in Vault Editor list & GET/PUT /api/config/files!
+	userSkillPath := filepath.Join(vaultDir, "skills", "go-audit", "SKILL.md")
+	candSkillPath := filepath.Join(vaultDir, "skills", "_candidates", "dream-audit", "SKILL.md")
+	for _, sp := range []string{userSkillPath, candSkillPath} {
+		if err := store.AtomicWriteFile(sp, []byte("---\nname: audit\ndescription: Audit skill\n---\n# Body\n"), 0o600); err != nil {
+			t.Fatalf("write %s: %v", sp, err)
+		}
+	}
+	stCfg, rawCfg := postJSON(http.MethodGet, "/api/config/files", nil)
+	if stCfg != http.StatusOK || !strings.Contains(string(rawCfg), "skills/go-audit/SKILL.md") || !strings.Contains(string(rawCfg), "skills/_candidates/dream-audit/SKILL.md") {
+		t.Fatalf("expected skills/*/SKILL.md and skills/_candidates/*/SKILL.md in /api/config/files, got (%d): %s", stCfg, string(rawCfg))
+	}
+	if stPut, rawPut := postJSON(http.MethodPut, "/api/config/files", map[string]string{
+		"rel_path": "skills/_candidates/dream-audit/SKILL.md",
+		"content":  "---\nname: dream-audit\ndescription: Updated candidate skill\n---\n# Updated\n",
+	}); stPut != http.StatusOK {
+		t.Fatalf("PUT candidate SKILL.md failed (%d): %s", stPut, string(rawPut))
+	}
+
+	// 3. Rewind & Delete session MUST enforce RunLockPath (409 Conflict during active run) & clean up isolated WorktreePath on delete!
+	repoDir := filepath.Join(t.TempDir(), "lock-repo")
+	initTempGitRepo(t, repoDir)
+	_, wsRaw := postJSON(http.MethodPost, "/api/workspaces", map[string]string{"path": repoDir, "name": "LockRepo"})
+	var wsCreated struct {
+		ID string `json:"id"`
+	}
+	_ = json.Unmarshal(wsRaw, &wsCreated)
+
+	stSess, sessRaw := postJSON(http.MethodPost, "/api/sessions", map[string]any{
+		"workspace_id": wsCreated.ID,
+		"title":        "Isolated Busy Session",
+		"agent_role":   "coder",
+		"isolate_git":  true,
+	})
+	if stSess != http.StatusCreated {
+		t.Fatalf("create isolated session status=%d: %s", stSess, string(sessRaw))
+	}
+	var createdMeta store.SessionMeta
+	_ = json.Unmarshal(sessRaw, &createdMeta)
+	if createdMeta.WorktreePath == "" {
+		t.Fatalf("expected non-empty WorktreePath on isolate_git session: %+v", createdMeta)
+	}
+	if _, err := os.Stat(createdMeta.WorktreePath); err != nil {
+		t.Fatalf("expected isolated worktree directory on disk: %v", err)
+	}
+
+	runDone := make(chan struct{})
+	go func() {
+		defer close(runDone)
+		_, _ = postJSON(http.MethodPost, "/api/runs/stream", map[string]any{
+			"workspace_id": wsCreated.ID,
+			"session_id":   createdMeta.ID,
+			"prompt":       "HOLD_SESSION_RUN_LOCK",
+		})
+	}()
+
+	select {
+	case <-startedRunCh:
+	case <-time.After(4 * time.Second):
+		t.Fatal("timed out waiting for active run to acquire session lock")
+	}
+
+	if stRew, _ := postJSON(http.MethodPost, "/api/sessions/"+createdMeta.ID+"/rewind", map[string]any{"to_seq": 0}); stRew != http.StatusConflict {
+		t.Fatalf("expected 409 Conflict on rewind during active run, got %d", stRew)
+	}
+	if stDel, _ := postJSON(http.MethodDelete, "/api/sessions/"+createdMeta.ID, nil); stDel != http.StatusConflict {
+		t.Fatalf("expected 409 Conflict on delete during active run, got %d", stDel)
+	}
+
+	close(blockCh)
+	<-runDone
+
+	if stDelOK, rawDelOK := postJSON(http.MethodDelete, "/api/sessions/"+createdMeta.ID, nil); stDelOK != http.StatusOK {
+		t.Fatalf("expected 200 OK deleting idle session, got %d: %s", stDelOK, string(rawDelOK))
+	}
+	if _, err := os.Stat(createdMeta.WorktreePath); !os.IsNotExist(err) {
+		t.Fatalf("expected isolated session WorktreePath %s removed on delete, stat err=%v", createdMeta.WorktreePath, err)
 	}
 }

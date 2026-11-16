@@ -15,6 +15,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -53,6 +54,7 @@ type Server struct {
 	heartbeatInterval time.Duration
 	version           string
 
+	configMu sync.Mutex
 	lastDiag atomic.Pointer[config.ReloadDiagnostic]
 
 	bgCtx    context.Context
@@ -395,6 +397,9 @@ func (s *Server) handleUpdateGlobalConfig(w http.ResponseWriter, r *http.Request
 		return
 	}
 
+	s.configMu.Lock()
+	defer s.configMu.Unlock()
+
 	cur := s.cfg.Current().Global
 	if v, ok := patch["theme"].(string); ok && strings.TrimSpace(v) != "" {
 		cur.Theme = strings.TrimSpace(v)
@@ -448,24 +453,35 @@ func (s *Server) handleUpdateGlobalConfig(w http.ResponseWriter, r *http.Request
 	writeJSON(w, http.StatusOK, sanitizeConfigSnapshot(snap))
 }
 
+type providerPatchInput struct {
+	ID         string                       `json:"id"`
+	Name       *string                      `json:"name"`
+	Protocol   *string                      `json:"protocol"`
+	BaseURL    *string                      `json:"base_url"`
+	APIKeyRef  *string                      `json:"api_key"`
+	Headers    *map[string]string           `json:"headers"`
+	TimeoutSec *int                         `json:"timeout_sec"`
+	Models     *map[string]config.ModelSpec `json:"models"`
+}
+
 func (s *Server) handleUpsertProvider(w http.ResponseWriter, r *http.Request) {
 	if s.cfg == nil {
 		writeJSONError(w, http.StatusServiceUnavailable, "config manager unavailable")
 		return
 	}
-	var in config.ProviderConfig
-	if err := decodeJSONBody(r, &in); err != nil {
+	var patch providerPatchInput
+	if err := decodeJSONBody(r, &patch); err != nil {
 		writeJSONError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	provID := strings.TrimSpace(in.ID)
+	provID := strings.TrimSpace(patch.ID)
 	if err := fleet.ValidateID(provID); err != nil {
 		writeJSONError(w, http.StatusBadRequest, fmt.Sprintf("invalid provider id: %v", err))
 		return
 	}
-	if strings.TrimSpace(in.Protocol) == "" {
-		in.Protocol = "openai-compat"
-	}
+
+	s.configMu.Lock()
+	defer s.configMu.Unlock()
 
 	var doc struct {
 		Providers map[string]config.ProviderConfig `toml:"providers"`
@@ -477,16 +493,84 @@ func (s *Server) handleUpsertProvider(w http.ResponseWriter, r *http.Request) {
 		doc.Providers = make(map[string]config.ProviderConfig)
 	}
 
-	if existing, has := doc.Providers[provID]; has {
-		if strings.TrimSpace(in.APIKeyRef) == "" || strings.TrimSpace(in.APIKeyRef) == "[REDACTED]" {
-			in.APIKeyRef = existing.APIKeyRef
+	var merged config.ProviderConfig
+	existing, hasExisting := doc.Providers[provID]
+	if hasExisting {
+		merged = existing
+		if existing.Headers != nil {
+			merged.Headers = make(map[string]string, len(existing.Headers))
+			for hk, hv := range existing.Headers {
+				merged.Headers[hk] = hv
+			}
 		}
-		if in.Models == nil && existing.Models != nil {
-			in.Models = existing.Models
+		if existing.Models != nil {
+			merged.Models = make(map[string]config.ModelSpec, len(existing.Models))
+			for mk, mv := range existing.Models {
+				merged.Models[mk] = mv
+			}
 		}
 	}
-	in.ID = provID
-	doc.Providers[provID] = in
+	merged.ID = provID
+
+	if patch.Name != nil && strings.TrimSpace(*patch.Name) != "" {
+		merged.Name = strings.TrimSpace(*patch.Name)
+	}
+	if strings.TrimSpace(merged.Name) == "" {
+		merged.Name = provID
+	}
+	if patch.Protocol != nil && strings.TrimSpace(*patch.Protocol) != "" {
+		merged.Protocol = strings.TrimSpace(*patch.Protocol)
+	}
+	if strings.TrimSpace(merged.Protocol) == "" {
+		merged.Protocol = "openai-compat"
+	}
+	if patch.BaseURL != nil && strings.TrimSpace(*patch.BaseURL) != "" {
+		merged.BaseURL = strings.TrimSpace(*patch.BaseURL)
+	}
+	if patch.APIKeyRef != nil {
+		ref := strings.TrimSpace(*patch.APIKeyRef)
+		if ref != "" && ref != "[REDACTED]" {
+			merged.APIKeyRef = ref
+		}
+	}
+	if patch.Headers != nil {
+		if len(*patch.Headers) == 0 {
+			merged.Headers = nil
+		} else {
+			if merged.Headers == nil {
+				merged.Headers = make(map[string]string, len(*patch.Headers))
+			}
+			for hk, hv := range *patch.Headers {
+				if hasExisting && strings.TrimSpace(hv) == "[REDACTED]" {
+					if prev, ok := existing.Headers[hk]; ok {
+						merged.Headers[hk] = prev
+						continue
+					}
+				}
+				merged.Headers[hk] = hv
+			}
+		}
+	}
+	if patch.TimeoutSec != nil && *patch.TimeoutSec > 0 {
+		merged.TimeoutSec = *patch.TimeoutSec
+	}
+	if patch.Models != nil {
+		if len(*patch.Models) == 0 {
+			merged.Models = map[string]config.ModelSpec{}
+		} else {
+			if merged.Models == nil {
+				merged.Models = make(map[string]config.ModelSpec, len(*patch.Models))
+			}
+			for mk, mv := range *patch.Models {
+				if mv.ID == "" {
+					mv.ID = mk
+				}
+				merged.Models[mk] = mv
+			}
+		}
+	}
+
+	doc.Providers[provID] = merged
 
 	encoded, err := toml.Marshal(doc)
 	if err != nil {
@@ -506,44 +590,135 @@ func (s *Server) handleUpsertProvider(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, sanitizeConfigSnapshot(snap))
 }
 
+type agentPatchInput struct {
+	ID              string    `json:"id"`
+	Name            *string   `json:"name"`
+	Description     *string   `json:"description"`
+	Provider        *string   `json:"provider"`
+	Model           *string   `json:"model"`
+	Effort          *string   `json:"effort"`
+	Fallbacks       *[]string `json:"fallbacks"`
+	AllowedTools    *[]string `json:"allowed_tools"`
+	DisallowedTools *[]string `json:"disallowed_tools"`
+	ReadOnly        *bool     `json:"read_only"`
+	APIKeyRef       *string   `json:"api_key"`
+	SystemPrompt    *string   `json:"system_prompt"`
+}
+
+type agentFrontmatterDoc struct {
+	ID              string    `toml:"id"`
+	Name            string    `toml:"name,omitempty"`
+	Description     string    `toml:"description,omitempty"`
+	Provider        string    `toml:"provider"`
+	Model           string    `toml:"model"`
+	Effort          string    `toml:"effort,omitempty"`
+	Fallbacks       *[]string `toml:"fallbacks"`
+	AllowedTools    *[]string `toml:"allowed_tools"`
+	DisallowedTools *[]string `toml:"disallowed_tools"`
+	ReadOnly        bool      `toml:"read_only,omitempty"`
+	APIKeyRef       string    `toml:"api_key,omitempty"`
+}
+
 func (s *Server) handleUpsertAgent(w http.ResponseWriter, r *http.Request) {
 	if s.cfg == nil {
 		writeJSONError(w, http.StatusServiceUnavailable, "config manager unavailable")
 		return
 	}
-	var in config.AgentProfile
-	if err := decodeJSONBody(r, &in); err != nil {
+	var patch agentPatchInput
+	if err := decodeJSONBody(r, &patch); err != nil {
 		writeJSONError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	agentID := strings.TrimSpace(in.ID)
+	agentID := strings.TrimSpace(patch.ID)
 	if err := fleet.ValidateID(agentID); err != nil {
 		writeJSONError(w, http.StatusBadRequest, fmt.Sprintf("invalid agent id: %v", err))
 		return
 	}
-	in.ID = agentID
-	if strings.TrimSpace(in.Name) == "" {
-		in.Name = agentID
-	}
-	if existing, ok := s.cfg.Current().Agents[agentID]; ok {
-		if strings.TrimSpace(in.SystemPrompt) == "" {
-			in.SystemPrompt = existing.SystemPrompt
-		}
-		if strings.TrimSpace(in.Provider) == "" {
-			in.Provider = existing.Provider
-		}
-		if strings.TrimSpace(in.Model) == "" {
-			in.Model = existing.Model
-		}
-		if strings.TrimSpace(in.Effort) == "" {
-			in.Effort = existing.Effort
+
+	s.configMu.Lock()
+	defer s.configMu.Unlock()
+
+	var merged config.AgentProfile
+	if snap := s.cfg.Current().Clone(); snap != nil {
+		if existing, ok := snap.Agents[agentID]; ok {
+			merged = existing
 		}
 	}
-	if strings.TrimSpace(in.SystemPrompt) == "" {
-		in.SystemPrompt = fmt.Sprintf("You are the %s agent in Gorness.", in.Name)
+	merged.ID = agentID
+
+	if patch.Name != nil && strings.TrimSpace(*patch.Name) != "" {
+		merged.Name = strings.TrimSpace(*patch.Name)
+	}
+	if strings.TrimSpace(merged.Name) == "" {
+		merged.Name = agentID
+	}
+	if patch.Description != nil {
+		merged.Description = strings.TrimSpace(*patch.Description)
+	}
+	if patch.Provider != nil && strings.TrimSpace(*patch.Provider) != "" {
+		merged.Provider = strings.TrimSpace(*patch.Provider)
+	}
+	if patch.Model != nil && strings.TrimSpace(*patch.Model) != "" {
+		merged.Model = strings.TrimSpace(*patch.Model)
+	}
+	if patch.Effort != nil && strings.TrimSpace(*patch.Effort) != "" {
+		merged.Effort = strings.TrimSpace(*patch.Effort)
+	}
+	if patch.Fallbacks != nil {
+		cp := make([]string, len(*patch.Fallbacks))
+		copy(cp, *patch.Fallbacks)
+		merged.Fallbacks = cp
+	}
+	if patch.AllowedTools != nil {
+		cp := make([]string, len(*patch.AllowedTools))
+		copy(cp, *patch.AllowedTools)
+		merged.AllowedTools = cp
+	}
+	if patch.DisallowedTools != nil {
+		cp := make([]string, len(*patch.DisallowedTools))
+		copy(cp, *patch.DisallowedTools)
+		merged.DisallowedTools = cp
+	}
+	if patch.ReadOnly != nil {
+		merged.ReadOnly = *patch.ReadOnly
+	}
+	if patch.APIKeyRef != nil {
+		ref := strings.TrimSpace(*patch.APIKeyRef)
+		if ref != "[REDACTED]" {
+			merged.APIKeyRef = ref
+		}
+	}
+	if patch.SystemPrompt != nil && strings.TrimSpace(*patch.SystemPrompt) != "" {
+		merged.SystemPrompt = strings.TrimSpace(*patch.SystemPrompt)
+	}
+	if strings.TrimSpace(merged.SystemPrompt) == "" {
+		merged.SystemPrompt = fmt.Sprintf("You are the %s agent in Gorness.", merged.Name)
 	}
 
-	fmBytes, err := toml.Marshal(in)
+	fmDoc := agentFrontmatterDoc{
+		ID:          merged.ID,
+		Name:        merged.Name,
+		Description: merged.Description,
+		Provider:    merged.Provider,
+		Model:       merged.Model,
+		Effort:      merged.Effort,
+		ReadOnly:    merged.ReadOnly,
+		APIKeyRef:   merged.APIKeyRef,
+	}
+	if merged.Fallbacks != nil {
+		fb := append([]string{}, merged.Fallbacks...)
+		fmDoc.Fallbacks = &fb
+	}
+	if merged.AllowedTools != nil {
+		at := append([]string{}, merged.AllowedTools...)
+		fmDoc.AllowedTools = &at
+	}
+	if merged.DisallowedTools != nil {
+		dt := append([]string{}, merged.DisallowedTools...)
+		fmDoc.DisallowedTools = &dt
+	}
+
+	fmBytes, err := toml.Marshal(fmDoc)
 	if err != nil {
 		writeJSONError(w, http.StatusBadRequest, fmt.Sprintf("marshal agent frontmatter: %v", err))
 		return
@@ -552,7 +727,7 @@ func (s *Server) handleUpsertAgent(w http.ResponseWriter, r *http.Request) {
 	doc.WriteString("+++\n")
 	doc.Write(bytes.TrimRight(fmBytes, "\n"))
 	doc.WriteString("\n+++\n")
-	doc.WriteString(strings.TrimSpace(in.SystemPrompt))
+	doc.WriteString(strings.TrimSpace(merged.SystemPrompt))
 	doc.WriteByte('\n')
 
 	targetPath := filepath.Join(s.cfg.Paths().AgentsDir(), agentID+".md")
@@ -588,6 +763,10 @@ func (s *Server) handleUpsertWorkflow(w http.ResponseWriter, r *http.Request) {
 		writeJSONError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+
+	s.configMu.Lock()
+	defer s.configMu.Unlock()
+
 	in.ID = wfID
 	if strings.TrimSpace(in.Name) == "" {
 		in.Name = wfID
@@ -691,6 +870,9 @@ func (s *Server) handleSaveConfigFile(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	s.configMu.Lock()
+	defer s.configMu.Unlock()
+
 	if err := store.AtomicWriteFile(absPath, rawBytes, 0o600); err != nil {
 		writeJSONError(w, http.StatusInternalServerError, err.Error())
 		return
@@ -728,17 +910,41 @@ func (s *Server) listVaultConfigRelPaths() []string {
 		}
 		var names []string
 		for _, ent := range entries {
-			if !ent.IsDir() && strings.HasSuffix(ent.Name(), ext) {
+			if !ent.IsDir() && ent.Type()&os.ModeSymlink == 0 && strings.HasSuffix(ent.Name(), ext) {
 				names = append(names, filepath.ToSlash(filepath.Join(subDir, ent.Name())))
 			}
 		}
 		sort.Strings(names)
 		out = append(out, names...)
 	}
+	appendSkillDirs := func(subDir string) {
+		entries, err := os.ReadDir(filepath.Join(paths.Root, subDir))
+		if err != nil {
+			return
+		}
+		var names []string
+		for _, ent := range entries {
+			if !ent.IsDir() || ent.Type()&os.ModeSymlink != 0 || ent.Name() == "_candidates" {
+				continue
+			}
+			if fleet.ValidateID(ent.Name()) != nil {
+				continue
+			}
+			skillMD := filepath.Join(paths.Root, subDir, ent.Name(), "SKILL.md")
+			if st, sErr := os.Lstat(skillMD); sErr == nil && st.Mode()&os.ModeSymlink == 0 && st.Mode().IsRegular() {
+				names = append(names, filepath.ToSlash(filepath.Join(subDir, ent.Name(), "SKILL.md")))
+			}
+		}
+		sort.Strings(names)
+		out = append(out, names...)
+	}
+
 	appendDir("agents", ".md")
 	appendDir("workflows", ".toml")
 	appendDir("memory", ".md")
 	appendDir(filepath.Join("memory", "notes"), ".md")
+	appendSkillDirs("skills")
+	appendSkillDirs(filepath.Join("skills", "_candidates"))
 	return out
 }
 
@@ -766,12 +972,23 @@ func (s *Server) resolveEditableVaultFile(rel string) (absPath, normRel string, 
 			allowed = true
 		} else if len(parts) == 3 && parts[0] == "memory" && parts[1] == "notes" && ext == ".md" && fleet.ValidateID(strings.TrimSuffix(parts[2], ".md")) == nil {
 			allowed = true
-		} else if len(parts) == 3 && parts[0] == "skills" && parts[2] == "SKILL.md" && fleet.ValidateID(parts[1]) == nil {
+		} else if len(parts) == 3 && parts[0] == "skills" && parts[1] != "_candidates" && parts[2] == "SKILL.md" && fleet.ValidateID(parts[1]) == nil {
+			allowed = true
+		} else if len(parts) == 4 && parts[0] == "skills" && parts[1] == "_candidates" && parts[3] == "SKILL.md" && fleet.ValidateID(parts[2]) == nil {
 			allowed = true
 		}
 	}
 	if !allowed {
 		return "", "", fmt.Errorf("path %q is not an editable ~/.gorness configuration file", cleaned)
+	}
+
+	cur := s.cfg.Paths().Root
+	segs := strings.Split(cleaned, "/")
+	for i := 0; i < len(segs)-1; i++ {
+		cur = filepath.Join(cur, segs[i])
+		if dirSt, lErr := os.Lstat(cur); lErr == nil && (dirSt.Mode()&os.ModeSymlink != 0 || !dirSt.IsDir()) {
+			return "", "", errors.New("refusing to traverse symlink or non-directory in vault")
+		}
 	}
 
 	full := filepath.Join(s.cfg.Paths().Root, filepath.FromSlash(cleaned))
@@ -1229,11 +1446,76 @@ func (s *Server) handleUpdateSession(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleDeleteSession(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
+	meta, err := s.engine.Sessions().GetMeta(id)
+	if err != nil {
+		writeJSONError(w, http.StatusNotFound, err.Error())
+		return
+	}
+	unlock, locked, err := store.TryFlock(s.engine.Sessions().RunLockPath(id))
+	if err != nil {
+		writeJSONError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	if !locked {
+		writeJSONError(w, http.StatusConflict, core.ErrSessionBusy.Error())
+		return
+	}
+	defer unlock()
+
+	if curMeta, gErr := s.engine.Sessions().GetMeta(id); gErr == nil && curMeta != nil {
+		meta = curMeta
+	}
+	s.cleanupDeletedSessionWorktree(r.Context(), meta)
+
 	if err := s.engine.Sessions().Delete(id); err != nil {
 		writeJSONError(w, http.StatusNotFound, err.Error())
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"deleted": id})
+}
+
+func (s *Server) cleanupDeletedSessionWorktree(ctx context.Context, meta *store.SessionMeta) {
+	if meta == nil || s.cfg == nil {
+		return
+	}
+	wtPath := strings.TrimSpace(meta.WorktreePath)
+	if wtPath == "" {
+		return
+	}
+	wtRoot := filepath.Clean(s.cfg.Paths().WorktreesDir())
+	if resolvedRoot, err := filepath.EvalSymlinks(wtRoot); err == nil {
+		wtRoot = filepath.Clean(resolvedRoot)
+	}
+	canonWT := filepath.Clean(wtPath)
+	if resolvedWT, err := filepath.EvalSymlinks(wtPath); err == nil {
+		canonWT = filepath.Clean(resolvedWT)
+	}
+	if !strings.HasPrefix(canonWT, wtRoot+string(filepath.Separator)) {
+		return
+	}
+
+	var repoRoot string
+	if s.engine != nil && meta.WorkspaceID != "" {
+		if ws, err := s.engine.Workspaces().Get(meta.WorkspaceID); err == nil && ws != nil {
+			repoRoot = ws.RootPath
+		}
+	}
+
+	pool := fleet.NewWorktreePool(s.cfg.Paths())
+	if rel, err := filepath.Rel(wtRoot, canonWT); err == nil {
+		segs := strings.Split(filepath.ToSlash(rel), "/")
+		if len(segs) == 2 && fleet.ValidateID(segs[0]) == nil && fleet.ValidateID(segs[1]) == nil {
+			_ = pool.Release(ctx, &fleet.WorktreeLease{
+				MissionID: segs[0],
+				NodeID:    segs[1],
+				RepoRoot:  repoRoot,
+				Path:      canonWT,
+				Branch:    fmt.Sprintf("gorness/fleet/%s/%s", segs[0], segs[1]),
+			}, segs[0] == "sessions")
+			return
+		}
+	}
+	_ = os.RemoveAll(canonWT)
 }
 
 func (s *Server) handleForkSession(w http.ResponseWriter, r *http.Request) {
@@ -1263,8 +1545,7 @@ func (s *Server) handleForkSession(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleRewindSession(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
-	meta, err := s.engine.Sessions().GetMeta(id)
-	if err != nil {
+	if _, err := s.engine.Sessions().GetMeta(id); err != nil {
 		writeJSONError(w, http.StatusNotFound, err.Error())
 		return
 	}
@@ -1274,6 +1555,23 @@ func (s *Server) handleRewindSession(w http.ResponseWriter, r *http.Request) {
 	}
 	if err := decodeJSONBody(r, &in); err != nil {
 		writeJSONError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	unlock, locked, err := store.TryFlock(s.engine.Sessions().RunLockPath(id))
+	if err != nil {
+		writeJSONError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	if !locked {
+		writeJSONError(w, http.StatusConflict, core.ErrSessionBusy.Error())
+		return
+	}
+	defer unlock()
+
+	meta, err := s.engine.Sessions().GetMeta(id)
+	if err != nil {
+		writeJSONError(w, http.StatusNotFound, err.Error())
 		return
 	}
 

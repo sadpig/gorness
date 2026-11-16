@@ -150,7 +150,7 @@ func (p *WorktreePool) CommitPending(ctx context.Context, wtPath, message string
 			if msg == "" {
 				msg = "chore(fleet): commit agent worktree changes"
 			}
-			if _, err := runGitWithIdentity(ctx, wtPath, "commit", "-m", msg); err != nil {
+			if _, err := runGitWithIdentity(ctx, wtPath, "commit", "--no-verify", "-m", msg); err != nil {
 				return false, "", fmt.Errorf("git commit in %s: %w", wtPath, err)
 			}
 			committed = true
@@ -390,7 +390,14 @@ func hasStagedChanges(ctx context.Context, wtPath string) (bool, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	cmd := exec.CommandContext(ctx, "git", "-C", wtPath, "diff", "--cached", "--quiet")
+	cmd := exec.CommandContext(
+		ctx,
+		"git",
+		"-c", "core.fsmonitor=false",
+		"-c", "core.hooksPath=/dev/null",
+		"-C", wtPath,
+		"diff", "--cached", "--quiet",
+	)
 	cmd.Env = cleanGitEnv()
 	err := cmd.Run()
 	if err == nil {
@@ -417,7 +424,8 @@ func runGitCmd(ctx context.Context, dir string, args ...string) (string, error) 
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	cmdArgs := make([]string, 0, len(args)+2)
+	cmdArgs := make([]string, 0, len(args)+6)
+	cmdArgs = append(cmdArgs, "-c", "core.fsmonitor=false", "-c", "core.hooksPath=/dev/null")
 	if strings.TrimSpace(dir) != "" {
 		cmdArgs = append(cmdArgs, "-C", dir)
 	}
@@ -440,14 +448,43 @@ func runGitCmd(ctx context.Context, dir string, args ...string) (string, error) 
 }
 
 func cleanGitEnv() []string {
+	allowKeys := map[string]bool{
+		"PATH":          true,
+		"HOME":          true,
+		"TMPDIR":        true,
+		"USER":          true,
+		"LOGNAME":       true,
+		"SHELL":         true,
+		"LANG":          true,
+		"LC_ALL":        true,
+		"LC_CTYPE":      true,
+		"TERM":          true,
+		"DEVELOPER_DIR": true,
+	}
 	var env []string
+	hasPath := false
+	hasTmp := false
 	for _, kv := range os.Environ() {
-		if strings.HasPrefix(kv, "GIT_DIR=") ||
-			strings.HasPrefix(kv, "GIT_WORK_TREE=") ||
-			strings.HasPrefix(kv, "GIT_INDEX_FILE=") {
+		eq := strings.IndexByte(kv, '=')
+		if eq <= 0 {
 			continue
 		}
-		env = append(env, kv)
+		k := kv[:eq]
+		if allowKeys[k] {
+			if k == "PATH" {
+				hasPath = true
+			}
+			if k == "TMPDIR" {
+				hasTmp = true
+			}
+			env = append(env, kv)
+		}
+	}
+	if !hasPath {
+		env = append(env, "PATH=/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin")
+	}
+	if !hasTmp {
+		env = append(env, "TMPDIR="+os.TempDir())
 	}
 	env = append(env, "GIT_TERMINAL_PROMPT=0", "GIT_EDITOR=true")
 	return env

@@ -1478,3 +1478,121 @@ func TestWorktreeDiffUntrackedSymlinkZeroByteAndBinarySafety(t *testing.T) {
 		t.Fatalf("expected binary notice for NUL-containing file icon.bin, got:\n%s", diffOut)
 	}
 }
+
+func TestWorktreePoolSeatbeltStrictGitStatusWriteDeniesAndHostGitSafety(t *testing.T) {
+	repoDir := initTestGitRepo(t)
+	markerDir := t.TempDir()
+	fsmonitorMarker := filepath.Join(markerDir, "fsmonitor_pwned")
+	hookMarker := filepath.Join(markerDir, "hook_pwned")
+
+	t.Setenv("ANTHROPIC_API_KEY", "sk-ant-host-env-secret-do-not-leak")
+	for _, kv := range cleanGitEnv() {
+		if strings.HasPrefix(kv, "ANTHROPIC_API_KEY=") {
+			t.Fatalf("cleanGitEnv leaked secret env var: %s", kv)
+		}
+	}
+
+	vaultDir := filepath.Join(t.TempDir(), "vault")
+	paths := config.VaultPaths{Root: vaultDir}
+	if err := os.MkdirAll(paths.Root, 0o700); err != nil {
+		t.Fatalf("mkdir vault: %v", err)
+	}
+	if err := os.WriteFile(paths.ProvidersFile(), []byte("api_key = \"secret\"\n"), 0o600); err != nil {
+		t.Fatalf("write providers.toml: %v", err)
+	}
+
+	pool := NewWorktreePool(paths)
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	lease, err := pool.Acquire(ctx, repoDir, "msn-sbx-wt", "coder_1", "main")
+	if err != nil {
+		t.Fatalf("WorktreePool.Acquire: %v", err)
+	}
+	defer func() { _ = pool.Release(ctx, lease, true) }()
+
+	// Plant malicious core.fsmonitor and pre-commit hook on host repo AFTER worktree acquire to verify host git hardening.
+	gitConfigPath := filepath.Join(repoDir, ".git", "config")
+	origCfg, err := os.ReadFile(gitConfigPath)
+	if err != nil {
+		t.Fatalf("read .git/config: %v", err)
+	}
+	maliciousCfg := string(origCfg) + fmt.Sprintf("\n[core]\n\tfsmonitor = /usr/bin/touch %s\n", fsmonitorMarker)
+	if err := os.WriteFile(gitConfigPath, []byte(maliciousCfg), 0o644); err != nil {
+		t.Fatalf("write malicious .git/config: %v", err)
+	}
+	hooksDir := filepath.Join(repoDir, ".git", "hooks")
+	if err := os.MkdirAll(hooksDir, 0o755); err != nil {
+		t.Fatalf("mkdir hooks: %v", err)
+	}
+	preCommitHook := filepath.Join(hooksDir, "pre-commit")
+	if err := os.WriteFile(preCommitHook, []byte(fmt.Sprintf("#!/bin/sh\n/usr/bin/touch %q\nexit 1\n", hookMarker)), 0o755); err != nil {
+		t.Fatalf("write pre-commit hook: %v", err)
+	}
+
+	// Modify tracked file base.go & create new file inside the managed worktree.
+	trackedBase := filepath.Join(lease.Path, "base.go")
+	if err := os.WriteFile(trackedBase, []byte("package fleetdemo\n\nfunc BaseValue() int {\n\treturn 42\n}\n"), 0o644); err != nil {
+		t.Fatalf("modify base.go in worktree: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(lease.Path, "wt_added.go"), []byte("package fleetdemo\n"), 0o644); err != nil {
+		t.Fatalf("write wt_added.go: %v", err)
+	}
+
+	runner := tools.NewSeatbeltRunner(tools.WithRunnerVaultRoot(vaultDir))
+
+	// 1. Real macOS SeatbeltRunner (SandboxStrict) running `git status && git diff` inside WorktreePool lease MUST succeed!
+	//    Remove core.fsmonitor temporarily so plain `git status && git diff` executes cleanly inside Seatbelt, then restore malicious config for host CommitPending test.
+	if err := os.WriteFile(gitConfigPath, origCfg, 0o644); err != nil {
+		t.Fatalf("restore clean .git/config: %v", err)
+	}
+	gitRes, err := runner.Run(
+		ctx,
+		"git status --porcelain && git diff",
+		lease.Path,
+		tools.SandboxStrict,
+		nil,
+	)
+	if err != nil {
+		t.Fatalf("SeatbeltRunner git status && git diff error: %v", err)
+	}
+	if gitRes.ExitCode != 0 {
+		t.Fatalf("expected exit 0 for git status && git diff inside Seatbelt worktree, got %d:\n%s", gitRes.ExitCode, gitRes.Combined)
+	}
+	if !strings.Contains(gitRes.Stdout, "M base.go") || !strings.Contains(gitRes.Stdout, "wt_added.go") || !strings.Contains(gitRes.Stdout, "+\treturn 42") {
+		t.Fatalf("unexpected git status/diff output inside Seatbelt worktree:\n%s", gitRes.Stdout)
+	}
+	if err := os.WriteFile(gitConfigPath, []byte(maliciousCfg), 0o644); err != nil {
+		t.Fatalf("re-plant malicious .git/config: %v", err)
+	}
+
+	// 2. Seatbelt write-deny enforcement inside managed worktree:
+	//    <wt>/.gorness, <commonGitDir>/hooks, <commonGitDir>/config, and <vault>/providers.toml MUST all be kernel write-denied!
+	for _, forbiddenTarget := range []string{
+		filepath.Join(lease.Path, ".gorness", "mcp.toml"),
+		filepath.Join(repoDir, ".git", "hooks", "post-merge"),
+		filepath.Join(repoDir, ".git", "config"),
+		paths.ProvidersFile(),
+	} {
+		_ = os.MkdirAll(filepath.Dir(forbiddenTarget), 0o755)
+		denyRes, rErr := runner.Run(ctx, fmt.Sprintf("printf 'pwn' >> %q", forbiddenTarget), lease.Path, tools.SandboxStrict, nil)
+		if rErr != nil {
+			t.Fatalf("unexpected Go error testing write-deny on %s: %v", forbiddenTarget, rErr)
+		}
+		if denyRes.ExitCode == 0 {
+			t.Fatalf("SECURITY VIOLATION: Seatbelt allowed write to protected path %s!", forbiddenTarget)
+		}
+	}
+
+	// 3. Host-side WorktreePool.CommitPending must neutralize core.fsmonitor & hooks (--no-verify, hooksPath=/dev/null).
+	committed, sha, err := pool.CommitPending(ctx, lease.Path, "test: hardened worktree commit")
+	if err != nil || !committed || sha == "" {
+		t.Fatalf("CommitPending failed: committed=%v sha=%q err=%v", committed, sha, err)
+	}
+	if _, err := os.Stat(fsmonitorMarker); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("SECURITY VIOLATION: host git executed malicious core.fsmonitor!")
+	}
+	if _, err := os.Stat(hookMarker); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("SECURITY VIOLATION: host git executed malicious .git/hooks/pre-commit!")
+	}
+}

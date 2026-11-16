@@ -259,8 +259,12 @@ func cmdTUI(ctx context.Context, args []string, stderr io.Writer, opts cliOption
 		return 2
 	}
 
-	wsPath := resolveWorkspaceDir(wsFlag)
 	vaultRoot := resolveVaultRoot(vaultFlag, opts.userHomeDir)
+	wsPath, wsErr := resolveInteractiveWorkspaceDir(wsFlag, vaultRoot)
+	if wsErr != nil {
+		fmt.Fprintf(stderr, "invalid workspace: %v\n", wsErr)
+		return 1
+	}
 
 	targetURL := strings.TrimSpace(serverURL)
 	if targetURL == "" {
@@ -300,8 +304,12 @@ func cmdStudio(
 		return 2
 	}
 
-	wsPath := resolveWorkspaceDir(wsFlag)
 	vaultRoot := resolveVaultRoot(vaultFlag, opts.userHomeDir)
+	wsPath, wsErr := resolveInteractiveWorkspaceDir(wsFlag, vaultRoot)
+	if wsErr != nil {
+		fmt.Fprintf(stderr, "invalid workspace: %v\n", wsErr)
+		return 1
+	}
 
 	daemonURL, err := ensureBackgroundDaemon(ctx, vaultRoot, opts)
 	if err != nil {
@@ -314,6 +322,12 @@ func cmdStudio(
 		regBody, _ := json.Marshal(map[string]string{"path": wsPath})
 		resp, pErr := http.Post(daemonURL+"/api/workspaces", "application/json", bytes.NewReader(regBody))
 		if pErr == nil {
+			if resp.StatusCode >= 400 && strings.TrimSpace(wsFlag) != "" {
+				rawErr, _ := io.ReadAll(resp.Body)
+				_ = resp.Body.Close()
+				fmt.Fprintf(stderr, "register workspace %s: HTTP %d: %s\n", wsPath, resp.StatusCode, strings.TrimSpace(string(rawErr)))
+				return 1
+			}
 			_ = resp.Body.Close()
 		}
 	}
@@ -663,6 +677,10 @@ func daemonUninstall(ctx context.Context, args []string, stdout, stderr io.Write
 	return 0
 }
 
+func daemonBackgroundLogPath(paths config.VaultPaths) string {
+	return filepath.Join(paths.LogsDir(), "daemon.log")
+}
+
 func ensureBackgroundDaemon(ctx context.Context, vaultRoot string, opts cliOptions) (string, error) {
 	if urlStr, _ := probeRunningDaemon(vaultRoot); urlStr != "" {
 		return urlStr, nil
@@ -676,7 +694,7 @@ func ensureBackgroundDaemon(ctx context.Context, vaultRoot string, opts cliOptio
 	if err := os.MkdirAll(paths.LogsDir(), 0o700); err != nil {
 		return "", err
 	}
-	logFile, err := os.OpenFile(filepath.Join(paths.LogsDir(), "daemon.jsonl"), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
+	logFile, err := os.OpenFile(daemonBackgroundLogPath(paths), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
 	if err != nil {
 		return "", err
 	}
@@ -1214,6 +1232,66 @@ func resolveWorkspaceDir(flagVal string) string {
 		return "."
 	}
 	return wd
+}
+
+func resolveInteractiveWorkspaceDir(wsFlag, vaultRoot string) (string, error) {
+	explicit := strings.TrimSpace(wsFlag) != ""
+	wsPath := resolveWorkspaceDir(wsFlag)
+	if !pathsOverlapVault(wsPath, vaultRoot) {
+		return wsPath, nil
+	}
+	if explicit {
+		return "", fmt.Errorf("workspace %q overlaps Gorness vault %q", wsPath, vaultRoot)
+	}
+	// 未显式指定 --workspace 且当前目录为 $HOME 或 ~/.gorness 时，跳过自动注册当前目录以保证正常启动。
+	return "", nil
+}
+
+func pathsOverlapVault(wsPath, vaultRoot string) bool {
+	canonWS := canonicalizeWithAncestors(wsPath)
+	canonVault := canonicalizeWithAncestors(vaultRoot)
+	if canonWS == "" || canonVault == "" {
+		return false
+	}
+	return isPathInsideOrEqualCLI(canonWS, canonVault) || isPathInsideOrEqualCLI(canonVault, canonWS)
+}
+
+func canonicalizeWithAncestors(raw string) string {
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" {
+		return ""
+	}
+	abs, err := filepath.Abs(trimmed)
+	if err != nil {
+		abs = filepath.Clean(trimmed)
+	}
+	if resolved, err := filepath.EvalSymlinks(abs); err == nil {
+		return filepath.Clean(resolved)
+	}
+	cur := abs
+	var tail []string
+	for cur != "/" && cur != "." {
+		tail = append(tail, filepath.Base(cur))
+		cur = filepath.Dir(cur)
+		if resolved, err := filepath.EvalSymlinks(cur); err == nil {
+			out := filepath.Clean(resolved)
+			for i := len(tail) - 1; i >= 0; i-- {
+				out = filepath.Join(out, tail[i])
+			}
+			return filepath.Clean(out)
+		}
+	}
+	return filepath.Clean(abs)
+}
+
+func isPathInsideOrEqualCLI(target, root string) bool {
+	if target == root {
+		return true
+	}
+	if root == string(filepath.Separator) {
+		return strings.HasPrefix(target, root)
+	}
+	return strings.HasPrefix(target, root+string(filepath.Separator))
 }
 
 func defaultExecRunner(ctx context.Context, name string, args ...string) error {

@@ -128,8 +128,8 @@ func (s *WorkspaceStore) Register(path, name string) (*Workspace, error) {
 	if resolvedVault, vErr := filepath.EvalSymlinks(s.paths.Root); vErr == nil {
 		canonVault = filepath.Clean(resolvedVault)
 	}
-	if isWithinOrEqualPath(canonRoot, canonVault) {
-		return nil, fmt.Errorf("%w: cannot register gorness vault %s as workspace", ErrInvalidPath, canonRoot)
+	if isWithinOrEqualPath(canonRoot, canonVault) || isWithinOrEqualPath(canonVault, canonRoot) {
+		return nil, fmt.Errorf("%w: workspace %s overlaps gorness vault %s", ErrInvalidPath, canonRoot, canonVault)
 	}
 
 	displayName := strings.TrimSpace(name)

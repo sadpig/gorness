@@ -1314,3 +1314,169 @@ func TestResolveDeferredEnqueueBeforeRemoveAndDreamPassWorkspaceValidation(t *te
 		t.Fatalf("expected writeWorkspaceProgress to reject traversal wsID")
 	}
 }
+
+func TestDeferredCooldownOnTargetSessionAndStaleResumeSafety(t *testing.T) {
+	var nonResumeRuns atomic.Int32
+	var sawSupersededReminder atomic.Bool
+
+	env := setupAlwaysOnEnv(t, 10, &scriptedStreamer{
+		fn: func(ctx context.Context, req llm.Request) (<-chan llm.StreamEvent, error) {
+			if strings.Contains(req.StaticSystem, "Housekeeping Utility") {
+				return makeTextStream("Deferred Guard Session"), nil
+			}
+			prompt := lastPromptText(req)
+			if strings.Contains(prompt, "was superseded by newer session activity") {
+				sawSupersededReminder.Store(true)
+				return makeTextStream("Acknowledged superseded deferred card."), nil
+			}
+			if strings.Contains(prompt, "intervening-manual-turn") {
+				return makeTextStream("Handled intervening manual turn cleanly."), nil
+			}
+			if strings.Contains(prompt, "queued-while-deferred") {
+				nonResumeRuns.Add(1)
+				return makeTextStream("Processed cooled-down follow-up after deferred resolution."), nil
+			}
+			if strings.Contains(prompt, "trigger-defer-card") {
+				return makeToolCallStream("call_defer_guard_1", "write_file", map[string]any{
+					"path":    ".gorness/mcp.toml",
+					"content": "[servers]\n",
+				}), nil
+			}
+			return makeTextStream("ok"), nil
+		},
+	})
+
+	svc, err := NewService(ServiceOptions{
+		Config:       env.cfgMgr,
+		Engine:       env.engine,
+		Notifier:     env.notifier,
+		TickInterval: 15 * time.Millisecond,
+		RetryBackoff: 20 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatalf("NewService: %v", err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer func() {
+		cancel()
+		_ = svc.Close()
+	}()
+	if err := svc.Start(ctx); err != nil {
+		t.Fatalf("svc.Start: %v", err)
+	}
+
+	sess, err := env.engine.Sessions().Create(env.ws.ID, "Shared AlwaysOn Session", "coder")
+	if err != nil {
+		t.Fatalf("Create session: %v", err)
+	}
+
+	// 1. Trigger a deferred card on sess.ID.
+	if _, err := svc.Enqueue(InboxEvent{
+		ID:          "ev_defer_init",
+		Source:      "webhook",
+		SourceID:    "def-init-1",
+		WorkspaceID: env.ws.ID,
+		SessionID:   sess.ID,
+		Payload:     map[string]any{"text": "trigger-defer-card"},
+	}); err != nil {
+		t.Fatalf("Enqueue initial defer event: %v", err)
+	}
+
+	var cardID string
+	waitForCondition(t, 4*time.Second, "pending deferred card on sess.ID", func() bool {
+		cards, _ := svc.ListDeferred()
+		if len(cards) == 1 && cards[0].SessionID == sess.ID {
+			cardID = cards[0].ID
+			return true
+		}
+		return false
+	})
+
+	// 2. Enqueue a non-resume webhook targeting sess.ID while the DeferredCard is pending:
+	//    Always-On MUST requeue/cool down the batch and NOT run it while the card is unresolved!
+	if _, err := svc.Enqueue(InboxEvent{
+		ID:          "ev_wait_behind_defer",
+		Source:      "timer",
+		SourceID:    "tm-behind-1",
+		WorkspaceID: env.ws.ID,
+		SessionID:   sess.ID,
+		Payload:     map[string]any{"text": "queued-while-deferred"},
+	}); err != nil {
+		t.Fatalf("Enqueue queued-while-deferred: %v", err)
+	}
+
+	time.Sleep(120 * time.Millisecond)
+	if got := nonResumeRuns.Load(); got != 0 {
+		t.Fatalf("expected non-resume batch targeting session with pending DeferredCard to cool down (0 runs), got %d", got)
+	}
+
+	// 3. Simulate intervening interactive session activity on sess.ID BEFORE DeferredCard is resolved!
+	_, manualStream, err := env.engine.StartRun(ctx, core.RunRequest{
+		WorkspaceID: env.ws.ID,
+		SessionID:   sess.ID,
+		Prompt:      "intervening-manual-turn",
+		AgentRole:   "coder",
+	})
+	if err != nil {
+		t.Fatalf("manual StartRun: %v", err)
+	}
+	for range manualStream {
+	}
+
+	// 4. Now resolve the stale DeferredCard as approved=true -> must NOT execute write_file and must NOT write an orphan tool_result,
+	//    and then the cooled-down follow-up event ev_wait_behind_defer must execute and finish cleanly!
+	if err := svc.ResolveDeferred(cardID, true, nil); err != nil {
+		t.Fatalf("ResolveDeferred: %v", err)
+	}
+
+	waitForCondition(t, 4*time.Second, "both stale deferred resume and cooled-down timer batch to complete", func() bool {
+		snap := svc.StateSnapshot()
+		var resumeDone, timerDone bool
+		for _, it := range snap.Inbox {
+			if it.Source == SourceDeferredResume && it.Status == StatusDone {
+				resumeDone = true
+			}
+			if it.ID == "ev_wait_behind_defer" && it.Status == StatusDone {
+				timerDone = true
+			}
+		}
+		return resumeDone && timerDone
+	})
+
+	if !sawSupersededReminder.Load() {
+		t.Fatal("expected stale deferred resume to inject <system-reminder> superseded notice")
+	}
+	if _, err := os.Stat(filepath.Join(env.wsRoot, ".gorness", "mcp.toml")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatal("stale deferred write_file MUST NOT execute after intervening session activity")
+	}
+
+	// Verify zero orphan tool_result blocks exist anywhere in sess.ID's active branch!
+	branch, err := env.engine.Sessions().LoadActiveBranch(sess.ID)
+	if err != nil {
+		t.Fatalf("LoadActiveBranch: %v", err)
+	}
+	openToolUses := make(map[string]bool)
+	for _, ent := range branch {
+		switch ent.Role {
+		case "assistant":
+			openToolUses = make(map[string]bool)
+			for _, b := range ent.Blocks {
+				if b.Type == "tool_use" && b.ToolCallID != "" {
+					openToolUses[b.ToolCallID] = true
+				}
+			}
+		case "tool":
+			for _, b := range ent.Blocks {
+				if b.Type == "tool_result" && !openToolUses[b.ToolCallID] {
+					t.Fatalf("CORRUPTION: orphan tool_result %q found in session branch without preceding assistant tool_use!", b.ToolCallID)
+				}
+			}
+		default:
+			for _, b := range ent.Blocks {
+				if b.Type == "tool_result" {
+					t.Fatalf("unexpected tool_result on role %q", ent.Role)
+				}
+			}
+		}
+	}
+}

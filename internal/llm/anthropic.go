@@ -93,7 +93,7 @@ func streamAnthropic(ctx context.Context, client *http.Client, req Request) (<-c
 		Model:     req.Model,
 		MaxTokens: maxTokens,
 		Stream:    true,
-		Messages:  buildAnthropicMessages(history),
+		Messages:  buildAnthropicMessages(history, enableThinking),
 	}
 
 	if enableThinking {
@@ -482,7 +482,7 @@ func consumeAnthropicSSE(ctx context.Context, body io.Reader, req Request, out c
 	}
 }
 
-func buildAnthropicMessages(history []store.SessionEntry) []anthropicMessageWire {
+func buildAnthropicMessages(history []store.SessionEntry, enableThinking bool) []anthropicMessageWire {
 	out := make([]anthropicMessageWire, 0, len(history))
 
 	type userBuckets struct {
@@ -510,13 +510,13 @@ func buildAnthropicMessages(history []store.SessionEntry) []anthropicMessageWire
 	for _, entry := range history {
 		switch entry.Role {
 		case "assistant":
-			flushUser()
+			foreignModel := isClearlyNonAnthropicModel(entry.ModelID)
 			blocks := make([]json.RawMessage, 0, len(entry.Blocks))
 			for _, b := range entry.Blocks {
 				switch b.Type {
 				case "thinking":
-					// 若历史条目明确来自非 Claude 模型且无签名，跳过未签名思考块以防跨模型切换触发 Anthropic 400 签名校验失败。
-					if b.Signature == "" && entry.ModelID != "" && !strings.Contains(strings.ToLower(entry.ModelID), "claude") {
+					// 当目标请求未启用 thinking、缺少签名，或历史条目明确来自非 Anthropic/Claude 模型（如 gemini*、gpt*）时，跳过思考块以防 400 签名校验失败。
+					if !enableThinking || b.Signature == "" || foreignModel {
 						continue
 					}
 					raw, err := marshalNoEscape(struct {
@@ -532,6 +532,9 @@ func buildAnthropicMessages(history []store.SessionEntry) []anthropicMessageWire
 						blocks = append(blocks, raw)
 					}
 				case "redacted_thinking":
+					if !enableThinking || b.Signature == "" || foreignModel {
+						continue
+					}
 					raw, err := marshalNoEscape(struct {
 						Type string `json:"type"`
 						Data string `json:"data"`
@@ -581,6 +584,7 @@ func buildAnthropicMessages(history []store.SessionEntry) []anthropicMessageWire
 				}
 			}
 			if len(blocks) > 0 {
+				flushUser()
 				out = append(out, anthropicMessageWire{
 					Role:    "assistant",
 					Content: blocks,
@@ -682,4 +686,27 @@ func anthropicMessagesURL(baseURL string) string {
 	default:
 		return base + "/v1/messages"
 	}
+}
+
+func isClearlyNonAnthropicModel(modelID string) bool {
+	m := strings.ToLower(strings.TrimSpace(modelID))
+	if m == "" {
+		return false
+	}
+	if strings.Contains(m, "claude") || strings.Contains(m, "anthropic") {
+		return false
+	}
+	if _, rest, ok := strings.Cut(m, "/"); ok && rest != "" {
+		m = rest
+	}
+	for _, pref := range []string{
+		"gemini", "gpt-", "gpt4", "gpt5", "chatgpt",
+		"o1", "o3", "o4",
+		"qwen", "deepseek", "llama", "mistral", "mixtral", "gemma", "glm", "kimi", "yi-", "command-r",
+	} {
+		if strings.HasPrefix(m, pref) {
+			return true
+		}
+	}
+	return false
 }

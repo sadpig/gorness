@@ -2371,3 +2371,285 @@ func TestFixRound1ReviewFindings(t *testing.T) {
 		}
 	})
 }
+
+func TestFinalFixWaveGitConfigGateGeminiToolSigFallbackModelPartialMCPAndRehydration(t *testing.T) {
+	// 1. PermissionGate: .git/config must trigger auto-run-config GateAsk in both auto and yolo modes (file tools & shell commands).
+	t.Run("git_config_auto_run_gate", func(t *testing.T) {
+		wsRoot := t.TempDir()
+		vaultRoot := filepath.Join(t.TempDir(), "vault")
+		pg, err := tools.NewPathGuard(wsRoot, vaultRoot)
+		if err != nil {
+			t.Fatalf("NewPathGuard: %v", err)
+		}
+		gate := NewPermissionGate(nil)
+		for _, mode := range []string{PermModeAuto, PermModeYolo} {
+			evalCtx := EvalContext{
+				WorkspaceID:   "ws-gitcfg",
+				WorkspaceRoot: wsRoot,
+				VaultRoot:     vaultRoot,
+				EffectiveMode: mode,
+				PathGuard:     pg,
+			}
+			resWrite := gate.Evaluate(evalCtx, ToolInvocation{
+				ToolName: "write_file",
+				Args:     json.RawMessage(`{"path":".git/config","content":"[core]\n\tfsmonitor = evil\n"}`),
+			})
+			if resWrite.Action != GateAsk || resWrite.ReasonCode != "auto-run-config" {
+				t.Fatalf("mode=%s write_file .git/config expected GateAsk/auto-run-config, got %+v", mode, resWrite)
+			}
+			resCmd := gate.Evaluate(evalCtx, ToolInvocation{
+				ToolName: "run_command",
+				Args:     json.RawMessage(`{"command":"printf '[core]\nfsmonitor=evil\n' >> .git/config"}`),
+			})
+			if resCmd.Action != GateAsk || resCmd.ReasonCode != "auto-run-config" {
+				t.Fatalf("mode=%s run_command .git/config expected GateAsk/auto-run-config, got %+v", mode, resCmd)
+			}
+		}
+	})
+
+	// 2. Gemini tool_use thoughtSignature persistence + Fallback answering ModelID & pricing + Partial MCP resilience + Cross-turn rehydration!
+	t.Run("gemini_sig_fallback_cost_partial_mcp_and_rehydration", func(t *testing.T) {
+		var mu sync.Mutex
+		var turn2Step1Tools []string
+		stepCounter := 0
+
+		streamer := llm.StreamerFunc(func(ctx context.Context, req llm.Request) (<-chan llm.StreamEvent, error) {
+			if strings.Contains(req.StaticSystem, "Housekeeping Utility") {
+				ch := make(chan llm.StreamEvent, 2)
+				ch <- llm.StreamEvent{Type: llm.StreamTextDelta, Text: "Rehydration Session"}
+				ch <- llm.StreamEvent{Type: llm.StreamDone, StopReason: "end_turn"}
+				close(ch)
+				return ch, nil
+			}
+
+			// Simulate primary anthropic failure when prompt requests FALLBACK_TEST so fallback openai/gpt-5.5 answers!
+			var lastUser string
+			for _, ent := range req.History {
+				if ent.Role == "user" {
+					for _, b := range ent.Blocks {
+						if b.Text != "" {
+							lastUser = b.Text
+						}
+					}
+				}
+			}
+			if strings.Contains(lastUser, "FALLBACK_TEST") {
+				if req.Provider.ID == "anthropic" {
+					return nil, &llm.APIError{ProviderID: "anthropic", StatusCode: 400, Message: "primary unavailable", Retryable: false}
+				}
+				ch := make(chan llm.StreamEvent, 2)
+				ch <- llm.StreamEvent{Type: llm.StreamTextDelta, Text: "Fallback gpt-5.5 reply"}
+				ch <- llm.StreamEvent{Type: llm.StreamDone, StopReason: "completed", InputTokens: 1_000_000, OutputTokens: 1_000_000}
+				close(ch)
+				return ch, nil
+			}
+
+			mu.Lock()
+			stepCounter++
+			curStep := stepCounter
+			if strings.Contains(lastUser, "TURN2_REHYDRATE_CHECK") {
+				turn2Step1Tools = make([]string, 0, len(req.Tools))
+				for _, ts := range req.Tools {
+					turn2Step1Tools = append(turn2Step1Tools, ts.Name)
+				}
+			}
+			mu.Unlock()
+
+			ch := make(chan llm.StreamEvent, 4)
+			if curStep == 1 {
+				// Emit search_tools + activate_skill with Gemini thoughtSignature!
+				ch <- llm.StreamEvent{
+					Type:       llm.StreamToolCall,
+					ToolCallID: "gem_tc_search",
+					ToolName:   "search_tools",
+					ToolInput:  json.RawMessage(`{"query":"healthy cluster ping","limit":5}`),
+					Signature:  "gem_tool_sig_alpha==",
+				}
+				ch <- llm.StreamEvent{
+					Type:       llm.StreamToolCall,
+					ToolCallID: "gem_tc_skill",
+					ToolName:   "activate_skill",
+					ToolInput:  json.RawMessage(`{"name":"go-hygiene"}`),
+					Signature:  "gem_tool_sig_beta==",
+				}
+				ch <- llm.StreamEvent{Type: llm.StreamDone, StopReason: "tool_use", InputTokens: 50, OutputTokens: 20}
+				close(ch)
+				return ch, nil
+			}
+			ch <- llm.StreamEvent{Type: llm.StreamTextDelta, Text: "Done turn"}
+			ch <- llm.StreamEvent{Type: llm.StreamDone, StopReason: "STOP", InputTokens: 40, OutputTokens: 10}
+			close(ch)
+			return ch, nil
+		})
+
+		eng, cfgMgr, _, _ := setupTestEngine(t, nil, streamer)
+		wsDir := t.TempDir()
+
+		// Create a workspace skill so activate_skill exists.
+		skillDir := filepath.Join(wsDir, ".gorness", "skills", "go-hygiene")
+		if err := os.MkdirAll(skillDir, 0o755); err != nil {
+			t.Fatalf("mkdir skill: %v", err)
+		}
+		if err := os.WriteFile(filepath.Join(skillDir, "SKILL.md"), []byte("---\nname: go-hygiene\ndescription: Go hygiene rules\npaths: [\"**/*.go\"]\n---\nHYGIENE_BODY\n"), 0o644); err != nil {
+			t.Fatalf("write SKILL.md: %v", err)
+		}
+		if err := os.WriteFile(filepath.Join(wsDir, "sample.go"), []byte("package sample\n"), 0o644); err != nil {
+			t.Fatalf("write sample.go: %v", err)
+		}
+
+		// Start a healthy HTTP MCP server exposing 10 tools (so total tools > 12 => BM25 folding active!),
+		// alongside a broken MCP server in global mcp.toml!
+		healthyMCP := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			var rpc struct {
+				ID     any    `json:"id"`
+				Method string `json:"method"`
+			}
+			_ = json.NewDecoder(r.Body).Decode(&rpc)
+			w.Header().Set("Content-Type", "application/json")
+			switch rpc.Method {
+			case "initialize":
+				_ = json.NewEncoder(w).Encode(map[string]any{
+					"jsonrpc": "2.0",
+					"id":      rpc.ID,
+					"result":  map[string]any{"protocolVersion": "2024-11-05", "capabilities": map[string]any{}},
+				})
+			case "notifications/initialized":
+				w.WriteHeader(http.StatusAccepted)
+			case "tools/list":
+				var list []map[string]any
+				list = append(list, map[string]any{
+					"name":        "cluster_ping",
+					"description": "Healthy cluster ping diagnostic tool",
+				})
+				for i := 1; i <= 9; i++ {
+					list = append(list, map[string]any{
+						"name":        fmt.Sprintf("extra_tool_%d", i),
+						"description": fmt.Sprintf("Extra filler tool %d", i),
+					})
+				}
+				_ = json.NewEncoder(w).Encode(map[string]any{
+					"jsonrpc": "2.0",
+					"id":      rpc.ID,
+					"result":  map[string]any{"tools": list},
+				})
+			}
+		}))
+		defer healthyMCP.Close()
+
+		mcpTOML := fmt.Sprintf(`[servers.broken_srv]
+transport = "stdio"
+command = "/nonexistent/gorness-broken-mcp"
+
+[servers.healthy_srv]
+transport = "http"
+url = %q
+`, healthyMCP.URL)
+		if err := store.AtomicWriteFile(cfgMgr.Paths().MCPFile(), []byte(mcpTOML), 0o600); err != nil {
+			t.Fatalf("write mcp.toml: %v", err)
+		}
+		if _, err := cfgMgr.Reload(); err != nil {
+			t.Fatalf("Reload mcp.toml: %v", err)
+		}
+
+		ws, err := eng.Workspaces().Register(wsDir, "FixWaveRepo")
+		if err != nil {
+			t.Fatalf("Register ws: %v", err)
+		}
+		sess, err := eng.Sessions().Create(ws.ID, "Gemini & Rehydrate Session", "coder")
+		if err != nil {
+			t.Fatalf("Create session: %v", err)
+		}
+
+		ctx := context.Background()
+		// Turn 1: Gemini model override -> emits tool_use with Signature and activates mcp__healthy_srv__cluster_ping via search_tools!
+		_, evs1, err := eng.StartRun(ctx, RunRequest{
+			WorkspaceID:   ws.ID,
+			SessionID:     sess.ID,
+			Prompt:        "Activate cluster ping tool and hygiene skill",
+			ModelOverride: "gemini/gemini-2.5-pro",
+		})
+		if err != nil {
+			t.Fatalf("Turn 1 StartRun: %v", err)
+		}
+		_ = drainRunEvents(evs1)
+
+		branch1, err := eng.Sessions().LoadActiveBranch(sess.ID)
+		if err != nil {
+			t.Fatalf("LoadActiveBranch turn 1: %v", err)
+		}
+		foundSig := false
+		for _, ent := range branch1 {
+			for _, blk := range ent.Blocks {
+				if blk.Type == "tool_use" && blk.ToolCallID == "gem_tc_search" && blk.Signature == "gem_tool_sig_alpha==" {
+					foundSig = true
+				}
+			}
+		}
+		if !foundSig {
+			t.Fatalf("expected Gemini tool_use Signature persisted in session jsonl, got branch=%+v", branch1)
+		}
+
+		// Turn 2: Fresh StartRun on same session -> Step 1 MUST rehydrate mcp__healthy_srv__cluster_ping immediately!
+		_, evs2, err := eng.StartRun(ctx, RunRequest{
+			WorkspaceID:   ws.ID,
+			SessionID:     sess.ID,
+			Prompt:        "TURN2_REHYDRATE_CHECK",
+			ModelOverride: "gemini/gemini-2.5-pro",
+		})
+		if err != nil {
+			t.Fatalf("Turn 2 StartRun: %v", err)
+		}
+		_ = drainRunEvents(evs2)
+
+		mu.Lock()
+		gotTurn2Tools := append([]string(nil), turn2Step1Tools...)
+		mu.Unlock()
+		if !containsString(gotTurn2Tools, "mcp__healthy_srv__cluster_ping") {
+			t.Fatalf("expected mcp__healthy_srv__cluster_ping rehydrated on Turn 2 Step 1 despite broken sibling MCP server, got %v", gotTurn2Tools)
+		}
+
+		// Turn 3 (separate session): Fallback from coder primary (claude-sonnet-5-5: $3+$15=$18) to fallback (gpt-5.5: $2.5+$10=$12.5)!
+		fbSess, err := eng.Sessions().Create(ws.ID, "Fallback Accounting", "coder")
+		if err != nil {
+			t.Fatalf("Create fbSess: %v", err)
+		}
+		_, fbStream, err := eng.StartRun(ctx, RunRequest{
+			WorkspaceID: ws.ID,
+			SessionID:   fbSess.ID,
+			Prompt:      "FALLBACK_TEST",
+			AgentRole:   "coder",
+		})
+		if err != nil {
+			t.Fatalf("Fallback StartRun: %v", err)
+		}
+		fbEvents := drainRunEvents(fbStream)
+		var fbOutcome *RunOutcome
+		for _, ev := range fbEvents {
+			if ev.Type == EventRunCompleted {
+				if out, ok := ev.Payload.(RunOutcome); ok {
+					cp := out
+					fbOutcome = &cp
+				}
+			}
+		}
+		if fbOutcome == nil {
+			t.Fatal("expected EventRunCompleted on fallback run")
+		}
+		if fbOutcome.CostUSD < 12.49 || fbOutcome.CostUSD > 12.51 {
+			t.Fatalf("expected fallback gpt-5.5 cost $12.50 (not primary $18.00), got $%.4f", fbOutcome.CostUSD)
+		}
+		fbBranch, err := eng.Sessions().LoadActiveBranch(fbSess.ID)
+		if err != nil {
+			t.Fatalf("LoadActiveBranch fbSess: %v", err)
+		}
+		var recordedAssistantModel string
+		for _, ent := range fbBranch {
+			if ent.Role == "assistant" {
+				recordedAssistantModel = ent.ModelID
+			}
+		}
+		if recordedAssistantModel != "gpt-5.5" {
+			t.Fatalf("expected assistant SessionEntry.ModelID='gpt-5.5' after fallback, got %q", recordedAssistantModel)
+		}
+	})
+}

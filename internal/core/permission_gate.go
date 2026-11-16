@@ -53,6 +53,7 @@ type ToolInvocation struct {
 	ToolCallID string            `json:"tool_call_id,omitempty"`
 	ToolName   string            `json:"tool_name"`
 	Args       json.RawMessage   `json:"args,omitempty"`
+	Signature  string            `json:"signature,omitempty"`
 	Tool       *tools.Tool       `json:"-"`
 	AlwaysAsk  bool              `json:"always_ask,omitempty"`
 	Staged     *tools.StagedEdit `json:"-"`
@@ -372,7 +373,7 @@ func matchTrustedHash(wsRoot, canonWs, absFile string, raw []byte, trustedHashes
 var (
 	reRmRootCmd = regexp.MustCompile(`(?i)(^|[;&|()\s])(sudo\s+)?(/(usr/)?s?bin/)?rm\s+([^\n;|&]*\s+)?(-[a-z]*r[a-z]*f|-[a-z]*f[a-z]*r|-r\s+-f|-f\s+-r|--no-preserve-root)([^\n;|&]*\s+)?(/|/\*|~|~/\*|\$HOME|\$\{HOME\})(\s|$|[;&|)])`)
 	reForkBomb  = regexp.MustCompile(`:\s*\(\s*\)\s*\{.*:\s*\|\s*:.*&`)
-	reAutoCfgSh = regexp.MustCompile(`(?i)(^|[\s"'/])(\.gorness(/|$)|\.mcp\.json\b|mcp\.toml\b|\.zshrc\b|\.zshenv\b|\.zprofile\b|\.zlogin\b|\.bashrc\b|\.bash_profile\b|\.profile\b|\.git/hooks/)`)
+	reAutoCfgSh = regexp.MustCompile(`(?i)(^|[\s"'/])(\.gorness(/|$)|\.mcp\.json\b|mcp\.toml\b|\.zshrc\b|\.zshenv\b|\.zprofile\b|\.zlogin\b|\.bashrc\b|\.bash_profile\b|\.profile\b|\.git/hooks/|\.git/config\b)`)
 )
 
 // PermissionGate 严格按不可绕过的固定九步顺序裁决每一次工具调用：

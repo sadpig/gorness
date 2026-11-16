@@ -217,6 +217,7 @@ func (l *AgentLoop) Run(ctx context.Context) (RunOutcome, error) {
 		return outcome, err
 	}
 	wasEmptySession := len(priorBranch) == 0
+	l.rehydrateActivatedState(priorBranch)
 
 	// 1. 修复可能残留的未闭合 tool_use，或执行挂起恢复的 Deferred 工具调用
 	if err := l.prepareInitialSessionState(ctx, priorBranch); err != nil {
@@ -324,7 +325,13 @@ func (l *AgentLoop) Run(ctx context.Context) (RunOutcome, error) {
 		outcome.InputTokens += stepRes.inputTokens
 		outcome.OutputTokens += stepRes.outputTokens
 		outcome.CacheReadTokens += stepRes.cacheReadTokens
-		stepCost := llm.EstimateCostUSD(l.cfg.route.Spec, stepRes.inputTokens, stepRes.outputTokens, stepRes.cacheReadTokens)
+		answeringModel := l.cfg.route.ModelID
+		answeringSpec := l.cfg.route.Spec
+		if strings.TrimSpace(stepRes.modelID) != "" {
+			answeringModel = strings.TrimSpace(stepRes.modelID)
+			answeringSpec = resolveRouteSpec(l.cfg.route, l.cfg.snap, stepRes.providerID, answeringModel)
+		}
+		stepCost := llm.EstimateCostUSD(answeringSpec, stepRes.inputTokens, stepRes.outputTokens, stepRes.cacheReadTokens)
 		outcome.CostUSD += stepCost
 
 		assistantBlocks := buildAssistantContentBlocks(stepRes)
@@ -332,7 +339,7 @@ func (l *AgentLoop) Run(ctx context.Context) (RunOutcome, error) {
 		if len(assistantBlocks) > 0 {
 			storedAssistant, aErr := l.cfg.sessions.Append(l.cfg.sessionID, store.SessionEntry{
 				Role:            "assistant",
-				ModelID:         l.cfg.route.ModelID,
+				ModelID:         answeringModel,
 				AgentRole:       l.cfg.agentRole,
 				Blocks:          assistantBlocks,
 				InputTokens:     stepRes.inputTokens,
@@ -436,6 +443,8 @@ func (l *AgentLoop) Run(ctx context.Context) (RunOutcome, error) {
 }
 
 type streamedStep struct {
+	providerID      string
+	modelID         string
 	thinking        string
 	signature       string
 	text            string
@@ -505,6 +514,7 @@ func (l *AgentLoop) consumeStepStream(ctx context.Context, step int, ch <-chan l
 				ToolCallID: callID,
 				ToolName:   strings.TrimSpace(ev.ToolName),
 				Args:       append(json.RawMessage(nil), args...),
+				Signature:  ev.Signature,
 			}
 			toolCalls = append(toolCalls, inv)
 			l.emit(EventToolCall, ToolCallPayload{
@@ -515,6 +525,8 @@ func (l *AgentLoop) consumeStepStream(ctx context.Context, step int, ch <-chan l
 			})
 
 		case llm.StreamDone:
+			res.providerID = ev.ProviderID
+			res.modelID = ev.ModelID
 			res.stopReason = ev.StopReason
 			res.inputTokens = ev.InputTokens
 			res.outputTokens = ev.OutputTokens
@@ -567,6 +579,7 @@ func buildAssistantContentBlocks(s streamedStep) []store.ContentBlock {
 			ToolCallID: tc.ToolCallID,
 			ToolName:   tc.ToolName,
 			ToolInput:  tc.Args,
+			Signature:  tc.Signature,
 		})
 	}
 	return blocks
@@ -1098,14 +1111,6 @@ func (l *AgentLoop) prepareInitialSessionState(ctx context.Context, branch []sto
 			}
 		}
 
-		if !matchedDangling {
-			blk, err := l.executeResumedCall(ctx, resReq)
-			if err != nil {
-				return err
-			}
-			resultBlocks = append(resultBlocks, blk)
-		}
-
 		if len(resultBlocks) > 0 {
 			if _, err := l.cfg.sessions.Append(l.cfg.sessionID, store.SessionEntry{
 				Role:      "tool",
@@ -1123,6 +1128,27 @@ func (l *AgentLoop) prepareInitialSessionState(ctx context.Context, branch []sto
 					Output:     rb.Text,
 					IsError:    rb.IsError,
 				})
+			}
+		}
+
+		if !matchedDangling {
+			// 会话在此期间已向前演进（原未配对 tool_use 已被先前回合修复或回退覆盖）：
+			// 绝不执行过期的延迟调用，更绝不向历史写入无主孤立 tool_result 破坏协议合法性！
+			note := fmt.Sprintf(
+				"<system-reminder>\nDeferred tool call %q (id=%s, approved=%v) was superseded by newer session activity and was not executed.\n</system-reminder>",
+				resReq.ToolName,
+				resReq.ToolCallID,
+				resReq.Approved,
+			)
+			if _, err := l.cfg.sessions.Append(l.cfg.sessionID, store.SessionEntry{
+				Role:      "user",
+				AgentRole: l.cfg.agentRole,
+				Blocks: []store.ContentBlock{
+					{Type: "text", Text: note},
+				},
+				CreatedAt: l.cfg.now().UTC(),
+			}); err != nil {
+				return err
 			}
 		}
 		return nil
@@ -1455,4 +1481,74 @@ func makeSkippedToolResult(inv ToolInvocation, msg string) store.ContentBlock {
 		Text:       msg,
 		IsError:    true,
 	}
+}
+
+func (l *AgentLoop) rehydrateActivatedState(branch []store.SessionEntry) {
+	if len(branch) == 0 {
+		return
+	}
+	for _, ent := range branch {
+		for _, blk := range ent.Blocks {
+			switch blk.Type {
+			case "tool_use":
+				name := strings.TrimSpace(blk.ToolName)
+				switch name {
+				case "":
+				case "activate_skill":
+					var in struct {
+						Name string `json:"name"`
+					}
+					if json.Unmarshal(blk.ToolInput, &in) == nil && strings.TrimSpace(in.Name) != "" {
+						l.activatedSkills[strings.TrimSpace(in.Name)] = true
+					}
+				case "search_tools":
+					if l.cfg.reg != nil {
+						var in struct {
+							Query string `json:"query"`
+							Limit int    `json:"limit"`
+						}
+						if json.Unmarshal(blk.ToolInput, &in) == nil && strings.TrimSpace(in.Query) != "" {
+							for _, m := range l.cfg.reg.SearchBM25(in.Query, in.Limit) {
+								l.activatedTools[m.Name] = true
+							}
+						}
+					}
+				default:
+					l.activatedTools[name] = true
+				}
+			case "tool_result":
+				if blk.ToolName == "search_tools" && l.cfg.reg != nil {
+					for _, line := range strings.Split(blk.Text, "\n") {
+						trimmed := strings.TrimSpace(line)
+						if after, ok := strings.CutPrefix(trimmed, "- "); ok {
+							if cand, _, hasColon := strings.Cut(after, ":"); hasColon {
+								cand = strings.TrimSpace(cand)
+								if _, exists := l.cfg.reg.Get(cand); exists {
+									l.activatedTools[cand] = true
+								}
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+}
+
+func resolveRouteSpec(route llm.ResolvedRoute, snap *config.Snapshot, providerID, modelID string) config.ModelSpec {
+	cleanProv := strings.TrimSpace(providerID)
+	cleanModel := strings.TrimSpace(modelID)
+	for cur := &route; cur != nil; cur = cur.Fallback {
+		if cur.ModelID == cleanModel && (cleanProv == "" || cur.ProviderID == cleanProv) {
+			return cur.Spec
+		}
+	}
+	if snap != nil && cleanProv != "" {
+		if prov, ok := snap.Providers[cleanProv]; ok {
+			if spec, has := prov.Models[cleanModel]; has {
+				return spec
+			}
+		}
+	}
+	return route.Spec
 }

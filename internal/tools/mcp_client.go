@@ -63,6 +63,7 @@ func (m *MCPManager) ConnectAll(ctx context.Context, cfg config.MCPConfig) error
 	}
 	sort.Strings(ids)
 
+	var errs []error
 	for _, id := range ids {
 		srv := cfg.Servers[id]
 		if srv.ID == "" {
@@ -72,10 +73,10 @@ func (m *MCPManager) ConnectAll(ctx context.Context, cfg config.MCPConfig) error
 			continue
 		}
 		if _, err := m.ConnectServer(ctx, srv); err != nil {
-			return fmt.Errorf("connect mcp server %q: %w", srv.ID, err)
+			errs = append(errs, fmt.Errorf("connect mcp server %q: %w", srv.ID, err))
 		}
 	}
-	return nil
+	return errors.Join(errs...)
 }
 
 func (m *MCPManager) ConnectServer(ctx context.Context, srv config.MCPServerConfig) ([]Tool, error) {

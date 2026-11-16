@@ -786,6 +786,13 @@ func (s *Service) runWorkerLoop(ctx context.Context) {
 			}
 			batch, nextWake, err := s.inbox.claimNextBatch(s.now(), s.currentDebounce(), s.retryBackoff)
 			if err != nil {
+				if !timer.Stop() {
+					select {
+					case <-timer.C:
+					default:
+					}
+				}
+				timer.Reset(s.tickInterval)
 				break
 			}
 			if len(batch) == 0 {
@@ -836,6 +843,12 @@ func (s *Service) executeClaimedBatch(ctx context.Context, batch []InboxEvent) {
 		agentRole = "coder"
 	}
 
+	resumeReq, isResume := extractDeferredResume(head)
+	if !isResume && sessionID != "" && s.hasPendingDeferredForSession(sessionID) {
+		_ = s.inbox.requeueBusyBatch(ids, s.retryBackoff, s.now())
+		return
+	}
+
 	// Pre-create session when unset so notify_user / set_followup capture state is race-free before StartRun begins.
 	autoCreatedSession := false
 	if sessionID == "" {
@@ -848,7 +861,6 @@ func (s *Service) executeClaimedBatch(ctx context.Context, batch []InboxEvent) {
 		autoCreatedSession = true
 	}
 
-	resumeReq, isResume := extractDeferredResume(head)
 	prompt := ""
 	if !isResume {
 		prompt = formatBatchPrompt(batch)
@@ -1005,6 +1017,23 @@ func (s *Service) executeClaimedBatch(ctx context.Context, batch []InboxEvent) {
 	}
 
 	_ = s.inbox.completeBatch(ids, sessionID, StatusDone, "", s.retryBackoff, s.now())
+}
+
+func (s *Service) hasPendingDeferredForSession(sessionID string) bool {
+	target := strings.TrimSpace(sessionID)
+	if target == "" {
+		return false
+	}
+	cards, err := s.ListDeferred()
+	if err != nil {
+		return false
+	}
+	for _, card := range cards {
+		if strings.TrimSpace(card.SessionID) == target {
+			return true
+		}
+	}
+	return false
 }
 
 func (s *Service) isTrivialFailedAutoSession(sessionID string) bool {

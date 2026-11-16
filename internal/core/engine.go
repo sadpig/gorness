@@ -615,14 +615,13 @@ func (e *Engine) StartRun(ctx context.Context, req RunRequest) (string, <-chan R
 			return
 		}
 
-		// 按需连接已授信的 MCP 服务器并在运行结束时回收子进程组
+	// 按需连接已授信的 MCP 服务器并在运行结束时回收子进程组（单个服务器失败不阻断其余健康服务器的工具挂载）
 		var mcpMgr *tools.MCPManager
 		if len(wsSnap.MCP.Servers) > 0 {
 			mcpMgr = tools.NewMCPManager(e.cfg.Secrets(), wsSnap.Paths.MCPFile(), effectiveRoot)
 			defer func() { _ = mcpMgr.Close() }()
-			if cErr := mcpMgr.ConnectAll(runCtx, wsSnap.MCP); cErr == nil {
-				mcpMgr.RegisterInto(reg)
-			}
+			_ = mcpMgr.ConnectAll(runCtx, wsSnap.MCP)
+			mcpMgr.RegisterInto(reg)
 		}
 
 		emit(EventRunStarted, map[string]any{

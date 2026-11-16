@@ -218,13 +218,16 @@ func isValidOverflowLogFilename(name string) bool {
 	return true
 }
 
-// IsAutoRunConfigPath 判断目标路径是否属于自执行/敏感工程配置（供 PermissionGate 第 5 步拦截确认）。
+// IsAutoRunConfigPath 判断目标路径是否属于自执行/敏感工程配置（供 PermissionGate 第 6 步拦截确认）。
 func IsAutoRunConfigPath(canonicalAbs, rel string) bool {
 	check := filepath.ToSlash(strings.TrimSpace(rel))
 	if check == "" {
 		check = filepath.ToSlash(canonicalAbs)
 	}
 	check = strings.TrimPrefix(check, "./")
+	if check == "" {
+		return false
+	}
 	base := filepath.Base(check)
 
 	switch base {
@@ -233,7 +236,12 @@ func IsAutoRunConfigPath(canonicalAbs, rel string) bool {
 		".mcp.json", "mcp.toml":
 		return true
 	}
-	if check == ".gorness" || strings.HasPrefix(check, ".gorness/") || strings.Contains(check, "/.gorness/") {
+	if check == ".gorness" || strings.HasPrefix(check, ".gorness/") || strings.HasSuffix(check, "/.gorness") || hasNonWorktreeGornessSegment(check) {
+		return true
+	}
+	if check == ".git/config" || strings.HasSuffix(check, "/.git/config") ||
+		check == ".git/config.lock" || strings.HasSuffix(check, "/.git/config.lock") ||
+		check == ".git/config.worktree" || strings.HasSuffix(check, "/.git/config.worktree") {
 		return true
 	}
 	if strings.HasPrefix(check, ".git/hooks/") || strings.Contains(check, "/.git/hooks/") {
@@ -243,6 +251,21 @@ func IsAutoRunConfigPath(canonicalAbs, rel string) bool {
 		return true
 	}
 	return false
+}
+
+func hasNonWorktreeGornessSegment(slashPath string) bool {
+	rest := slashPath
+	for {
+		idx := strings.Index(rest, "/.gorness/")
+		if idx < 0 {
+			return false
+		}
+		after := rest[idx+len("/.gorness/"):]
+		if !strings.HasPrefix(after, "runtime/worktrees/") {
+			return true
+		}
+		rest = after
+	}
 }
 
 // toUncleanedAbs 在不调用 filepath.Clean / filepath.Join 的前提下构造绝对路径串，保留原始路径段顺序供 POSIX 软链遍历。

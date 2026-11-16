@@ -597,3 +597,85 @@ func TestHeadlessGateAskDeferAndACPMidRunCancel(t *testing.T) {
 		}
 	})
 }
+
+func TestInteractiveLaunchFromHomeSkipsVaultContainingCwdAndWritesDaemonLog(t *testing.T) {
+	mockLLM := startMockAnthropicSSEServer(t)
+	defer mockLLM.Close()
+
+	vaultDir, homeDir, _ := prepareTempVaultWithMockProvider(t, mockLLM.URL)
+
+	origWD, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("Getwd: %v", err)
+	}
+	if err := os.Chdir(homeDir); err != nil {
+		t.Fatalf("Chdir(homeDir): %v", err)
+	}
+	t.Cleanup(func() { _ = os.Chdir(origWD) })
+
+	// 1. Start daemon in-process on ephemeral port so cmdStudio probes it and verify cwd=$HOME is cleanly skipped when --workspace is omitted!
+	dCtx, dCancel := context.WithCancel(context.Background())
+	defer dCancel()
+	var dOut, dErr bytes.Buffer
+	dDone := make(chan int, 1)
+	go func() {
+		dDone <- runCLI(dCtx, []string{
+			"daemon", "serve",
+			"--vault", vaultDir,
+			"--host", "127.0.0.1",
+			"--port", "0",
+		}, strings.NewReader(""), &dOut, &dErr, cliOptions{userHomeDir: homeDir})
+	}()
+
+	var daemonURL string
+	deadline := time.Now().Add(4 * time.Second)
+	for time.Now().Before(deadline) {
+		if u, _ := probeRunningDaemon(vaultDir); u != "" {
+			daemonURL = u
+			break
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+	if daemonURL == "" {
+		t.Fatalf("daemon did not become healthy: %s", dErr.String())
+	}
+
+	var stOut, stErr bytes.Buffer
+	code := runCLI(dCtx, []string{
+		"studio",
+		"--vault", vaultDir,
+		"--no-open",
+	}, strings.NewReader(""), &stOut, &stErr, cliOptions{userHomeDir: homeDir})
+	if code != 0 {
+		t.Fatalf("expected studio --no-open from $HOME to succeed with code 0, got %d (stderr=%s)", code, stErr.String())
+	}
+
+	resp, err := http.Get(daemonURL + "/api/workspaces")
+	if err != nil {
+		t.Fatalf("GET /api/workspaces: %v", err)
+	}
+	var wsList []map[string]any
+	_ = json.NewDecoder(resp.Body).Decode(&wsList)
+	resp.Body.Close()
+	if len(wsList) != 0 {
+		t.Fatalf("expected 0 workspaces registered when launching from $HOME without --workspace, got %+v", wsList)
+	}
+
+	// Explicit --workspace pointing to $HOME must be rejected cleanly with non-zero exit code!
+	var badOut, badErr bytes.Buffer
+	badCode := runCLI(dCtx, []string{
+		"studio",
+		"--vault", vaultDir,
+		"--workspace", homeDir,
+		"--no-open",
+	}, strings.NewReader(""), &badOut, &badErr, cliOptions{userHomeDir: homeDir})
+	if badCode == 0 {
+		t.Fatal("expected explicit --workspace $HOME to fail with non-zero exit code")
+	}
+	if gotLog := daemonBackgroundLogPath(config.VaultPaths{Root: vaultDir}); filepath.Base(gotLog) != "daemon.log" {
+		t.Fatalf("expected daemon background stdout log at runtime/logs/daemon.log, got %s", gotLog)
+	}
+
+	dCancel()
+	<-dDone
+}

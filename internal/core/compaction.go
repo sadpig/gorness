@@ -248,7 +248,11 @@ func (c *Compactor) generateMergedSummary(
 		return "", "", 0, 0, 0, 0, sErr
 	}
 
-	var textBuf strings.Builder
+	var (
+		textBuf     strings.Builder
+		answeringID string
+		answeringPr string
+	)
 	for ev := range ch {
 		switch ev.Type {
 		case llm.StreamStepReset:
@@ -256,6 +260,8 @@ func (c *Compactor) generateMergedSummary(
 		case llm.StreamTextDelta:
 			textBuf.WriteString(ev.Text)
 		case llm.StreamDone:
+			answeringPr = ev.ProviderID
+			answeringID = ev.ModelID
 			inTok = ev.InputTokens
 			outTok = ev.OutputTokens
 			cacheTok = ev.CacheReadTokens
@@ -271,8 +277,14 @@ func (c *Compactor) generateMergedSummary(
 	if out == "" {
 		out = buildDeterministicAnchoredFallback(priorSummary, transcript)
 	}
-	cost := llm.EstimateCostUSD(route.Spec, inTok, outTok, cacheTok)
-	return out, route.ModelID, inTok, outTok, cacheTok, cost, nil
+	usedModel := route.ModelID
+	usedSpec := route.Spec
+	if strings.TrimSpace(answeringID) != "" {
+		usedModel = strings.TrimSpace(answeringID)
+		usedSpec = resolveRouteSpec(route, snap, answeringPr, usedModel)
+	}
+	cost := llm.EstimateCostUSD(usedSpec, inTok, outTok, cacheTok)
+	return out, usedModel, inTok, outTok, cacheTok, cost, nil
 }
 
 func isCompactionAnchorEntry(e store.SessionEntry) bool {

@@ -121,6 +121,10 @@ type sessionSwitchedMsg struct {
 	notice    string
 }
 
+type approvalSettledTickMsg struct {
+	approvalID string
+}
+
 // Model 实现 Gorness 多项目多会话终端工作台（流式对话、逐块 Diff 审批、舰队状态栏）。
 type Model struct {
 	ctx           context.Context
@@ -135,6 +139,7 @@ type Model struct {
 	boot            bootstrapPayload
 	activeWsID      string
 	activeSessionID string
+	inFlightRunID   string
 	sidebarIdx      int
 	entries         []store.SessionEntry
 	agentRole       string
@@ -149,6 +154,7 @@ type Model struct {
 	hunkCursor    int
 	selectedHunks map[string]map[string]bool // approvalID -> hunkID -> bool
 	surfacedLocal map[string]time.Time
+	seenEventSeq  map[uint64]bool
 
 	sseCh chan core.RunEvent
 }
@@ -172,6 +178,7 @@ func NewModel(ctx context.Context, serverURL, initialWsPath string) *Model {
 		agentRole:     "coder",
 		selectedHunks: make(map[string]map[string]bool),
 		surfacedLocal: make(map[string]time.Time),
+		seenEventSeq:  make(map[uint64]bool),
 		sseCh:         make(chan core.RunEvent, 128),
 	}
 }
@@ -219,23 +226,41 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		m.boot = typed.data
+		var cmds []tea.Cmd
 		for _, appr := range m.boot.PendingApprovals {
-			m.ensureApprovalTracked(appr)
+			if m.ensureApprovalTracked(appr) {
+				cmds = append(cmds, scheduleApprovalSettleTick(appr.ID))
+			}
 		}
 		if m.activeWsID == "" && len(m.boot.Workspaces) > 0 {
 			m.activeWsID = m.boot.Workspaces[0].ID
 		}
 		visible := m.visibleSessions()
 		if m.activeSessionID == "" && len(visible) > 0 {
-			m.activeSessionID = visible[0].ID
-			m.activeWsID = visible[0].WorkspaceID
+			for _, s := range visible {
+				if m.activeWsID == "" || s.WorkspaceID == m.activeWsID {
+					m.activeSessionID = s.ID
+					m.activeWsID = s.WorkspaceID
+					break
+				}
+			}
+			if m.activeSessionID == "" {
+				m.activeSessionID = visible[0].ID
+				m.activeWsID = visible[0].WorkspaceID
+			}
 		}
 		if m.currentApproval() != nil && m.focus != focusApproval {
 			m.focus = focusApproval
 		}
 		if m.activeSessionID != "" {
-			return m, m.loadSessionCmd(m.activeSessionID)
+			cmds = append(cmds, m.loadSessionCmd(m.activeSessionID))
 		}
+		if len(cmds) > 0 {
+			return m, tea.Batch(cmds...)
+		}
+		return m, nil
+
+	case approvalSettledTickMsg:
 		return m, nil
 
 	case sessionLoadedMsg:
@@ -256,8 +281,38 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		var cmds []tea.Cmd
 		cmds = append(cmds, m.waitNextSSECmd())
 
+		if ev.Seq > 0 {
+			if m.seenEventSeq[ev.Seq] {
+				return m, tea.Batch(cmds...)
+			}
+			m.seenEventSeq[ev.Seq] = true
+		}
+
+		adoptIfNewSession := func(sessID, wsID, runID string) {
+			if sessID == "" {
+				return
+			}
+		if (m.activeSessionID == "" || m.inFlightRunID == "pending") && (m.activeWsID == "" || wsID == "" || wsID == m.activeWsID) {
+				m.activeSessionID = sessID
+				if m.activeWsID == "" && wsID != "" {
+					m.activeWsID = wsID
+				}
+				if runID != "" {
+					m.inFlightRunID = runID
+				}
+				cmds = append(cmds, m.refreshBootstrapCmd(), m.loadSessionCmd(m.activeSessionID))
+			} else if runID != "" && m.inFlightRunID != "" && runID == m.inFlightRunID && m.activeSessionID != sessID {
+				m.activeSessionID = sessID
+				if wsID != "" {
+					m.activeWsID = wsID
+				}
+				cmds = append(cmds, m.refreshBootstrapCmd(), m.loadSessionCmd(m.activeSessionID))
+			}
+		}
+
 		switch ev.Type {
 		case core.EventRunStarted:
+			adoptIfNewSession(ev.SessionID, ev.WorkspaceID, ev.RunID)
 			if ev.SessionID == m.activeSessionID {
 				m.liveRunID = ev.RunID
 				m.liveThinking = ""
@@ -269,6 +324,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.liveText = ""
 			}
 		case core.EventThinkingDelta:
+			adoptIfNewSession(ev.SessionID, ev.WorkspaceID, ev.RunID)
 			if ev.SessionID == m.activeSessionID {
 				if mp, ok := ev.Payload.(map[string]any); ok {
 					if s, _ := mp["thinking"].(string); s != "" {
@@ -277,6 +333,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				}
 			}
 		case core.EventTextDelta:
+			adoptIfNewSession(ev.SessionID, ev.WorkspaceID, ev.RunID)
 			if ev.SessionID == m.activeSessionID {
 				if mp, ok := ev.Payload.(map[string]any); ok {
 					if s, _ := mp["text"].(string); s != "" {
@@ -288,9 +345,20 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			raw, _ := json.Marshal(ev.Payload)
 			var appr core.PendingApproval
 			if json.Unmarshal(raw, &appr) == nil && appr.ID != "" {
-				m.ensureApprovalTracked(appr)
+				sessID := appr.SessionID
+				if sessID == "" {
+					sessID = ev.SessionID
+				}
+				wsID := appr.WorkspaceID
+				if wsID == "" {
+					wsID = ev.WorkspaceID
+				}
+				adoptIfNewSession(sessID, wsID, appr.RunID)
+				if m.ensureApprovalTracked(appr) {
+					cmds = append(cmds, scheduleApprovalSettleTick(appr.ID))
+				}
 				m.upsertApproval(appr)
-				if appr.SessionID == m.activeSessionID {
+				if sessID == m.activeSessionID || m.activeSessionID == "" {
 					m.focus = focusApproval
 					m.hunkCursor = 0
 				}
@@ -298,7 +366,11 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case core.EventApprovalResolved:
 			cmds = append(cmds, m.refreshBootstrapCmd())
 		case core.EventRunCompleted, core.EventRunFailed, core.EventRunCancelled, core.EventCompacted, core.EventTitleUpdated:
-			if ev.SessionID == m.activeSessionID {
+			if m.inFlightRunID != "" && ev.RunID == m.inFlightRunID {
+				m.inFlightRunID = ""
+			}
+			adoptIfNewSession(ev.SessionID, ev.WorkspaceID, ev.RunID)
+			if ev.SessionID == m.activeSessionID && m.activeSessionID != "" {
 				m.liveRunID = ""
 				m.liveThinking = ""
 				m.liveText = ""
@@ -512,6 +584,9 @@ func (m *Model) dispatchComposerInput(prompt string) (tea.Model, tea.Cmd) {
 		}, "Injected mid-run Steer")
 	}
 
+	if m.activeSessionID == "" {
+		m.inFlightRunID = "pending"
+	}
 	return m, m.startRunCmd(prompt)
 }
 
@@ -699,6 +774,12 @@ func (m *Model) renderInlineApproval(appr core.PendingApproval, maxW int) string
 	var lines []string
 	lines = append(lines, fmt.Sprintf("⚠ Approval Required: %s [%s] (%s)",
 		config.EscapeBidi(appr.ToolName), config.EscapeBidi(appr.ReasonCode), stateTag))
+	if reason := strings.TrimSpace(appr.Reason); reason != "" {
+		lines = append(lines, "  Reason: "+truncateRunes(collapseNewlines(config.EscapeBidi(reason)), maxW-12))
+	}
+	if compactArgs := compactJSONArgs(appr.Args); compactArgs != "" && compactArgs != "{}" {
+		lines = append(lines, "  Args:   "+truncateRunes(collapseNewlines(config.EscapeBidi(compactArgs)), maxW-12))
+	}
 	for idx, h := range appr.Hunks {
 		if idx >= 3 {
 			lines = append(lines, fmt.Sprintf("  ... +%d more hunks", len(appr.Hunks)-3))
@@ -848,8 +929,8 @@ func (m *Model) startRunCmd(prompt string) tea.Cmd {
 			raw, _ := io.ReadAll(resp.Body)
 			return statusNoticeMsg{err: fmt.Errorf("run HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(raw)))}
 		}
-		// Drain stream; live deltas arrive via global SSE subscription simultaneously
-		_, _ = io.Copy(io.Discard, resp.Body)
+		// Forward SSE frames into m.sseCh (deduplicated by RunEvent.Seq in Update) so zero events are missed on startup.
+		m.forwardSSEResponseBody(resp.Body)
 		return statusNoticeMsg{text: "Turn complete"}
 	}
 }
@@ -883,40 +964,74 @@ func (m *Model) postActionCmd(path string, payload any, okNotice string) tea.Cmd
 
 func (m *Model) startGlobalSSEWorkerCmd() tea.Cmd {
 	return func() tea.Msg {
-		go func() {
-			req, err := http.NewRequestWithContext(m.ctx, http.MethodGet, m.serverURL+"/api/events/stream", nil)
-			if err != nil {
-				return
-			}
-			resp, err := m.httpClient.Do(req)
-			if err != nil {
-				return
-			}
-			defer resp.Body.Close()
-
-			sc := bufio.NewScanner(resp.Body)
-			sc.Buffer(make([]byte, 0, 64*1024), 1024*1024)
-			for sc.Scan() {
-				line := sc.Text()
-				if !strings.HasPrefix(line, "data:") {
-					continue
-				}
-				raw := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
-				if raw == "" {
-					continue
-				}
-				var ev core.RunEvent
-				if json.Unmarshal([]byte(raw), &ev) != nil || ev.Type == "heartbeat" || ev.Type == "connected" {
-					continue
-				}
-				select {
-				case m.sseCh <- ev:
-				case <-m.ctx.Done():
-					return
-				}
-			}
-		}()
+		go m.runGlobalSSELoop()
 		return m.waitNextSSECmd()()
+	}
+}
+
+func (m *Model) runGlobalSSELoop() {
+	backoff := 100 * time.Millisecond
+	const maxBackoff = 2 * time.Second
+
+	for {
+		if m.ctx.Err() != nil {
+			return
+		}
+		connected := false
+		req, err := http.NewRequestWithContext(m.ctx, http.MethodGet, m.serverURL+"/api/events/stream", nil)
+		if err == nil {
+			resp, doErr := m.httpClient.Do(req)
+			if doErr == nil {
+				if resp.StatusCode == http.StatusOK {
+					connected = true
+					m.forwardSSEResponseBody(resp.Body)
+				}
+				_ = resp.Body.Close()
+			}
+		}
+		if m.ctx.Err() != nil {
+			return
+		}
+		if connected {
+			backoff = 100 * time.Millisecond
+		}
+		timer := time.NewTimer(backoff)
+		select {
+		case <-timer.C:
+		case <-m.ctx.Done():
+			timer.Stop()
+			return
+		}
+		if backoff < maxBackoff {
+			backoff *= 2
+			if backoff > maxBackoff {
+				backoff = maxBackoff
+			}
+		}
+	}
+}
+
+func (m *Model) forwardSSEResponseBody(body io.Reader) {
+	sc := bufio.NewScanner(body)
+	sc.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+	for sc.Scan() {
+		line := sc.Text()
+		if !strings.HasPrefix(line, "data:") {
+			continue
+		}
+		raw := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
+		if raw == "" {
+			continue
+		}
+		var ev core.RunEvent
+		if json.Unmarshal([]byte(raw), &ev) != nil || ev.Type == "heartbeat" || ev.Type == "connected" {
+			continue
+		}
+		select {
+		case m.sseCh <- ev:
+		case <-m.ctx.Done():
+			return
+		}
 	}
 }
 
@@ -992,17 +1107,27 @@ func (m *Model) activeRunIDForSession() string {
 }
 
 func (m *Model) currentApproval() *core.PendingApproval {
+	if m.activeSessionID != "" {
+		for i := range m.boot.PendingApprovals {
+			if m.boot.PendingApprovals[i].SessionID == m.activeSessionID {
+				return &m.boot.PendingApprovals[i]
+			}
+		}
+		return nil
+	}
 	for i := range m.boot.PendingApprovals {
-		if m.boot.PendingApprovals[i].SessionID == m.activeSessionID {
+		if m.activeWsID == "" || m.boot.PendingApprovals[i].WorkspaceID == m.activeWsID {
 			return &m.boot.PendingApprovals[i]
 		}
 	}
 	return nil
 }
 
-func (m *Model) ensureApprovalTracked(appr core.PendingApproval) {
+func (m *Model) ensureApprovalTracked(appr core.PendingApproval) bool {
+	newlyTracked := false
 	if _, ok := m.surfacedLocal[appr.ID]; !ok {
 		m.surfacedLocal[appr.ID] = time.Now()
+		newlyTracked = true
 	}
 	if _, ok := m.selectedHunks[appr.ID]; !ok {
 		set := make(map[string]bool, len(appr.Hunks))
@@ -1011,6 +1136,25 @@ func (m *Model) ensureApprovalTracked(appr core.PendingApproval) {
 		}
 		m.selectedHunks[appr.ID] = set
 	}
+	return newlyTracked
+}
+
+func scheduleApprovalSettleTick(approvalID string) tea.Cmd {
+	return tea.Tick(core.SettleWindow+15*time.Millisecond, func(time.Time) tea.Msg {
+		return approvalSettledTickMsg{approvalID: approvalID}
+	})
+}
+
+func compactJSONArgs(raw json.RawMessage) string {
+	trimmed := bytes.TrimSpace(raw)
+	if len(trimmed) == 0 {
+		return ""
+	}
+	var buf bytes.Buffer
+	if err := json.Compact(&buf, trimmed); err == nil {
+		return buf.String()
+	}
+	return string(trimmed)
 }
 
 func (m *Model) upsertApproval(appr core.PendingApproval) {

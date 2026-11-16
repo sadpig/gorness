@@ -558,7 +558,15 @@ func quickGitStatus(dir string) string {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, "git", "-C", dir, "status", "--porcelain", "-u")
+	cmd := exec.CommandContext(
+		ctx,
+		"git",
+		"-c", "core.fsmonitor=false",
+		"-c", "core.hooksPath=/dev/null",
+		"-C", dir,
+		"status", "--porcelain", "-u",
+	)
+	cmd.Env = buildCleanCommandEnv(os.TempDir(), nil)
 	out, err := cmd.Output()
 	if err != nil {
 		return ""

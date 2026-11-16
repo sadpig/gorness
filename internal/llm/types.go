@@ -43,6 +43,8 @@ const (
 
 type StreamEvent struct {
 	Type            StreamEventType `json:"type"`
+	ProviderID      string          `json:"provider_id,omitempty"`
+	ModelID         string          `json:"model_id,omitempty"`
 	Text            string          `json:"text,omitempty"`
 	Thinking        string          `json:"thinking,omitempty"`
 	Signature       string          `json:"signature,omitempty"`
