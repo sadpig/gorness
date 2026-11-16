@@ -1191,12 +1191,12 @@ details.subagent-card > summary::-webkit-details-marker {
   gap: 4px;
 }
 
-/* Config Matrix & Live Vault Editor */
+/* Config Matrix & Live Vault Editor (Right Inspector + Full Mode C Studio) */
 .config-block {
   display: flex;
   flex-direction: column;
-  gap: 7px;
-  padding-bottom: 8px;
+  gap: 8px;
+  padding-bottom: 10px;
   border-bottom: 1px solid var(--hairline);
 }
 .config-block.grow {
@@ -1208,25 +1208,52 @@ details.subagent-card > summary::-webkit-details-marker {
   display: flex;
   justify-content: space-between;
   align-items: center;
+  gap: 8px;
   font-size: 12px;
+}
+.insp-matrix-hint {
+  font-size: 11px;
+  color: var(--ink-secondary);
+  line-height: 1.4;
 }
 .agent-matrix-rows {
   display: flex;
   flex-direction: column;
-  gap: 6px;
-  max-height: 220px;
+  gap: 8px;
   overflow-y: auto;
 }
 .matrix-row {
-  padding: 6px 8px;
-  border-radius: 7px;
+  padding: 9px 10px;
+  border-radius: 9px;
   background: var(--bg-canvas);
   border: 1px solid var(--hairline);
-  display: grid;
-  grid-template-columns: 74px 1fr 64px auto;
-  gap: 5px;
-  align-items: center;
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
   font-size: 11.5px;
+}
+.matrix-row-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 6px;
+}
+.matrix-row-selects {
+  display: grid;
+  grid-template-columns: 0.9fr 1.35fr 0.75fr;
+  gap: 5px;
+}
+.raw-vault-disclosure {
+  border: 1px solid var(--hairline);
+  border-radius: 9px;
+  padding: 8px 10px;
+  background: var(--bg-canvas);
+}
+.raw-vault-disclosure > summary {
+  cursor: pointer;
+  font-size: 11.5px;
+  font-weight: 600;
+  color: var(--ink-secondary);
 }
 .vault-editor {
   flex: 1;
@@ -1247,6 +1274,359 @@ details.subagent-card > summary::-webkit-details-marker {
 .tiny-status {
   font-size: 11px;
   color: var(--green);
+}
+.tiny-muted {
+  font-size: 11.5px;
+  color: var(--ink-secondary);
+}
+
+/* Mode C: Apple System Settings & Config Matrix Studio */
+.settings-studio-header {
+  padding: 9px 16px;
+  background: var(--bg-surface);
+  border-bottom: 1px solid var(--hairline);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+.settings-nav-pills {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  flex-wrap: wrap;
+}
+.settings-nav-btn {
+  border: 1px solid transparent;
+  background: transparent;
+  color: var(--ink-secondary);
+  padding: 5px 10px;
+  border-radius: 8px;
+  font-size: 12px;
+  font-weight: 500;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  transition: background var(--ease-mac), color var(--ease-mac), border-color var(--ease-mac);
+}
+.settings-nav-btn:hover {
+  background: var(--bg-hover);
+  color: var(--ink-primary);
+}
+.settings-nav-btn.active {
+  background: var(--bg-selected);
+  color: var(--accent);
+  border-color: rgba(0, 113, 227, 0.25);
+  font-weight: 600;
+}
+.settings-tile {
+  width: 20px;
+  height: 20px;
+  border-radius: 5px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 11.5px;
+  background: var(--bg-subtle);
+}
+
+.config-studio-scroll {
+  flex: 1;
+  overflow-y: auto;
+  padding: 18px 22px 28px;
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+.cfg-section-card {
+  background: var(--bg-surface);
+  border: 1px solid var(--hairline);
+  border-radius: 12px;
+  padding: 14px 16px;
+  box-shadow: var(--shadow-card);
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+.cfg-section-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+.cfg-section-title {
+  font-size: 14px;
+  font-weight: 600;
+  margin: 0 0 2px;
+}
+.cfg-section-desc {
+  font-size: 12px;
+  color: var(--ink-secondary);
+  margin: 0;
+}
+
+/* 1-Click Scheme & Preset Cards */
+.scheme-presets-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(210px, 1fr));
+  gap: 9px;
+}
+.scheme-card {
+  padding: 10px 12px;
+  border-radius: 10px;
+  border: 1px solid var(--hairline-strong);
+  background: var(--bg-canvas);
+  cursor: pointer;
+  text-align: left;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  transition: border-color var(--ease-mac), background var(--ease-mac), transform var(--ease-mac);
+}
+.scheme-card:hover {
+  border-color: var(--accent);
+  background: var(--bg-selected);
+}
+.scheme-card.active {
+  border-color: var(--accent);
+  background: var(--bg-selected);
+}
+.scheme-card-top {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 6px;
+}
+.scheme-card strong {
+  font-size: 12.5px;
+  color: var(--ink-primary);
+}
+.scheme-card span {
+  font-size: 11px;
+  color: var(--ink-secondary);
+  line-height: 1.38;
+}
+
+/* Visual Agent Role Matrix Cards */
+.role-cards-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(390px, 1fr));
+  gap: 12px;
+}
+.role-matrix-card {
+  background: var(--bg-surface);
+  border: 1px solid var(--hairline-strong);
+  border-radius: 12px;
+  padding: 13px 15px;
+  box-shadow: var(--shadow-card);
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.role-card-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  gap: 8px;
+}
+.role-title-wrap {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.role-title-line {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+}
+.role-id-badge {
+  padding: 2px 7px;
+  border-radius: 6px;
+  background: var(--bg-selected);
+  color: var(--accent);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  font-weight: 600;
+}
+.role-field-grid {
+  display: grid;
+  grid-template-columns: 1fr 1.45fr;
+  gap: 8px;
+}
+.cfg-field-label {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  font-size: 11px;
+  font-weight: 500;
+  color: var(--ink-secondary);
+}
+
+/* Segmented Pill Selector Bars (Effort, Access Mode, Concurrency, Timeout) */
+.pill-bar {
+  display: inline-flex;
+  background: var(--bg-subtle);
+  border-radius: 8px;
+  padding: 2px;
+  gap: 2px;
+  flex-wrap: wrap;
+}
+.pill-opt {
+  border: 0;
+  background: transparent;
+  color: var(--ink-secondary);
+  padding: 4px 9px;
+  border-radius: 6px;
+  font-size: 11.5px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: background var(--ease-mac), color var(--ease-mac);
+}
+.pill-opt:hover {
+  color: var(--ink-primary);
+}
+.pill-opt.active {
+  background: var(--bg-surface);
+  color: var(--accent);
+  font-weight: 600;
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.08);
+}
+
+/* Interactive Checkable Tool & Domain Chips */
+.preset-pills-row, .chips-wrap {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  align-items: center;
+}
+.chip-btn {
+  border: 1px solid var(--hairline-strong);
+  background: var(--bg-canvas);
+  color: var(--ink-secondary);
+  padding: 4px 9px;
+  border-radius: 999px;
+  font-size: 11.5px;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  transition: all var(--ease-mac);
+}
+.chip-btn:hover {
+  border-color: var(--accent);
+  color: var(--ink-primary);
+}
+.chip-btn.active {
+  background: var(--bg-selected);
+  border-color: var(--accent);
+  color: var(--accent);
+  font-weight: 600;
+}
+.chip-btn.danger-chip.active {
+  background: var(--red-bg);
+  border-color: var(--red);
+  color: var(--red);
+}
+.chip-btn.warn-chip.active {
+  background: var(--amber-bg);
+  border-color: var(--amber);
+  color: var(--amber);
+}
+.chip-remove {
+  margin-left: 2px;
+  opacity: 0.7;
+  font-weight: 700;
+}
+.chip-remove:hover {
+  opacity: 1;
+}
+
+/* Form Rows in Settings Studio */
+.settings-form-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 14px;
+  padding: 9px 0;
+  border-bottom: 1px solid var(--hairline);
+  flex-wrap: wrap;
+}
+.settings-form-row:last-child {
+  border-bottom: 0;
+  padding-bottom: 0;
+}
+.settings-row-info {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 180px;
+  flex: 1;
+}
+.settings-row-info strong {
+  font-size: 12.5px;
+}
+.settings-row-info span {
+  font-size: 11.5px;
+  color: var(--ink-secondary);
+}
+
+/* Workspace Picker & Discovered Repos Grid */
+.picker-banner-row {
+  padding: 11px 14px;
+  border-radius: 10px;
+  background: var(--bg-selected);
+  border: 1px solid rgba(0, 113, 227, 0.25);
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 12px;
+}
+.discovered-repos-section {
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+}
+.ws-suggestions-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(210px, 1fr));
+  gap: 7px;
+  max-height: 230px;
+  overflow-y: auto;
+  padding: 2px;
+}
+.ws-sug-card {
+  padding: 8px 10px;
+  border-radius: 8px;
+  border: 1px solid var(--hairline-strong);
+  background: var(--bg-canvas);
+  cursor: pointer;
+  text-align: left;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+.ws-sug-card:hover {
+  border-color: var(--accent);
+  background: var(--bg-selected);
+}
+.ws-sug-card.registered {
+  border-color: var(--green);
+  background: var(--green-bg);
+}
+.manual-input-disclosure {
+  border: 1px solid var(--hairline);
+  border-radius: 8px;
+  padding: 7px 10px;
+  background: var(--bg-canvas);
+}
+.manual-input-disclosure > summary {
+  cursor: pointer;
+  font-size: 11.5px;
+  color: var(--ink-secondary);
 }
 
 /* Sandboxed Preview Tab */

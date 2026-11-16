@@ -11,6 +11,7 @@ import (
 	"io/fs"
 	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"sort"
 	"strconv"
@@ -138,14 +139,22 @@ func (s *Server) buildMux() http.Handler {
 	mux.HandleFunc("POST /api/config/global", s.handleUpdateGlobalConfig)
 	mux.HandleFunc("PUT /api/config/global", s.handleUpdateGlobalConfig)
 	mux.HandleFunc("POST /api/config/providers", s.handleUpsertProvider)
+	mux.HandleFunc("DELETE /api/config/providers/{id}", s.handleDeleteProvider)
 	mux.HandleFunc("POST /api/config/agents", s.handleUpsertAgent)
 	mux.HandleFunc("POST /api/config/workflows", s.handleUpsertWorkflow)
+	mux.HandleFunc("POST /api/config/rules", s.handleUpsertRules)
+	mux.HandleFunc("PUT /api/config/rules", s.handleUpsertRules)
+	mux.HandleFunc("POST /api/config/mcp", s.handleUpsertMCP)
+	mux.HandleFunc("PUT /api/config/mcp", s.handleUpsertMCP)
+	mux.HandleFunc("DELETE /api/config/mcp/{id}", s.handleDeleteMCP)
 	mux.HandleFunc("GET /api/config/files", s.handleGetConfigFiles)
 	mux.HandleFunc("PUT /api/config/files", s.handleSaveConfigFile)
 
 	// Workspaces
 	mux.HandleFunc("GET /api/workspaces", s.handleListWorkspaces)
 	mux.HandleFunc("POST /api/workspaces", s.handleRegisterWorkspace)
+	mux.HandleFunc("GET /api/workspaces/suggestions", s.handleWorkspaceSuggestions)
+	mux.HandleFunc("POST /api/workspaces/pick-folder", s.handlePickWorkspaceFolder)
 	mux.HandleFunc("GET /api/workspaces/{wsID}", s.handleGetWorkspace)
 	mux.HandleFunc("PATCH /api/workspaces/{wsID}", s.handleUpdateWorkspace)
 	mux.HandleFunc("PUT /api/workspaces/{wsID}", s.handleUpdateWorkspace)
@@ -424,6 +433,9 @@ func (s *Server) handleUpdateGlobalConfig(w http.ResponseWriter, r *http.Request
 	}
 	if v, ok := patch["max_concurrency"].(float64); ok && int(v) > 0 {
 		cur.MaxConcurrency = int(v)
+	}
+	if v, ok := patch["max_tool_concurrency"].(float64); ok && int(v) > 0 {
+		cur.MaxToolConcurrency = int(v)
 	}
 	if v, ok := patch["max_steps"].(float64); ok && int(v) > 0 {
 		cur.MaxSteps = int(v)
@@ -794,6 +806,292 @@ func (s *Server) handleUpsertWorkflow(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, sanitizeConfigSnapshot(snap))
 }
 
+func (s *Server) handleDeleteProvider(w http.ResponseWriter, r *http.Request) {
+	if s.cfg == nil {
+		writeJSONError(w, http.StatusServiceUnavailable, "config manager unavailable")
+		return
+	}
+	provID := strings.TrimSpace(r.PathValue("id"))
+	if err := fleet.ValidateID(provID); err != nil {
+		writeJSONError(w, http.StatusBadRequest, fmt.Sprintf("invalid provider id: %v", err))
+		return
+	}
+
+	s.configMu.Lock()
+	defer s.configMu.Unlock()
+
+	var doc struct {
+		Providers map[string]config.ProviderConfig `toml:"providers"`
+	}
+	if raw, err := os.ReadFile(s.cfg.Paths().ProvidersFile()); err == nil && len(bytes.TrimSpace(raw)) > 0 {
+		_ = toml.Unmarshal(raw, &doc)
+	}
+	if len(doc.Providers) <= 1 {
+		writeJSONError(w, http.StatusBadRequest, "cannot delete the last remaining provider")
+		return
+	}
+	delete(doc.Providers, provID)
+
+	encoded, err := toml.Marshal(doc)
+	if err != nil {
+		writeJSONError(w, http.StatusBadRequest, fmt.Sprintf("marshal providers.toml: %v", err))
+		return
+	}
+	if err := store.AtomicWriteFile(s.cfg.Paths().ProvidersFile(), encoded, 0o600); err != nil {
+		writeJSONError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	snap, err := s.cfg.Reload()
+	if err != nil {
+		writeJSONError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	s.lastDiag.Store(nil)
+	writeJSON(w, http.StatusOK, sanitizeConfigSnapshot(snap))
+}
+
+type rulesPatchInput struct {
+	AllowCommands  *[]string                `json:"allow_commands"`
+	AskCommands    *[]string                `json:"ask_commands"`
+	DenyCommands   *[]string                `json:"deny_commands"`
+	AllowPaths     *[]string                `json:"allow_paths"`
+	DenyPaths      *[]string                `json:"deny_paths"`
+	AllowedDomains *[]string                `json:"allowed_domains"`
+	Rules          *[]config.PermissionRule `json:"rules"`
+}
+
+func (s *Server) handleUpsertRules(w http.ResponseWriter, r *http.Request) {
+	if s.cfg == nil {
+		writeJSONError(w, http.StatusServiceUnavailable, "config manager unavailable")
+		return
+	}
+	var patch rulesPatchInput
+	if err := decodeJSONBody(r, &patch); err != nil {
+		writeJSONError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	s.configMu.Lock()
+	defer s.configMu.Unlock()
+
+	var merged config.RuleSet
+	if cur := s.cfg.Current(); cur != nil {
+		merged = cur.Clone().Rules
+	}
+	cleanStrList := func(in []string) []string {
+		seen := make(map[string]bool, len(in))
+		out := make([]string, 0, len(in))
+		for _, item := range in {
+			v := strings.TrimSpace(item)
+			if v != "" && !seen[v] {
+				seen[v] = true
+				out = append(out, v)
+			}
+		}
+		return out
+	}
+
+	if patch.AllowCommands != nil {
+		merged.AllowCommands = cleanStrList(*patch.AllowCommands)
+	}
+	if patch.AskCommands != nil {
+		merged.AskCommands = cleanStrList(*patch.AskCommands)
+	}
+	if patch.DenyCommands != nil {
+		merged.DenyCommands = cleanStrList(*patch.DenyCommands)
+	}
+	if patch.AllowPaths != nil {
+		merged.AllowPaths = cleanStrList(*patch.AllowPaths)
+	}
+	if patch.DenyPaths != nil {
+		merged.DenyPaths = cleanStrList(*patch.DenyPaths)
+	}
+	if patch.AllowedDomains != nil {
+		merged.AllowedDomains = cleanStrList(*patch.AllowedDomains)
+	}
+	if patch.Rules != nil {
+		cp := make([]config.PermissionRule, len(*patch.Rules))
+		copy(cp, *patch.Rules)
+		merged.Rules = cp
+	}
+
+	encoded, err := toml.Marshal(merged)
+	if err != nil {
+		writeJSONError(w, http.StatusBadRequest, fmt.Sprintf("marshal rules.toml: %v", err))
+		return
+	}
+	if err := store.AtomicWriteFile(s.cfg.Paths().RulesFile(), encoded, 0o600); err != nil {
+		writeJSONError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	snap, err := s.cfg.Reload()
+	if err != nil {
+		writeJSONError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	s.lastDiag.Store(nil)
+	writeJSON(w, http.StatusOK, sanitizeConfigSnapshot(snap))
+}
+
+type mcpPatchInput struct {
+	ID         string             `json:"id"`
+	Transport  *string            `json:"transport"`
+	Command    *string            `json:"command"`
+	Args       *[]string          `json:"args"`
+	URL        *string            `json:"url"`
+	Env        *map[string]string `json:"env"`
+	Headers    *map[string]string `json:"headers"`
+	Enabled    *bool              `json:"enabled"`
+	TimeoutSec *int               `json:"timeout_sec"`
+}
+
+func (s *Server) handleUpsertMCP(w http.ResponseWriter, r *http.Request) {
+	if s.cfg == nil {
+		writeJSONError(w, http.StatusServiceUnavailable, "config manager unavailable")
+		return
+	}
+	var patch mcpPatchInput
+	if err := decodeJSONBody(r, &patch); err != nil {
+		writeJSONError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	srvID := strings.TrimSpace(patch.ID)
+	if err := fleet.ValidateID(srvID); err != nil {
+		writeJSONError(w, http.StatusBadRequest, fmt.Sprintf("invalid mcp server id: %v", err))
+		return
+	}
+
+	s.configMu.Lock()
+	defer s.configMu.Unlock()
+
+	var doc config.MCPConfig
+	if raw, err := os.ReadFile(s.cfg.Paths().MCPFile()); err == nil && len(bytes.TrimSpace(raw)) > 0 {
+		_ = toml.Unmarshal(raw, &doc)
+	}
+	if doc.Servers == nil {
+		doc.Servers = make(map[string]config.MCPServerConfig)
+	}
+
+	merged, hasExisting := doc.Servers[srvID]
+	merged.ID = srvID
+	if patch.Transport != nil && strings.TrimSpace(*patch.Transport) != "" {
+		merged.Transport = strings.TrimSpace(*patch.Transport)
+	}
+	if strings.TrimSpace(merged.Transport) == "" {
+		merged.Transport = "stdio"
+	}
+	if patch.Command != nil {
+		merged.Command = strings.TrimSpace(*patch.Command)
+	}
+	if patch.Args != nil {
+		cp := make([]string, len(*patch.Args))
+		copy(cp, *patch.Args)
+		merged.Args = cp
+	}
+	if patch.URL != nil {
+		merged.URL = strings.TrimSpace(*patch.URL)
+	}
+	if patch.Env != nil {
+		if len(*patch.Env) == 0 {
+			merged.Env = nil
+		} else {
+			if merged.Env == nil {
+				merged.Env = make(map[string]string, len(*patch.Env))
+			}
+			for k, v := range *patch.Env {
+				if hasExisting && strings.TrimSpace(v) == "[REDACTED]" {
+					continue
+				}
+				merged.Env[k] = v
+			}
+		}
+	}
+	if patch.Headers != nil {
+		if len(*patch.Headers) == 0 {
+			merged.Headers = nil
+		} else {
+			if merged.Headers == nil {
+				merged.Headers = make(map[string]string, len(*patch.Headers))
+			}
+			for k, v := range *patch.Headers {
+				if hasExisting && strings.TrimSpace(v) == "[REDACTED]" {
+					continue
+				}
+				merged.Headers[k] = v
+			}
+		}
+	}
+	if patch.Enabled != nil {
+		val := *patch.Enabled
+		merged.Enabled = &val
+	} else if merged.Enabled == nil {
+		val := true
+		merged.Enabled = &val
+	}
+	if patch.TimeoutSec != nil && *patch.TimeoutSec > 0 {
+		merged.TimeoutSec = *patch.TimeoutSec
+	} else if merged.TimeoutSec <= 0 {
+		merged.TimeoutSec = 60
+	}
+
+	doc.Servers[srvID] = merged
+	encoded, err := toml.Marshal(doc)
+	if err != nil {
+		writeJSONError(w, http.StatusBadRequest, fmt.Sprintf("marshal mcp.toml: %v", err))
+		return
+	}
+	if err := store.AtomicWriteFile(s.cfg.Paths().MCPFile(), encoded, 0o600); err != nil {
+		writeJSONError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	snap, err := s.cfg.Reload()
+	if err != nil {
+		writeJSONError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	s.lastDiag.Store(nil)
+	writeJSON(w, http.StatusOK, sanitizeConfigSnapshot(snap))
+}
+
+func (s *Server) handleDeleteMCP(w http.ResponseWriter, r *http.Request) {
+	if s.cfg == nil {
+		writeJSONError(w, http.StatusServiceUnavailable, "config manager unavailable")
+		return
+	}
+	srvID := strings.TrimSpace(r.PathValue("id"))
+	if err := fleet.ValidateID(srvID); err != nil {
+		writeJSONError(w, http.StatusBadRequest, fmt.Sprintf("invalid mcp server id: %v", err))
+		return
+	}
+
+	s.configMu.Lock()
+	defer s.configMu.Unlock()
+
+	var doc config.MCPConfig
+	if raw, err := os.ReadFile(s.cfg.Paths().MCPFile()); err == nil && len(bytes.TrimSpace(raw)) > 0 {
+		_ = toml.Unmarshal(raw, &doc)
+	}
+	if doc.Servers != nil {
+		delete(doc.Servers, srvID)
+	}
+	encoded, err := toml.Marshal(doc)
+	if err != nil {
+		writeJSONError(w, http.StatusBadRequest, fmt.Sprintf("marshal mcp.toml: %v", err))
+		return
+	}
+	if err := store.AtomicWriteFile(s.cfg.Paths().MCPFile(), encoded, 0o600); err != nil {
+		writeJSONError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	snap, err := s.cfg.Reload()
+	if err != nil {
+		writeJSONError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	s.lastDiag.Store(nil)
+	writeJSON(w, http.StatusOK, sanitizeConfigSnapshot(snap))
+}
+
 func (s *Server) handleGetConfigFiles(w http.ResponseWriter, r *http.Request) {
 	if s.cfg == nil {
 		writeJSONError(w, http.StatusServiceUnavailable, "config manager unavailable")
@@ -1029,6 +1327,113 @@ func (s *Server) handleRegisterWorkspace(w http.ResponseWriter, r *http.Request)
 		return
 	}
 	writeJSON(w, http.StatusCreated, ws)
+}
+
+type workspaceSuggestion struct {
+	Name       string `json:"name"`
+	Path       string `json:"path"`
+	IsGit      bool   `json:"is_git"`
+	Registered bool   `json:"registered"`
+}
+
+func (s *Server) handleWorkspaceSuggestions(w http.ResponseWriter, _ *http.Request) {
+	homeDir := ""
+	vaultRoot := ""
+	if s.cfg != nil {
+		vaultRoot = s.cfg.Paths().Root
+		homeDir = filepath.Dir(vaultRoot)
+	}
+	if homeDir == "" {
+		homeDir, _ = os.UserHomeDir()
+	}
+
+	registeredPaths := make(map[string]bool)
+	if s.engine != nil {
+		for _, ws := range s.engine.Workspaces().List() {
+			registeredPaths[filepath.Clean(ws.RootPath)] = true
+		}
+	}
+
+	searchRoots := []string{
+		filepath.Join(homeDir, "Documents", "MyProjectes"),
+		filepath.Join(homeDir, "Documents", "Projects"),
+		filepath.Join(homeDir, "Projects"),
+		filepath.Join(homeDir, "Developer"),
+		filepath.Join(homeDir, "Code"),
+		filepath.Join(homeDir, "Workspace"),
+		filepath.Join(homeDir, "Workspaces"),
+		filepath.Join(homeDir, "repos"),
+		filepath.Join(homeDir, "src"),
+	}
+
+	seen := make(map[string]bool)
+	var suggestions []workspaceSuggestion
+
+	for _, root := range searchRoots {
+		entries, err := os.ReadDir(root)
+		if err != nil {
+			continue
+		}
+		for _, ent := range entries {
+			if !ent.IsDir() || strings.HasPrefix(ent.Name(), ".") {
+				continue
+			}
+			full := filepath.Clean(filepath.Join(root, ent.Name()))
+			if full == filepath.Clean(vaultRoot) || seen[full] {
+				continue
+			}
+			seen[full] = true
+			_, gitErr := os.Stat(filepath.Join(full, ".git"))
+			suggestions = append(suggestions, workspaceSuggestion{
+				Name:       ent.Name(),
+				Path:       full,
+				IsGit:      gitErr == nil,
+				Registered: registeredPaths[full],
+			})
+			if len(suggestions) >= 60 {
+				break
+			}
+		}
+		if len(suggestions) >= 60 {
+			break
+		}
+	}
+
+	sort.Slice(suggestions, func(i, j int) bool {
+		if suggestions[i].IsGit != suggestions[j].IsGit {
+			return suggestions[i].IsGit
+		}
+		return strings.ToLower(suggestions[i].Name) < strings.ToLower(suggestions[j].Name)
+	})
+
+	if suggestions == nil {
+		suggestions = []workspaceSuggestion{}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"suggestions": suggestions,
+	})
+}
+
+func (s *Server) handlePickWorkspaceFolder(w http.ResponseWriter, r *http.Request) {
+	ctx, cancel := context.WithTimeout(r.Context(), 60*time.Second)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, "/usr/bin/osascript", "-e", `POSIX path of (choose folder with prompt "选择要挂载到 Gorness 的项目文件夹 / Select Project Folder")`)
+	out, err := cmd.Output()
+	if err != nil {
+		writeJSON(w, http.StatusOK, map[string]any{"cancelled": true})
+		return
+	}
+	chosen := strings.TrimRight(strings.TrimSpace(string(out)), "/")
+	if chosen == "" {
+		writeJSON(w, http.StatusOK, map[string]any{"cancelled": true})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"cancelled": false,
+		"path":      chosen,
+		"name":      filepath.Base(chosen),
+	})
 }
 
 func (s *Server) handleGetWorkspace(w http.ResponseWriter, r *http.Request) {

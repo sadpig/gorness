@@ -30,6 +30,7 @@
             <span data-i18n="modeFleet">多智能体编排画布</span>
             <span id="fleet-live-badge" class="pill-count hidden">0</span>
           </button>
+          <button id="mode-config-btn" class="seg-btn" type="button" data-mode="config" data-i18n="modeConfig">配置矩阵与设置</button>
         </div>
       </div>
 
@@ -95,13 +96,13 @@
             </div>
             <span class="vault-formats">TOML · MD · JSONL · HTML</span>
           </div>
-          <button id="open-config-studio-btn" class="ghost-xs-btn" type="button" data-i18n="configStudioBtn">配置矩阵</button>
+          <button id="open-config-studio-btn" class="primary-xs-btn" type="button" data-i18n="configStudioBtn">配置矩阵</button>
         </footer>
       </aside>
 
       <div class="splitter" id="left-splitter" role="separator" aria-orientation="vertical"></div>
 
-      <!-- CENTER PANE: Dual Mode (A) Streaming Conversation | (B) Visual Multi-Agent SVG Studio -->
+      <!-- CENTER PANE: Tri-Mode (A) Streaming Conversation | (B) Visual Multi-Agent SVG Studio | (C) Zero-Typing Config & Matrix Studio -->
       <main class="center-pane" id="center-pane">
         <!-- Reload Diagnostic Banner (if malformed TOML/MD saved mid-edit) -->
         <div id="reload-diag-banner" class="diag-banner hidden"></div>
@@ -122,17 +123,20 @@
               </label>
 
               <label class="inline-select-label">
-                <span data-i18n="permLabel">权限</span>
-                <select id="perm-mode-select" class="mac-select">
-                  <option value="auto">auto</option>
-                  <option value="accept_edits">accept_edits</option>
-                  <option value="ask">ask</option>
-                  <option value="plan">plan</option>
-                  <option value="yolo">yolo</option>
-                </select>
+                <span data-i18n="modelSelectLabel">模型</span>
+                <select id="model-override-input" class="mac-select mono"></select>
               </label>
 
-              <input id="model-override-input" class="mac-input-xs mono" type="text" data-i18n-placeholder="modelOverridePh" placeholder="provider/model 覆盖">
+              <label class="inline-select-label">
+                <span data-i18n="permLabel">权限</span>
+                <select id="perm-mode-select" class="mac-select">
+                  <option value="auto" data-i18n="permAutoOpt">自动安全门控 (Auto)</option>
+                  <option value="accept_edits" data-i18n="permAcceptEditsOpt">自动接受编辑 (Accept Edits)</option>
+                  <option value="ask" data-i18n="permAskOpt">每次询问 (Ask)</option>
+                  <option value="plan" data-i18n="permPlanOpt">只读规划 (Plan)</option>
+                  <option value="yolo" data-i18n="permYoloOpt">全放行 (Yolo)</option>
+                </select>
+              </label>
 
               <button id="compact-session-btn" class="ghost-xs-btn" type="button" title="/compact" data-i18n="compactBtn">压缩</button>
               <button id="fork-session-btn" class="ghost-xs-btn" type="button" title="/fork" data-i18n="forkBtn">分叉</button>
@@ -239,6 +243,43 @@
             </div>
           </div>
         </section>
+
+        <!-- MODE C: Apple HIG Zero-Typing Settings & Agent-Model Matrix Studio -->
+        <section id="config-mode-view" class="mode-view hidden">
+          <div class="settings-studio-header">
+            <div class="settings-nav-pills" id="settings-nav-pills" role="tablist">
+              <button class="settings-nav-btn active" type="button" data-cfg-page="matrix">
+                <span class="settings-tile tile-purple">🧩</span>
+                <span data-i18n="cfgPageMatrix">异构角色模型矩阵</span>
+              </button>
+              <button class="settings-nav-btn" type="button" data-cfg-page="providers">
+                <span class="settings-tile tile-blue">☁️</span>
+                <span data-i18n="cfgPageProviders">供应商与模型目录</span>
+              </button>
+              <button class="settings-nav-btn" type="button" data-cfg-page="workflows">
+                <span class="settings-tile tile-indigo">🕸️</span>
+                <span data-i18n="cfgPageWorkflows">多智能体拓扑配置</span>
+              </button>
+              <button class="settings-nav-btn" type="button" data-cfg-page="global">
+                <span class="settings-tile tile-teal">🛡️</span>
+                <span data-i18n="cfgPageGlobal">全局与权限沙箱</span>
+              </button>
+              <button class="settings-nav-btn" type="button" data-cfg-page="mcp">
+                <span class="settings-tile tile-green">🔌</span>
+                <span data-i18n="cfgPageMCP">MCP 扩展服务</span>
+              </button>
+              <button class="settings-nav-btn" type="button" data-cfg-page="files">
+                <span class="settings-tile tile-gray">📄</span>
+                <span data-i18n="cfgPageFiles">底层源文件</span>
+              </button>
+            </div>
+            <div class="settings-header-right">
+              <span id="config-autosave-pill" class="status-pill ok" data-i18n="autoSaveReady">点选即存 · 实时热生效 ✓</span>
+            </div>
+          </div>
+
+          <div id="config-studio-content" class="config-studio-scroll"></div>
+        </section>
       </main>
 
       <div class="splitter" id="right-splitter" role="separator" aria-orientation="vertical"></div>
@@ -279,40 +320,28 @@
           <div id="snapshots-timeline-list" class="snapshots-list"></div>
         </section>
 
-        <!-- Tab 3: Heterogeneous Agent-Model Matrix & Live ~/.gorness/ TOML/MD Editor -->
+        <!-- Tab 3: Quick Zero-Typing Agent-Model Matrix & Studio Launcher -->
         <section id="insp-panel-config" class="insp-panel hidden">
           <div class="config-block">
             <div class="subhead-row">
               <strong data-i18n="agentMatrixTitle">异构 Agent 角色模型矩阵</strong>
-              <button id="toggle-add-provider-btn" class="ghost-xs-btn" type="button" data-i18n="addProviderBtn">+ 供应商</button>
+              <button id="expand-full-config-btn" class="primary-xs-btn" type="button" data-i18n="expandConfigStudioBtn">展开完整配置中心 ↗</button>
             </div>
-
-            <form id="quick-provider-form" class="mini-card-form hidden">
-              <input id="prov-id-in" class="mac-input" type="text" placeholder="id (e.g. apple_genai)" required>
-              <select id="prov-proto-in" class="mac-select">
-                <option value="anthropic">anthropic</option>
-                <option value="openai-responses">openai-responses</option>
-                <option value="openai-compat">openai-compat</option>
-                <option value="gemini">gemini</option>
-              </select>
-              <input id="prov-url-in" class="mac-input" type="text" placeholder="base_url (https://...)" required>
-              <input id="prov-key-in" class="mac-input mono" type="text" placeholder="env:API_KEY or keychain:service">
-              <input id="prov-model-in" class="mac-input mono" type="text" placeholder="default model id">
-              <button class="primary-xs-btn" type="submit" data-i18n="saveProviderBtn">写入 providers.toml</button>
-            </form>
-
+            <div class="insp-matrix-hint" data-i18n="inspMatrixHint">直接下拉点选服务商、模型与推理强度，即刻自动写入 ~/.gorness/agents/*.md</div>
             <div id="agent-matrix-rows" class="agent-matrix-rows"></div>
           </div>
 
-          <div class="config-block grow">
-            <div class="subhead-row">
-              <strong data-i18n="vaultEditorTitle">~/.gorness 实时 TOML / MD 编辑器</strong>
-              <button id="save-vault-file-btn" class="primary-xs-btn" type="button" data-i18n="saveHotReloadBtn">保存并热加载</button>
+          <details class="raw-vault-disclosure">
+            <summary data-i18n="vaultEditorTitle">高级：~/.gorness 底层 TOML / MD 源文件检视</summary>
+            <div class="config-block grow" style="margin-top:8px;">
+              <div class="subhead-row">
+                <select id="vault-file-select" class="mac-select" style="flex:1;"></select>
+                <button id="save-vault-file-btn" class="primary-xs-btn" type="button" data-i18n="saveHotReloadBtn">保存并热加载</button>
+              </div>
+              <textarea id="vault-file-editor" class="vault-editor mono" spellcheck="false"></textarea>
+              <div id="vault-save-status" class="tiny-status"></div>
             </div>
-            <select id="vault-file-select" class="mac-select full"></select>
-            <textarea id="vault-file-editor" class="vault-editor mono" spellcheck="false"></textarea>
-            <div id="vault-save-status" class="tiny-status"></div>
-          </div>
+          </details>
         </section>
 
         <!-- Tab 4: Isolated Sandboxed HTML Artifact Preview -->
@@ -342,31 +371,52 @@
     </div>
   </div>
 
-  <!-- Modal: Register Workspace -->
+  <!-- Modal: Register Workspace (with Native Finder Folder Picker & 1-Click Discovered Repositories) -->
   <div id="workspace-modal" class="modal-backdrop hidden" role="dialog" aria-modal="true">
-    <div class="modal-sheet">
+    <div class="modal-sheet wide">
       <div class="modal-head">
-        <h3 data-i18n="registerWsTitle">注册本地 macOS 项目工作区</h3>
+        <h3 data-i18n="registerWsTitle">挂载本地 macOS 项目工作区</h3>
         <button class="close-modal-btn" type="button" data-close="workspace-modal">✕</button>
       </div>
       <form id="register-ws-form" class="modal-form">
-        <label>
-          <span data-i18n="wsPathLabel">本地目录绝对路径</span>
-          <input id="ws-path-input" class="mac-input mono" type="text" placeholder="/Users/you/Projects/my-service" required>
-        </label>
-        <label>
-          <span data-i18n="wsNameLabel">显示名称（可选）</span>
-          <input id="ws-name-input" class="mac-input" type="text" placeholder="My Service">
-        </label>
+        <div class="picker-banner-row">
+          <div>
+            <strong data-i18n="finderPickerTitle">通过 macOS Finder 图形选择器添加</strong>
+            <div class="tiny-muted" data-i18n="finderPickerSub">无需手输路径，直接弹出原生文件夹对话框选择代码仓库</div>
+          </div>
+          <button id="pick-native-folder-btn" class="primary-sm-btn" type="button" data-i18n="pickFolderBtn">📁 选择本地文件夹…</button>
+        </div>
+
+        <div class="discovered-repos-section">
+          <div class="subhead-row">
+            <span class="tiny-muted" data-i18n="discoveredReposLabel">本机常用开发目录下发现的项目（点击即可一键挂载）：</span>
+          </div>
+          <div id="ws-suggestions-list" class="ws-suggestions-grid"></div>
+        </div>
+
+        <details class="manual-input-disclosure">
+          <summary data-i18n="manualPathToggle">或手动粘贴/微调目录路径</summary>
+          <div class="two-col" style="margin-top:8px;">
+            <label>
+              <span data-i18n="wsPathLabel">本地目录绝对路径</span>
+              <input id="ws-path-input" class="mac-input mono" type="text" placeholder="/Users/you/Projects/my-service" required>
+            </label>
+            <label>
+              <span data-i18n="wsNameLabel">显示名称（可选）</span>
+              <input id="ws-name-input" class="mac-input" type="text" placeholder="My Service">
+            </label>
+          </div>
+        </details>
+
         <div class="modal-actions">
           <button class="ghost-sm-btn close-modal-btn" type="button" data-close="workspace-modal" data-i18n="cancelBtn">取消</button>
-          <button class="primary-sm-btn" type="submit" data-i18n="confirmRegisterBtn">注册项目</button>
+          <button class="primary-sm-btn" type="submit" data-i18n="confirmRegisterBtn">挂载项目</button>
         </div>
       </form>
     </div>
   </div>
 
-  <!-- Modal: Launch Visual Multi-Agent Fleet Mission (6 Topologies) -->
+  <!-- Modal: Launch Visual Multi-Agent Fleet Mission (6 Topologies + Preset Selectors) -->
   <div id="fleet-launcher-modal" class="modal-backdrop hidden" role="dialog" aria-modal="true">
     <div class="modal-sheet wide">
       <div class="modal-head">
@@ -376,19 +426,43 @@
       <form id="launch-fleet-form" class="modal-form">
         <div class="topology-cards-grid" id="topology-cards-grid"></div>
 
-        <label>
-          <span data-i18n="missionGoalLabel">编排目标 (Mission Goal)</span>
-          <textarea id="fleet-goal-input" class="mac-textarea" rows="3" placeholder="描述跨模块架构改造、并发探索或生成-盲审闭环目标…" required></textarea>
-        </label>
+        <div>
+          <div class="subhead-row" style="margin-bottom:5px;">
+            <span data-i18n="missionGoalLabel">编排目标 (Mission Goal) — 可点选常用任务模板或补充说明</span>
+          </div>
+          <div class="preset-pills-row" id="fleet-goal-presets">
+            <button class="chip-btn" type="button" data-goal-preset="梳理项目核心模块架构，定位潜在边界缺陷并输出可验证的重构与补测方案">🏗️ 跨模块架构梳理与加固</button>
+            <button class="chip-btn" type="button" data-goal-preset="并发审计全仓并发安全、错误处理、路径边界与权限逃逸风险，并修复发现的问题">🛡️ 全仓安全与并发竞态审计</button>
+            <button class="chip-btn" type="button" data-goal-preset="按 TDD 闭环为当前核心模块补充高覆盖率边界测试，并通过异构 Verifier 盲审">🧪 核心模块 TDD 补测与盲审</button>
+            <button class="chip-btn" type="button" data-goal-preset="排查热点链路性能瓶颈、锁竞争与多余内存分配，提交最小化性能优化补丁">⚡ 性能剖析与零回归优化</button>
+          </div>
+          <textarea id="fleet-goal-input" class="mac-textarea" rows="3" placeholder="点击上方快捷目标模板，或在此输入具体任务目标…" required></textarea>
+        </div>
 
         <div class="two-col">
           <label>
-            <span data-i18n="verifyCmdLabel">Refinery 验收门控命令</span>
-            <input id="fleet-verify-input" class="mac-input mono" type="text" value="go test ./...">
+            <span data-i18n="verifyCmdLabel">Refinery 验收门控命令（点选预设）</span>
+            <select id="fleet-verify-input" class="mac-select mono">
+              <option value="go test ./...">go test ./...</option>
+              <option value="CGO_ENABLED=0 go test -race ./...">CGO_ENABLED=0 go test -race ./...</option>
+              <option value="npm test">npm test</option>
+              <option value="pnpm test">pnpm test</option>
+              <option value="pytest">pytest</option>
+              <option value="cargo test">cargo test</option>
+              <option value="make test">make test</option>
+              <option value="">（不执行门控命令 / 仅盲审）</option>
+            </select>
           </label>
           <label>
-            <span data-i18n="budgetLabel">预算上限 (USD, 0=不限)</span>
-            <input id="fleet-budget-input" class="mac-input mono" type="number" step="0.5" min="0" value="0">
+            <span data-i18n="budgetLabel">预算上限 (USD)</span>
+            <select id="fleet-budget-input" class="mac-select mono">
+              <option value="0">不限预算 ($0 Unlimited)</option>
+              <option value="1.0">$1.00 USD</option>
+              <option value="3.0">$3.00 USD</option>
+              <option value="5.0">$5.00 USD</option>
+              <option value="10.0">$10.00 USD</option>
+              <option value="25.0">$25.00 USD</option>
+            </select>
           </label>
         </div>
 
@@ -405,7 +479,7 @@
     </div>
   </div>
 
-  <!-- Modal / Drawer: Always-On Sleep-Wake Primitives -->
+  <!-- Modal / Drawer: Always-On Sleep-Wake Primitives (with Dropdown Schedule & Task Presets) -->
   <div id="alwayson-modal" class="modal-backdrop hidden" role="dialog" aria-modal="true">
     <div class="modal-sheet wide">
       <div class="modal-head">
@@ -418,10 +492,28 @@
             <strong data-i18n="aoTimersHead">持久化定时器 (timers.toml)</strong>
             <button id="trigger-dream-btn" class="ghost-xs-btn" type="button" data-i18n="runDreamBtn">运行 Dreamer 提炼技能</button>
           </div>
-          <form id="add-timer-form" class="inline-form">
-            <input id="timer-cron-input" class="mac-input mono" type="text" placeholder="*/30 * * * * (留空则为 60s Follow-up)">
-            <input id="timer-note-input" class="mac-input" type="text" placeholder="巡检任务说明…" required>
-            <button class="primary-xs-btn" type="submit">+</button>
+          <form id="add-timer-form" class="modal-form" style="padding:0;gap:7px;">
+            <div class="two-col">
+              <select id="timer-cron-input" class="mac-select mono">
+                <option value="*/15 * * * *">每 15 分钟 (*/15 * * * *)</option>
+                <option value="*/30 * * * *" selected>每 30 分钟 (*/30 * * * *)</option>
+                <option value="0 * * * *">每小时整点 (0 * * * *)</option>
+                <option value="0 9 * * *">每天早上 09:00 (0 9 * * *)</option>
+                <option value="0 18 * * *">每天傍晚 18:00 (0 18 * * *)</option>
+                <option value="0 9 * * 1">每周一 09:00 (0 9 * * 1)</option>
+                <option value="">单次 60 秒后跟进 (Follow-up)</option>
+              </select>
+              <select id="timer-note-preset" class="mac-select">
+                <option value="运行 go test ./... 检查工作区测试健康度，仅在发现失败时提醒我">🧪 定期运行测试健康度巡检</option>
+                <option value="检查 git status 与最近提交，汇总未完成的待办与风险项">🔍 检查 Git 工作区变更与风险</option>
+                <option value="扫描最近会话记录，提炼可复用的排错经验与项目规范">🧠 提炼近期会话经验与规范</option>
+                <option value="检查依赖与构建状态，确认无编译错误或安全告警">📦 验证构建与依赖健康状态</option>
+              </select>
+            </div>
+            <div class="inline-form">
+              <input id="timer-note-input" class="mac-input" type="text" value="运行 go test ./... 检查工作区测试健康度，仅在发现失败时提醒我" required>
+              <button class="primary-xs-btn" type="submit">+ 添加定时任务</button>
+            </div>
           </form>
           <div id="ao-timers-list" class="ao-list"></div>
         </div>
@@ -430,8 +522,13 @@
           <div class="subhead-row">
             <strong data-i18n="aoWebhookHead">本地事件注入 &amp; 发件箱 (outbox.jsonl)</strong>
           </div>
+          <div class="preset-pills-row">
+            <button class="chip-btn" type="button" data-wh-preset="执行一次快速代码质量与测试状态自检">⚡ 快速质量自检</button>
+            <button class="chip-btn" type="button" data-wh-preset="汇总当前工作区未提交的改动并生成简报">📋 改动简报汇总</button>
+            <button class="chip-btn" type="button" data-wh-preset="检查是否有挂起项或失败的单元测试">🩺 失败单测排查</button>
+          </div>
           <form id="send-webhook-form" class="inline-form">
-            <input id="webhook-text-input" class="mac-input" type="text" placeholder="投递幂等 Inbox 事件…" required>
+            <input id="webhook-text-input" class="mac-input" type="text" placeholder="点击上方快捷事件或输入说明…" required>
             <button class="primary-xs-btn" type="submit" data-i18n="enqueueBtn">投递</button>
           </form>
           <div id="ao-outbox-list" class="ao-list"></div>

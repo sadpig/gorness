@@ -1464,3 +1464,183 @@ func TestConfigMatrixPatchPreservationSkillFilesAndSessionRunLockGuards(t *testi
 		t.Fatalf("expected isolated session WorktreePath %s removed on delete, stat err=%v", createdMeta.WorktreePath, err)
 	}
 }
+
+func TestZeroTypingConfigMatrixRulesMCPAndWorkspaceSuggestions(t *testing.T) {
+	nodeBin, err := exec.LookPath("node")
+	if err != nil {
+		t.Skip("node binary not available")
+	}
+
+	srv, vaultDir, cleanup := newTestStack(t, nil, nil)
+	defer cleanup()
+
+	// Create a discoverable project folder inside the test user home directory
+	fakeHome := filepath.Dir(vaultDir)
+	sampleProj := filepath.Join(fakeHome, "Projects", "demo-service")
+	if err := os.MkdirAll(filepath.Join(sampleProj, ".git"), 0o755); err != nil {
+		t.Fatalf("mkdir sampleProj: %v", err)
+	}
+
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+	client := ts.Client()
+
+	doJSON := func(method, path string, body any) (int, []byte) {
+		t.Helper()
+		var rdr io.Reader
+		if body != nil {
+			raw, _ := json.Marshal(body)
+			rdr = bytes.NewReader(raw)
+		}
+		req, err := http.NewRequest(method, ts.URL+path, rdr)
+		if err != nil {
+			t.Fatalf("NewRequest %s %s: %v", method, path, err)
+		}
+		req.Header.Set("Origin", ts.URL)
+		if body != nil {
+			req.Header.Set("Content-Type", "application/json")
+		}
+		resp, err := client.Do(req)
+		if err != nil {
+			t.Fatalf("Do %s %s: %v", method, path, err)
+		}
+		defer resp.Body.Close()
+		out, _ := io.ReadAll(resp.Body)
+		return resp.StatusCode, out
+	}
+
+	// 1. Verify /api/config/rules updates rules.toml via structured click-toggle arrays.
+	stRules, rawRules := doJSON(http.MethodPost, "/api/config/rules", map[string]any{
+		"allowed_domains": []string{"api.anthropic.com", "api.deepseek.com", "github.com"},
+		"allow_commands":  []string{"go test*", "npm test*"},
+	})
+	if stRules != http.StatusOK {
+		t.Fatalf("POST /api/config/rules status=%d: %s", stRules, string(rawRules))
+	}
+	var snapAfterRules config.Snapshot
+	if err := json.Unmarshal(rawRules, &snapAfterRules); err != nil {
+		t.Fatalf("decode rules snapshot: %v", err)
+	}
+	if len(snapAfterRules.Rules.AllowedDomains) != 3 || snapAfterRules.Rules.AllowedDomains[1] != "api.deepseek.com" {
+		t.Fatalf("unexpected AllowedDomains after /api/config/rules: %+v", snapAfterRules.Rules.AllowedDomains)
+	}
+
+	// 2. Verify /api/config/mcp upserts and toggles MCP servers in mcp.toml.
+	stMCP, rawMCP := doJSON(http.MethodPost, "/api/config/mcp", map[string]any{
+		"id":          "filesystem",
+		"transport":   "stdio",
+		"command":     "npx",
+		"args":        []string{"-y", "@modelcontextprotocol/server-filesystem", "."},
+		"enabled":     true,
+		"timeout_sec": 60,
+	})
+	if stMCP != http.StatusOK {
+		t.Fatalf("POST /api/config/mcp status=%d: %s", stMCP, string(rawMCP))
+	}
+	var snapAfterMCP config.Snapshot
+	if err := json.Unmarshal(rawMCP, &snapAfterMCP); err != nil {
+		t.Fatalf("decode mcp snapshot: %v", err)
+	}
+	if _, ok := snapAfterMCP.MCP.Servers["filesystem"]; !ok {
+		t.Fatalf("expected filesystem MCP server in snapshot, got: %+v", snapAfterMCP.MCP.Servers)
+	}
+
+	// 3. Verify GET /api/workspaces/suggestions discovers ~/Projects/demo-service for 1-click mounting.
+	stSug, rawSug := doJSON(http.MethodGet, "/api/workspaces/suggestions", nil)
+	if stSug != http.StatusOK || !strings.Contains(string(rawSug), "demo-service") {
+		t.Fatalf("expected demo-service in /api/workspaces/suggestions (%d): %s", stSug, string(rawSug))
+	}
+
+	// 4. Verify Web UI exports zero-typing helpers: applyProviderPreset, applyMatrixPreset, patchAgentField, toggleRuleChip, toggleMCPPreset, and renders cascading dropdowns instead of text inputs!
+	appJSPath, err := filepath.Abs(filepath.Join("..", "..", "web", "app.js"))
+	if err != nil {
+		t.Fatalf("resolve web/app.js: %v", err)
+	}
+	nodeScript := fmt.Sprintf(`
+import assert from "node:assert/strict";
+import { pathToFileURL } from "node:url";
+
+const baseURL = %q;
+const elements = new Map();
+function makeEl(id) {
+  return {
+    id,
+    value: "",
+    textContent: "",
+    innerHTML: "",
+    checked: true,
+    disabled: false,
+    style: { setProperty() {}, width: "" },
+    dataset: {},
+    classList: {
+      _set: new Set(["hidden"]),
+      add(...c) { c.forEach((x) => this._set.add(x)); },
+      remove(...c) { c.forEach((x) => this._set.delete(x)); },
+      toggle(c, force) {
+        if (force === undefined) {
+          if (this._set.has(c)) { this._set.delete(c); return false; }
+          this._set.add(c); return true;
+        }
+        if (force) this._set.add(c); else this._set.delete(c);
+        return force;
+      },
+      contains(c) { return this._set.has(c); }
+    },
+    setAttribute(k, v) { this[k] = v; },
+    getAttribute(k) { return this[k] || ""; },
+    addEventListener() {}
+  };
+}
+function getEl(id) {
+  if (!elements.has(id)) elements.set(id, makeEl(id));
+  return elements.get(id);
+}
+
+globalThis.__GORNESS_TEST_NO_AUTOBOOT__ = true;
+globalThis.localStorage = { getItem: () => null, setItem: () => {} };
+globalThis.CSS = { escape: (s) => String(s) };
+globalThis.document = {
+  activeElement: null,
+  documentElement: { lang: "zh-CN", style: { setProperty() {} }, setAttribute() {} },
+  getElementById: (id) => getEl(id),
+  querySelectorAll: () => [],
+  querySelector: () => null,
+  addEventListener() {}
+};
+globalThis.window = { innerWidth: 1280, addEventListener() {} };
+
+const origFetch = globalThis.fetch;
+globalThis.fetch = (input, init = {}) => {
+  const url = typeof input === "string" && input.startsWith("/") ? baseURL + input : input;
+  const headers = Object.assign({ Origin: baseURL }, init.headers || {});
+  return origFetch(url, Object.assign({}, init, { headers }));
+};
+
+const mod = await import(pathToFileURL(%q).href);
+await mod.loadBootstrap();
+
+// Verify model-override-input is populated with <option> items for 1-click selection!
+assert.match(getEl("model-override-input").innerHTML, /<option value="anthropic\/claude-sonnet-5-5"/, "model-override-input must be populated with selectable provider/model options");
+
+// Verify 1-click Provider Preset adds DeepSeek with full model catalog without typing!
+await mod.applyProviderPreset("deepseek");
+assert.ok(mod.state.config.providers.deepseek, "applyProviderPreset('deepseek') must register deepseek provider");
+assert.ok(mod.state.config.providers.deepseek.models["deepseek-chat"], "deepseek preset must populate model catalog");
+
+// Verify zero-typing Agent-Model Matrix renders <select> for model (no <input data-agent-model type="text">) and auto-saves via patchAgentRole!
+mod.setCenterMode("config");
+const studioHTML = getEl("config-studio-content").innerHTML;
+assert.match(studioHTML, /data-agent-model-select="coder"/, "Config Studio must render <select> dropdown for agent model");
+assert.doesNotMatch(studioHTML, /<input[^>]*data-agent-model/, "Agent Matrix must NOT use raw text input for model selection");
+
+await mod.patchAgentRole("coder", { provider: "deepseek", model: "deepseek-chat", effort: "xhigh" });
+assert.equal(mod.state.config.agents.coder.provider, "deepseek", "patchAgentRole must auto-save provider");
+assert.equal(mod.state.config.agents.coder.model, "deepseek-chat", "patchAgentRole must auto-save model");
+assert.equal(mod.state.config.agents.coder.effort, "xhigh", "patchAgentRole must auto-save effort");
+`, ts.URL, appJSPath)
+
+	cmd := exec.Command(nodeBin, "--input-type=module", "-e", nodeScript)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("node zero-typing config matrix test failed: %v\n%s", err, string(out))
+	}
+}
