@@ -35,6 +35,11 @@
       </div>
 
       <div class="topbar-right">
+        <button id="open-settings-top-btn" class="toolbar-btn" type="button" title="打开系统设置与配置矩阵对话框 (⌘,)">
+          <span>⚙️</span>
+          <span data-i18n="modeConfig">配置矩阵与设置</span>
+        </button>
+
         <button id="alwayson-drawer-btn" class="toolbar-btn" type="button">
           <span class="pulse-dot idle" id="alwayson-dot"></span>
           <span data-i18n="alwaysOnBtn">常驻队列</span>
@@ -243,43 +248,6 @@
             </div>
           </div>
         </section>
-
-        <!-- MODE C: Apple HIG Zero-Typing Settings & Agent-Model Matrix Studio -->
-        <section id="config-mode-view" class="mode-view hidden">
-          <div class="settings-studio-header">
-            <div class="settings-nav-pills" id="settings-nav-pills" role="tablist">
-              <button class="settings-nav-btn active" type="button" data-cfg-page="matrix">
-                <span class="settings-tile tile-purple">🧩</span>
-                <span data-i18n="cfgPageMatrix">异构角色模型矩阵</span>
-              </button>
-              <button class="settings-nav-btn" type="button" data-cfg-page="providers">
-                <span class="settings-tile tile-blue">☁️</span>
-                <span data-i18n="cfgPageProviders">供应商与模型目录</span>
-              </button>
-              <button class="settings-nav-btn" type="button" data-cfg-page="workflows">
-                <span class="settings-tile tile-indigo">🕸️</span>
-                <span data-i18n="cfgPageWorkflows">多智能体拓扑配置</span>
-              </button>
-              <button class="settings-nav-btn" type="button" data-cfg-page="global">
-                <span class="settings-tile tile-teal">🛡️</span>
-                <span data-i18n="cfgPageGlobal">全局与权限沙箱</span>
-              </button>
-              <button class="settings-nav-btn" type="button" data-cfg-page="mcp">
-                <span class="settings-tile tile-green">🔌</span>
-                <span data-i18n="cfgPageMCP">MCP 扩展服务</span>
-              </button>
-              <button class="settings-nav-btn" type="button" data-cfg-page="files">
-                <span class="settings-tile tile-gray">📄</span>
-                <span data-i18n="cfgPageFiles">底层源文件</span>
-              </button>
-            </div>
-            <div class="settings-header-right">
-              <span id="config-autosave-pill" class="status-pill ok" data-i18n="autoSaveReady">点选即存 · 实时热生效 ✓</span>
-            </div>
-          </div>
-
-          <div id="config-studio-content" class="config-studio-scroll"></div>
-        </section>
       </main>
 
       <div class="splitter" id="right-splitter" role="separator" aria-orientation="vertical"></div>
@@ -320,14 +288,21 @@
           <div id="snapshots-timeline-list" class="snapshots-list"></div>
         </section>
 
-        <!-- Tab 3: Quick Zero-Typing Agent-Model Matrix & Studio Launcher -->
+        <!-- Tab 3: Quick Zero-Typing Agent-Model Matrix & Pop-up Dialog Launcher -->
         <section id="insp-panel-config" class="insp-panel hidden">
           <div class="config-block">
             <div class="subhead-row">
               <strong data-i18n="agentMatrixTitle">异构 Agent 角色模型矩阵</strong>
-              <button id="expand-full-config-btn" class="primary-xs-btn" type="button" data-i18n="expandConfigStudioBtn">展开完整配置中心 ↗</button>
+              <button id="expand-full-config-btn" class="primary-xs-btn" type="button" data-i18n="expandConfigStudioBtn">⚙️ 弹出设置对话框…</button>
             </div>
-            <div class="insp-matrix-hint" data-i18n="inspMatrixHint">直接下拉点选服务商、模型与推理强度，即刻自动写入 ~/.gorness/agents/*.md</div>
+            <div class="insp-matrix-hint" data-i18n="inspMatrixHint">点击下方任意分类按钮立即弹出完整设置窗口，或在此直接下拉切换角色模型：</div>
+            <div class="chips-wrap">
+              <button class="chip-btn active" type="button" data-open-settings-page="matrix">🧩 角色模型矩阵</button>
+              <button class="chip-btn" type="button" data-open-settings-page="providers">☁️ 供应商与密钥</button>
+              <button class="chip-btn" type="button" data-open-settings-page="workflows">🕸️ 拓扑工作流</button>
+              <button class="chip-btn" type="button" data-open-settings-page="global">🛡️ 权限与沙箱</button>
+              <button class="chip-btn" type="button" data-open-settings-page="mcp">🔌 MCP 扩展</button>
+            </div>
             <div id="agent-matrix-rows" class="agent-matrix-rows"></div>
           </div>
 
@@ -368,6 +343,63 @@
           ></iframe>
         </section>
       </aside>
+    </div>
+  </div>
+
+  <!-- Pop-up Modal Dialog: Unified macOS System Settings & Zero-Typing Config Matrix (⌘,) -->
+  <div id="config-mode-view" class="modal-backdrop hidden" role="dialog" aria-modal="true" aria-label="Settings and Config Matrix">
+    <div class="modal-sheet settings-dialog-sheet">
+      <aside class="settings-dialog-sidebar" role="tablist">
+        <div class="settings-sidebar-brand">
+          <div class="brand-mark" aria-hidden="true">
+            <span class="dot dot-red"></span>
+            <span class="dot dot-amber"></span>
+            <span class="dot dot-green"></span>
+          </div>
+          <strong>Gorness 设置中心</strong>
+        </div>
+
+        <div class="settings-sidebar-group-label">模型与智能体</div>
+        <button class="settings-nav-btn active" type="button" data-cfg-page="matrix">
+          <span class="settings-tile tile-purple">🧩</span>
+          <span data-i18n="cfgPageMatrix">异构角色模型矩阵</span>
+        </button>
+        <button class="settings-nav-btn" type="button" data-cfg-page="providers">
+          <span class="settings-tile tile-blue">☁️</span>
+          <span data-i18n="cfgPageProviders">供应商与模型目录</span>
+        </button>
+
+        <div class="settings-sidebar-group-label">编排与安全</div>
+        <button class="settings-nav-btn" type="button" data-cfg-page="workflows">
+          <span class="settings-tile tile-indigo">🕸️</span>
+          <span data-i18n="cfgPageWorkflows">多智能体拓扑配置</span>
+        </button>
+        <button class="settings-nav-btn" type="button" data-cfg-page="global">
+          <span class="settings-tile tile-teal">🛡️</span>
+          <span data-i18n="cfgPageGlobal">全局与权限沙箱</span>
+        </button>
+
+        <div class="settings-sidebar-group-label">扩展与透明文件仓</div>
+        <button class="settings-nav-btn" type="button" data-cfg-page="mcp">
+          <span class="settings-tile tile-green">🔌</span>
+          <span data-i18n="cfgPageMCP">MCP 扩展服务</span>
+        </button>
+        <button class="settings-nav-btn" type="button" data-cfg-page="files">
+          <span class="settings-tile tile-gray">📄</span>
+          <span data-i18n="cfgPageFiles">底层源文件</span>
+        </button>
+      </aside>
+
+      <div class="settings-dialog-main">
+        <div class="settings-dialog-topbar">
+          <div class="settings-dialog-title-row">
+            <strong id="settings-dialog-page-title" data-i18n="cfgPageMatrix">异构角色模型矩阵</strong>
+            <span id="config-autosave-pill" class="status-pill ok" data-i18n="autoSaveReady">点选即存 · 实时热生效 ✓</span>
+          </div>
+          <button class="close-modal-btn" type="button" data-close="config-mode-view" title="关闭设置对话框 (Esc)">✕</button>
+        </div>
+        <div id="config-studio-content" class="config-studio-scroll"></div>
+      </div>
     </div>
   </div>
 

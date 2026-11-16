@@ -37,6 +37,10 @@ extern void goOpenVaultInFinder(void);
 	NSMenu *appMenu = [[NSMenu alloc] initWithTitle:@"Gorness"];
 	[appMenu addItemWithTitle:@"About Gorness" action:@selector(orderFrontStandardAboutPanel:) keyEquivalent:@""];
 	[appMenu addItem:[NSMenuItem separatorItem]];
+	NSMenuItem *settingsItem = [[NSMenuItem alloc] initWithTitle:@"Settings & Config Matrix…" action:@selector(openSettings:) keyEquivalent:@","];
+	[settingsItem setTarget:self];
+	[appMenu addItem:settingsItem];
+	[appMenu addItem:[NSMenuItem separatorItem]];
 	NSMenuItem *openProj = [[NSMenuItem alloc] initWithTitle:@"Add Project Folder…" action:@selector(addProjectFolder:) keyEquivalent:@"o"];
 	[openProj setTarget:self];
 	[appMenu addItem:openProj];
@@ -110,6 +114,10 @@ extern void goOpenVaultInFinder(void);
 	[showItem setTarget:self];
 	[menu addItem:showItem];
 
+	NSMenuItem *statusSettingsItem = [[NSMenuItem alloc] initWithTitle:@"Settings & Config Matrix…" action:@selector(openSettings:) keyEquivalent:@""];
+	[statusSettingsItem setTarget:self];
+	[menu addItem:statusSettingsItem];
+
 	NSMenuItem *addItem = [[NSMenuItem alloc] initWithTitle:@"Add Project Folder…" action:@selector(addProjectFolder:) keyEquivalent:@""];
 	[addItem setTarget:self];
 	[menu addItem:addItem];
@@ -163,6 +171,13 @@ extern void goOpenVaultInFinder(void);
 		[self.mainWindow makeKeyAndOrderFront:nil];
 	}
 	[NSApp activateIgnoringOtherApps:YES];
+}
+
+- (void)openSettings:(id)sender {
+	[self showMainWindow:sender];
+	if (self.webView != nil) {
+		[self.webView evaluateJavaScript:@"if (window.openGornessSettingsModal) window.openGornessSettingsModal();" completionHandler:nil];
+	}
 }
 
 - (void)reloadWorkbench:(id)sender {

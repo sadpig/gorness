@@ -889,14 +889,26 @@ function applyI18nInPlace() {
   renderTopologyCardsGrid();
 }
 
+export function openSettingsModal(page = "") {
+  if (page) state.configPage = page;
+  document.getElementById("config-mode-view")?.classList.remove("hidden");
+  renderConfigStudio();
+}
+
+globalThis.openGornessSettingsModal = (page) => openSettingsModal(page);
+
 export function setCenterMode(mode) {
+  if (mode === "config") {
+    openSettingsModal();
+    return;
+  }
   state.centerMode = mode;
   document.getElementById("mode-chat-btn")?.classList.toggle("active", mode === "chat");
   document.getElementById("mode-fleet-btn")?.classList.toggle("active", mode === "fleet");
-  document.getElementById("mode-config-btn")?.classList.toggle("active", mode === "config");
+  document.getElementById("mode-config-btn")?.classList.remove("active");
   document.getElementById("chat-mode-view")?.classList.toggle("hidden", mode !== "chat");
   document.getElementById("fleet-mode-view")?.classList.toggle("hidden", mode !== "fleet");
-  document.getElementById("config-mode-view")?.classList.toggle("hidden", mode !== "config");
+  document.getElementById("config-mode-view")?.classList.add("hidden");
   if (mode === "fleet") {
     renderFleetMissionSelector();
     renderFleetStudio();
@@ -904,8 +916,6 @@ export function setCenterMode(mode) {
     if (snap && snap.status === "running") {
       subscribeToMissionStream(snap.id);
     }
-  } else if (mode === "config") {
-    renderConfigStudio();
   }
 }
 
@@ -2742,6 +2752,19 @@ export function renderConfigStudio() {
   const container = document.getElementById("config-studio-content");
   if (!container || !state.config) return;
 
+  const pageKeyMap = {
+    matrix: "cfgPageMatrix",
+    providers: "cfgPageProviders",
+    workflows: "cfgPageWorkflows",
+    global: "cfgPageGlobal",
+    mcp: "cfgPageMCP",
+    files: "cfgPageFiles"
+  };
+  const titleEl = document.getElementById("settings-dialog-page-title");
+  if (titleEl) {
+    titleEl.textContent = t(pageKeyMap[state.configPage] || "cfgPageMatrix");
+  }
+
   document.querySelectorAll("[data-cfg-page]").forEach((btn) => {
     btn.classList.toggle("active", btn.getAttribute("data-cfg-page") === state.configPage);
   });
@@ -3679,10 +3702,11 @@ function setupResizableSplitters() {
 }
 
 function bindWorkbenchEvents() {
-  // Center Mode Switch (Chat | Fleet Studio | Zero-Typing Config Matrix Studio)
+  // Center Mode Switch & Pop-up Settings Dialog Triggers
   document.getElementById("mode-chat-btn")?.addEventListener("click", () => setCenterMode("chat"));
   document.getElementById("mode-fleet-btn")?.addEventListener("click", () => setCenterMode("fleet"));
-  document.getElementById("mode-config-btn")?.addEventListener("click", () => setCenterMode("config"));
+  document.getElementById("mode-config-btn")?.addEventListener("click", () => openSettingsModal("matrix"));
+  document.getElementById("open-settings-top-btn")?.addEventListener("click", () => openSettingsModal("matrix"));
 
   // Theme & Bilingual Toggle
   document.querySelectorAll(".theme-btn").forEach((btn) => {
@@ -3707,14 +3731,19 @@ function bindWorkbenchEvents() {
 
   // Inspector Tabs & Config Studio Launchers
   document.querySelectorAll(".insp-tab").forEach((btn) => {
-    btn.addEventListener("click", () => setInspectorTab(btn.dataset.tab || "files"));
+    btn.addEventListener("click", () => {
+      const tab = btn.dataset.tab || "files";
+      setInspectorTab(tab);
+      if (tab === "config") {
+        openSettingsModal("matrix");
+      }
+    });
   });
   document.getElementById("open-config-studio-btn")?.addEventListener("click", () => {
-    setInspectorTab("config");
-    setCenterMode("config");
+    openSettingsModal("matrix");
   });
   document.getElementById("expand-full-config-btn")?.addEventListener("click", () => {
-    setCenterMode("config");
+    openSettingsModal("matrix");
   });
 
   // Modals open/close
@@ -3844,13 +3873,18 @@ function bindWorkbenchEvents() {
   });
   document.getElementById("send-or-steer-btn")?.addEventListener("click", () => sendPromptOrSteer());
 
-  // Global Session Search (⌘K)
+  // Global Session Search (⌘K) & Settings Dialog Shortcut (⌘, / Esc)
   const searchIn = document.getElementById("global-search-input");
   const searchPop = document.getElementById("search-results-popover");
   window.addEventListener("keydown", (e) => {
     if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "k") {
       e.preventDefault();
       searchIn?.focus();
+    } else if ((e.metaKey || e.ctrlKey) && e.key === ",") {
+      e.preventDefault();
+      openSettingsModal("matrix");
+    } else if (e.key === "Escape") {
+      ["config-mode-view", "workspace-modal", "fleet-launcher-modal", "alwayson-modal"].forEach((id) => closeModal(id));
     }
   });
   let searchTimer = null;
@@ -4069,6 +4103,17 @@ function bindWorkbenchEvents() {
   document.addEventListener("click", async (e) => {
     const target = e.target;
     if (!(target instanceof Element)) return;
+
+    if (target.classList.contains("modal-backdrop") && target.id) {
+      closeModal(target.id);
+      return;
+    }
+
+    const openPageBtn = target.closest("[data-open-settings-page]");
+    if (openPageBtn) {
+      openSettingsModal(openPageBtn.getAttribute("data-open-settings-page") || "matrix");
+      return;
+    }
 
     // 1. Config Studio Sub-Navigation Pills
     const cfgNavBtn = target.closest("[data-cfg-page]");
