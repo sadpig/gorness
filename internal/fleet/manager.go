@@ -2,8 +2,6 @@ package fleet
 
 import (
 	"context"
-	"crypto/rand"
-	"encoding/hex"
 	"errors"
 	"fmt"
 	"os"
@@ -76,7 +74,7 @@ func NewManager(opts ManagerOptions) (*Manager, error) {
 	pool := NewWorktreePool(paths)
 	refinery := NewRefinery(pool, sb, opts.VerifyRunner)
 
-	return &Manager{
+	mgr := &Manager{
 		cfg:           cfgMgr,
 		engine:        opts.Engine,
 		pool:          pool,
@@ -86,7 +84,126 @@ func NewManager(opts ManagerOptions) (*Manager, error) {
 		now:           nowFn,
 		active:        make(map[string]*missionRuntime),
 		finished:      make(map[string]*MissionSnapshot),
-	}, nil
+	}
+	mgr.recoverInterruptedMissions()
+	return mgr, nil
+}
+
+// Pool 暴露底层 Git Worktree 隔离池（供会话级 Worktree 创建与回收复用）。
+func (m *Manager) Pool() *WorktreePool {
+	if m == nil {
+		return nil
+	}
+	return m.pool
+}
+
+// Refinery 暴露串行变基验收与快进合入门控器。
+func (m *Manager) Refinery() *Refinery {
+	if m == nil {
+		return nil
+	}
+	return m.refinery
+}
+
+func (m *Manager) publishFleetUpdated(wsID, missionID, evType, nodeID string) {
+	if m == nil || m.engine == nil {
+		return
+	}
+	m.engine.PublishSystemEvent(core.EventFleetUpdated, map[string]any{
+		"workspace_id": wsID,
+		"mission_id":   missionID,
+		"event":        evType,
+		"node_id":      nodeID,
+		"timestamp":    m.now().UTC(),
+	})
+}
+
+// recoverInterruptedMissions 在守护进程启动时扫描所有工作区黑板，将前次崩溃遗留的 running/pending 任务标记为 interrupted 并释放孤儿抢占任务卡。
+func (m *Manager) recoverInterruptedMissions() {
+	if m == nil || m.cfg == nil {
+		return
+	}
+	wsBase := m.cfg.Paths().WorkspacesDir()
+	wsIDs := make(map[string]bool)
+	if m.engine != nil && m.engine.Workspaces() != nil {
+		for _, ws := range m.engine.Workspaces().List() {
+			if ValidateID(ws.ID) == nil {
+				wsIDs[ws.ID] = true
+			}
+		}
+	}
+	if entries, err := os.ReadDir(wsBase); err == nil {
+		for _, ent := range entries {
+			if ent.IsDir() && ValidateID(ent.Name()) == nil {
+				wsIDs[ent.Name()] = true
+			}
+		}
+	}
+
+	now := m.now().UTC()
+	for wsID := range wsIDs {
+		missionsDir := filepath.Join(wsBase, wsID, "missions")
+		if ensureStrictSubpath(wsBase, missionsDir) != nil {
+			continue
+		}
+		mEntries, err := os.ReadDir(missionsDir)
+		if err != nil {
+			continue
+		}
+		for _, me := range mEntries {
+			if !me.IsDir() || ValidateID(me.Name()) != nil {
+				continue
+			}
+			mid := me.Name()
+			mDir := filepath.Join(missionsDir, mid)
+			_, stSnap := os.Stat(filepath.Join(mDir, "snapshot.toml"))
+			_, stMD := os.Stat(filepath.Join(mDir, "MISSION.md"))
+			if stSnap != nil && stMD != nil {
+				continue
+			}
+			bb, bErr := newMarkdownBlackboardWithClock(m.cfg.Paths(), wsID, mid, m.now)
+			if bErr != nil {
+				continue
+			}
+			snap, lErr := bb.LoadSnapshot()
+			if lErr != nil || snap == nil {
+				continue
+			}
+			if snap.Status != MissionRunning && snap.Status != MissionPending {
+				continue
+			}
+
+			_, _ = bb.ReleaseAllClaimedTasks()
+			tasks, _ := bb.ListTasks()
+			notes, _ := bb.ListNotes()
+
+			snap.Status = MissionInterrupted
+			if strings.TrimSpace(snap.Error) == "" {
+				snap.Error = "mission interrupted by prior daemon shutdown"
+			}
+			for i := range snap.Nodes {
+				snap.Nodes[i].ActiveRunID = ""
+				switch snap.Nodes[i].Status {
+				case NodeRunning, NodeMerging, NodeStalled:
+					snap.Nodes[i].Status = NodeCancelled
+					snap.Nodes[i].UpdatedAt = now
+				}
+			}
+			for i := range snap.Edges {
+				snap.Edges[i].Active = false
+			}
+			snap.MergeQueue = []string{}
+			if tasks != nil {
+				snap.Tasks = tasks
+			}
+			if notes != nil {
+				snap.Notes = notes
+			}
+			snap.UpdatedAt = now
+			_ = bb.SaveSnapshot(snap)
+			_ = bb.AppendAuditEvent("mission_interrupted", "", "", snap.Error)
+		}
+	}
 }
 
 func missionMapKey(wsID, missionID string) string {
@@ -125,7 +242,7 @@ func (m *Manager) StartMission(ctx context.Context, req MissionRequest) (*Missio
 	now := m.now().UTC()
 	missionID := strings.TrimSpace(req.MissionID)
 	if missionID == "" {
-		missionID = fmt.Sprintf("msn_%d_%d_%s", now.UnixMilli(), m.missionNonce.Add(1), randomFleetHex(4))
+		missionID = fmt.Sprintf("msn_%d_%d_%s", now.UnixMilli(), m.missionNonce.Add(1), store.RandomHex(4))
 	}
 	if err := ValidateID(missionID); err != nil {
 		return nil, nil, fmt.Errorf("invalid mission_id: %w", err)
@@ -301,13 +418,15 @@ func (m *Manager) StartMission(ctx context.Context, req MissionRequest) (*Missio
 		allowedDomains:   append([]string(nil), wsSnap.Rules.AllowedDomains...),
 		roleModels:       roleModels,
 		nodeWorktreeSpec: nodeWorktreeSpec,
-		leases:           make(map[string]*WorktreeLease),
-		nodeDiffs:        make(map[string]string),
-		pendingSteers:    make(map[string][]string),
-		snap:             snap,
-		cancel:           missionCancel,
-		done:             make(chan struct{}),
-		subs:             make(map[uint64]chan MissionEvent),
+		leases:             make(map[string]*WorktreeLease),
+		nodeDiffs:          make(map[string]string),
+		pendingSteers:      make(map[string][]string),
+		stallCancelled:     make(map[string]bool),
+		stallReleasedTasks: make(map[string][]string),
+		snap:               snap,
+		cancel:             missionCancel,
+		done:               make(chan struct{}),
+		subs:               make(map[uint64]chan MissionEvent),
 	}
 
 	rt.witness = NewWitness(WitnessOptions{
@@ -315,7 +434,10 @@ func (m *Manager) StartMission(ctx context.Context, req MissionRequest) (*Missio
 		CheckInterval: m.checkInterval,
 		Now:           m.now,
 		OnStall: func(nodeID string, silentFor time.Duration) {
-			rt.markNodeStalled(nodeID, silentFor)
+			rt.onNodeFirstStall(nodeID, silentFor)
+		},
+		OnRepeatStall: func(nodeID string, silentFor time.Duration, stallCount int) {
+			rt.onNodeRepeatStall(nodeID, silentFor, stallCount)
 		},
 	})
 
@@ -601,6 +723,214 @@ func (m *Manager) InspectNodeDiff(wsID, missionID, nodeID string) (string, error
 	return bb.ReadNodeDiff(nodeID)
 }
 
+// DeleteMission 删除已结束或已中断的 Fleet 任务（清理关联 Git Worktree 分支与任务黑板目录）；若任务仍在活跃运行中则拒绝删除。
+// 参数 id 支持纯 `missionID` 或 `wsID/missionID`。
+func (m *Manager) DeleteMission(id string) error {
+	if m == nil {
+		return ErrManagerClosed
+	}
+	raw := strings.TrimSpace(id)
+	if raw == "" {
+		return fmt.Errorf("%w: empty mission id", ErrInvalidID)
+	}
+
+	var explicitWS, missionID string
+	if wsPart, mPart, hasSlash := strings.Cut(raw, "/"); hasSlash {
+		if err := ValidateID(wsPart); err != nil {
+			return fmt.Errorf("invalid workspace id: %w", err)
+		}
+		if err := ValidateID(mPart); err != nil {
+			return fmt.Errorf("invalid mission id: %w", err)
+		}
+		explicitWS = wsPart
+		missionID = mPart
+	} else {
+		if err := ValidateID(raw); err != nil {
+			return fmt.Errorf("invalid mission id: %w", err)
+		}
+		missionID = raw
+	}
+
+	m.mu.Lock()
+	for _, rt := range m.active {
+		if rt.snap.ID == missionID && (explicitWS == "" || rt.ws.ID == explicitWS) {
+			m.mu.Unlock()
+			return fmt.Errorf("cannot delete actively running mission %q; stop it first", missionID)
+		}
+	}
+
+	resolvedWS := explicitWS
+	if resolvedWS == "" {
+		for _, fin := range m.finished {
+			if fin.ID == missionID {
+				resolvedWS = fin.WorkspaceID
+				break
+			}
+		}
+	}
+	m.mu.Unlock()
+
+	wsBase := m.cfg.Paths().WorkspacesDir()
+	if resolvedWS == "" {
+		if entries, err := os.ReadDir(wsBase); err == nil {
+			for _, ent := range entries {
+				if !ent.IsDir() || ValidateID(ent.Name()) != nil {
+					continue
+				}
+				candDir := filepath.Join(wsBase, ent.Name(), "missions", missionID)
+				if st, sErr := os.Stat(candDir); sErr == nil && st.IsDir() {
+					resolvedWS = ent.Name()
+					break
+				}
+			}
+		}
+	}
+	if resolvedWS == "" {
+		return fmt.Errorf("%w: %s", ErrMissionNotFound, missionID)
+	}
+
+	missionDir := filepath.Join(wsBase, resolvedWS, "missions", missionID)
+	if err := ensureStrictSubpath(wsBase, missionDir); err != nil {
+		return err
+	}
+
+	m.mu.Lock()
+	key := missionMapKey(resolvedWS, missionID)
+	if _, live := m.active[key]; live {
+		m.mu.Unlock()
+		return fmt.Errorf("cannot delete actively running mission %q; stop it first", missionID)
+	}
+	_, inFinished := m.finished[key]
+	delete(m.finished, key)
+	m.mu.Unlock()
+
+	_, stErr := os.Stat(missionDir)
+	if errors.Is(stErr, os.ErrNotExist) && !inFinished {
+		return fmt.Errorf("%w: %s", ErrMissionNotFound, missionID)
+	}
+
+	repoRoot := ""
+	if m.engine != nil && m.engine.Workspaces() != nil {
+		if ws, gErr := m.engine.Workspaces().Get(resolvedWS); gErr == nil && ws != nil {
+			repoRoot = ws.RootPath
+		}
+	}
+	_ = m.pool.CleanupMission(context.Background(), repoRoot, missionID)
+	if err := os.RemoveAll(missionDir); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("remove mission dir %s: %w", missionDir, err)
+	}
+
+	m.publishFleetUpdated(resolvedWS, missionID, EventMissionDeleted, "")
+	return nil
+}
+
+// DiffSessionWorktree 计算独立会话 Worktree 相对于工作区主仓库当前/默认分支的完整 Git Diff（含未追踪文件）及 dirty 标志。
+func (m *Manager) DiffSessionWorktree(wsPath, wtPath string) (string, bool, error) {
+	if m == nil || m.pool == nil {
+		return "", false, ErrManagerClosed
+	}
+	cleanWS := canonicalizeDir(wsPath)
+	cleanWT := canonicalizeDir(wtPath)
+	if cleanWS == "" || cleanWT == "" {
+		return "", false, errors.New("workspace path and worktree path are required")
+	}
+	if _, err := os.Stat(cleanWT); err != nil {
+		return "", false, fmt.Errorf("stat worktree %s: %w", cleanWT, err)
+	}
+
+	ctx := context.Background()
+	if !m.pool.IsGitRepo(ctx, cleanWS) {
+		return "", false, fmt.Errorf("workspace %s is not a git repository", cleanWS)
+	}
+	if !m.pool.IsGitRepo(ctx, cleanWT) {
+		return "", false, fmt.Errorf("worktree %s is not a git repository", cleanWT)
+	}
+
+	baseBranch, err := m.pool.DetectDefaultBranch(ctx, cleanWS)
+	if err != nil {
+		return "", false, err
+	}
+	diff, err := m.pool.Diff(ctx, cleanWT, baseBranch)
+	if err != nil {
+		return "", false, err
+	}
+	statusOut, _ := runGitCmd(ctx, cleanWT, "status", "--porcelain")
+	ahead, _ := countCommitsAhead(ctx, cleanWT, baseBranch)
+	dirty := strings.TrimSpace(diff) != "" || strings.TrimSpace(statusOut) != "" || ahead > 0
+	return diff, dirty, nil
+}
+
+// LandSessionWorktree 通过 Refinery 串行门控将会话隔离 Worktree 的改动自动归集提交、变基、执行可选验收命令并快进（--ff-only）合入主工作区。
+func (m *Manager) LandSessionWorktree(ctx context.Context, wsPath, wtPath, branch, verifyCmd string) (MergeReport, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if m == nil || m.pool == nil || m.refinery == nil {
+		return MergeReport{}, ErrManagerClosed
+	}
+	cleanWS := canonicalizeDir(wsPath)
+	cleanWT := canonicalizeDir(wtPath)
+	if cleanWS == "" || cleanWT == "" {
+		return MergeReport{}, errors.New("workspace path and worktree path are required")
+	}
+	if !m.pool.IsGitRepo(ctx, cleanWS) {
+		return MergeReport{}, fmt.Errorf("workspace %s is not a git repository", cleanWS)
+	}
+	if !m.pool.IsGitRepo(ctx, cleanWT) {
+		return MergeReport{}, fmt.Errorf("worktree %s is not a git repository", cleanWT)
+	}
+
+	targetBranch, err := m.pool.DetectDefaultBranch(ctx, cleanWS)
+	if err != nil {
+		return MergeReport{}, err
+	}
+	wtBranch := strings.TrimSpace(branch)
+	if wtBranch == "" {
+		wtBranch, err = m.pool.DetectDefaultBranch(ctx, cleanWT)
+		if err != nil {
+			return MergeReport{}, err
+		}
+	}
+
+	sbMode := tools.SandboxStrict
+	var allowedDomains []string
+	if m.engine != nil && m.engine.Workspaces() != nil {
+		if ws, gErr := m.engine.Workspaces().GetByPath(cleanWS); gErr == nil && ws != nil {
+			if wsSnap, _, cErr := m.cfg.ForWorkspace(ws.RootPath, ws.TrustedHashes); cErr == nil && wsSnap != nil {
+				rawMode := wsSnap.Global.SandboxMode
+				if strings.TrimSpace(ws.SandboxMode) != "" {
+					rawMode = ws.SandboxMode
+				}
+				sbMode = tools.NormalizeSandboxMode(rawMode)
+				allowedDomains = append([]string(nil), wsSnap.Rules.AllowedDomains...)
+			}
+		}
+	}
+
+	nodeSlug := sanitizeGitRefSegment(filepath.Base(cleanWT))
+	lease := &WorktreeLease{
+		MissionID:  "session",
+		NodeID:     nodeSlug,
+		RepoRoot:   cleanWS,
+		Path:       cleanWT,
+		Branch:     wtBranch,
+		BaseBranch: targetBranch,
+	}
+
+	res, err := m.refinery.Land(ctx, LandRequest{
+		Lease:          lease,
+		TargetBranch:   targetBranch,
+		CommitMessage:  fmt.Sprintf("feat(session): land worktree %s", wtBranch),
+		VerifyCommand:  strings.TrimSpace(verifyCmd),
+		SandboxMode:    sbMode,
+		AllowedDomains: allowedDomains,
+	})
+	if res == nil {
+		return MergeReport{}, err
+	}
+	return *res, err
+}
+
 func (m *Manager) Wait() {
 	if m == nil {
 		return
@@ -652,11 +982,13 @@ type missionRuntime struct {
 	roleModels       map[string]string
 	nodeWorktreeSpec map[string]bool
 
-	mu            sync.Mutex
-	snap          MissionSnapshot
-	leases        map[string]*WorktreeLease
-	nodeDiffs     map[string]string
-	pendingSteers map[string][]string
+	mu                 sync.Mutex
+	snap               MissionSnapshot
+	leases             map[string]*WorktreeLease
+	nodeDiffs          map[string]string
+	pendingSteers      map[string][]string
+	stallCancelled     map[string]bool
+	stallReleasedTasks map[string][]string
 
 	cancel context.CancelFunc
 	done   chan struct{}
@@ -746,6 +1078,10 @@ func (rt *missionRuntime) emit(ev MissionEvent) {
 		}
 	}
 	rt.subsMu.Unlock()
+
+	if ev.Type != EventNodeDelta {
+		rt.mgr.publishFleetUpdated(ev.WorkspaceID, ev.MissionID, ev.Type, ev.NodeID)
+	}
 }
 
 func (rt *missionRuntime) snapshotClone() *MissionSnapshot {
@@ -879,6 +1215,90 @@ func (rt *missionRuntime) runNode(
 	nodeID, prompt, worktreePath string,
 	dynamicCtx []string,
 ) (core.RunOutcome, error) {
+	for attempt := 0; attempt < 2; attempt++ {
+		attemptDyn := dynamicCtx
+		if attempt > 0 {
+			attemptDyn = append(append([]string(nil), dynamicCtx...), "Witness recovery requeue: your previous execution stalled without progress; complete the assigned task concisely.")
+		}
+		outcome, err := rt.runNodeOnce(ctx, nodeID, prompt, worktreePath, attemptDyn)
+		if err == nil {
+			return outcome, nil
+		}
+		if ctx.Err() == nil && rt.consumeStallCancel(nodeID) {
+			if rt.snap.Topology == TopoSharedBoard {
+				return outcome, errNodeStallReleased
+			}
+			if attempt == 0 {
+				rt.reclaimStallTasks(nodeID, rt.nodeWorktreeBranch(nodeID))
+				continue
+			}
+			return outcome, fmt.Errorf("node %s stalled repeatedly and was cancelled", nodeID)
+		}
+		return outcome, err
+	}
+	return core.RunOutcome{}, fmt.Errorf("node %s failed after stall recovery retry", nodeID)
+}
+
+func (rt *missionRuntime) nodeWorktreeBranch(nodeID string) string {
+	rt.mu.Lock()
+	defer rt.mu.Unlock()
+	if l := rt.leases[nodeID]; l != nil {
+		return l.Branch
+	}
+	for _, n := range rt.snap.Nodes {
+		if n.ID == nodeID {
+			return n.WorktreeBranch
+		}
+	}
+	return ""
+}
+
+func (rt *missionRuntime) consumeStallCancel(nodeID string) bool {
+	rt.mu.Lock()
+	defer rt.mu.Unlock()
+	if rt.stallCancelled[nodeID] {
+		delete(rt.stallCancelled, nodeID)
+		return true
+	}
+	return false
+}
+
+func (rt *missionRuntime) reclaimStallTasks(nodeID, branch string) {
+	rt.mu.Lock()
+	ids := rt.stallReleasedTasks[nodeID]
+	delete(rt.stallReleasedTasks, nodeID)
+	rt.mu.Unlock()
+	if len(ids) == 0 {
+		return
+	}
+	claimedAny := false
+	for _, tid := range ids {
+		if _, won, err := rt.bb.ClaimTask(tid, nodeID, branch); err == nil && won {
+			claimedAny = true
+		}
+	}
+	if claimedAny {
+		rt.syncBlackboardState(EventTaskUpdated, nodeID, "", "reclaimed tasks on stall retry for "+nodeID)
+	}
+}
+
+func (rt *missionRuntime) restoreRunningIfStalled(nodeID string) {
+	rt.mu.Lock()
+	for i := range rt.snap.Nodes {
+		if rt.snap.Nodes[i].ID == nodeID && rt.snap.Nodes[i].Status == NodeStalled {
+			rt.snap.Nodes[i].Status = NodeRunning
+			rt.snap.Nodes[i].UpdatedAt = rt.mgr.now().UTC()
+			break
+		}
+	}
+	rt.mu.Unlock()
+}
+
+func (rt *missionRuntime) runNodeOnce(
+	ctx context.Context,
+	nodeID, prompt, worktreePath string,
+	dynamicCtx []string,
+) (core.RunOutcome, error) {
 	var zero core.RunOutcome
 	if ctx.Err() != nil {
 		return zero, ctx.Err()
@@ -893,6 +1313,7 @@ func (rt *missionRuntime) runNode(
 	}
 
 	override := firstNonEmpty(rt.roleModels[nodeID], rt.roleModels[node.RoleID])
+	wtBranch := rt.nodeWorktreeBranch(nodeID)
 
 	// 先提取已排队的节点 Steer 指令
 	var dyn []string
@@ -900,6 +1321,7 @@ func (rt *missionRuntime) runNode(
 		dyn = append(dyn, dynamicCtx...)
 	}
 	rt.mu.Lock()
+	delete(rt.stallCancelled, nodeID)
 	if queued := rt.pendingSteers[nodeID]; len(queued) > 0 {
 		for _, s := range queued {
 			dyn = append(dyn, "Steer: "+s)
@@ -917,6 +1339,7 @@ func (rt *missionRuntime) runNode(
 		PermMode:       rt.req.PermMode,
 		SandboxMode:    rt.req.SandboxMode,
 		WorktreePath:   worktreePath,
+		ExtraTools:     rt.makeNodeBlackboardTools(nodeID, wtBranch),
 		DynamicContext: dyn,
 	})
 	if err != nil {
@@ -963,7 +1386,10 @@ func (rt *missionRuntime) runNode(
 	)
 
 	for ev := range runStream {
-		rt.witness.Beat(nodeID)
+		if ev.Type != core.EventSteerInjected {
+			rt.witness.Beat(nodeID)
+			rt.restoreRunningIfStalled(nodeID)
+		}
 		switch ev.Type {
 		case core.EventTextDelta:
 			if m, ok := ev.Payload.(map[string]any); ok {
@@ -984,6 +1410,18 @@ func (rt *missionRuntime) runNode(
 					Message: p.Message,
 				})
 			}
+
+		case core.EventApprovalRequired:
+			rt.witness.PauseNode(nodeID)
+			rt.emit(MissionEvent{
+				Type:    EventApprovalRequired,
+				NodeID:  nodeID,
+				Message: "approval required",
+				Payload: ev.Payload,
+			})
+
+		case core.EventApprovalResolved:
+			rt.witness.ResumeNode(nodeID)
 
 		case core.EventToolResult:
 			if worktreePath != "" {
@@ -1398,23 +1836,72 @@ func (rt *missionRuntime) setSummary(summary string) {
 	rt.mu.Unlock()
 }
 
-func (rt *missionRuntime) markNodeStalled(nodeID string, silentFor time.Duration) {
+func (rt *missionRuntime) onNodeFirstStall(nodeID string, silentFor time.Duration) {
 	now := rt.mgr.now().UTC()
+	var activeRunID string
 	rt.mu.Lock()
 	for i := range rt.snap.Nodes {
-		if rt.snap.Nodes[i].ID == nodeID && rt.snap.Nodes[i].Status == NodeRunning {
-			rt.snap.Nodes[i].Status = NodeStalled
-			rt.snap.Nodes[i].UpdatedAt = now
+		if rt.snap.Nodes[i].ID == nodeID {
+			if rt.snap.Nodes[i].Status == NodeRunning {
+				rt.snap.Nodes[i].Status = NodeStalled
+				rt.snap.Nodes[i].UpdatedAt = now
+			}
+			activeRunID = rt.snap.Nodes[i].ActiveRunID
 		}
 	}
 	rt.snap.UpdatedAt = now
 	rt.mu.Unlock()
 
+	steerMsg := fmt.Sprintf("Witness stall recovery: node %s has been silent for %s; conclude current step or report blocker immediately.", nodeID, silentFor.Round(time.Millisecond))
+	if activeRunID != "" {
+		_ = rt.mgr.engine.Steer(activeRunID, steerMsg)
+	}
+
 	rt.emit(MissionEvent{
 		Type:    EventNodeStalled,
 		NodeID:  nodeID,
-		Message: fmt.Sprintf("node %s silent for %s", nodeID, silentFor.Round(time.Millisecond)),
+		Message: fmt.Sprintf("node %s silent for %s (steered once)", nodeID, silentFor.Round(time.Millisecond)),
 	})
+}
+
+func (rt *missionRuntime) onNodeRepeatStall(nodeID string, silentFor time.Duration, stallCount int) {
+	if stallCount < 2 {
+		return
+	}
+	now := rt.mgr.now().UTC()
+	var activeRunID string
+	rt.mu.Lock()
+	for i := range rt.snap.Nodes {
+		if rt.snap.Nodes[i].ID == nodeID {
+			rt.snap.Nodes[i].Status = NodeStalled
+			rt.snap.Nodes[i].UpdatedAt = now
+			activeRunID = rt.snap.Nodes[i].ActiveRunID
+		}
+	}
+	rt.stallCancelled[nodeID] = true
+	rt.snap.UpdatedAt = now
+	rt.mu.Unlock()
+
+	if released, err := rt.bb.ReleaseNodeTasks(nodeID); err == nil && len(released) > 0 {
+		ids := make([]string, 0, len(released))
+		for _, t := range released {
+			ids = append(ids, t.ID)
+		}
+		rt.mu.Lock()
+		rt.stallReleasedTasks[nodeID] = ids
+		rt.mu.Unlock()
+		rt.syncBlackboardState(EventTaskUpdated, nodeID, "", fmt.Sprintf("released %d stalled task(s) from %s", len(ids), nodeID))
+	}
+
+	rt.emit(MissionEvent{
+		Type:    EventNodeStalled,
+		NodeID:  nodeID,
+		Message: fmt.Sprintf("node %s remained stalled (%s); cancelling run and releasing tasks", nodeID, silentFor.Round(time.Millisecond)),
+	})
+
+	if activeRunID != "" {
+		_ = rt.mgr.engine.StopRun(activeRunID)
+	}
 }
 
 func (rt *missionRuntime) checkBudget() error {
@@ -1511,12 +1998,4 @@ func firstNonEmpty(vals ...string) string {
 		}
 	}
 	return ""
-}
-
-func randomFleetHex(numBytes int) string {
-	b := make([]byte, numBytes)
-	if _, err := rand.Read(b); err != nil {
-		return fmt.Sprintf("%08x", time.Now().UnixNano()&0xffffffff)
-	}
-	return hex.EncodeToString(b)
 }

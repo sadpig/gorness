@@ -23,13 +23,22 @@ import (
 const (
 	PluginID = "alwayson"
 
-	defaultTickInterval = 250 * time.Millisecond
-	defaultRetryBackoff = 25 * time.Millisecond
+	defaultTickInterval          = 250 * time.Millisecond
+	defaultRetryBackoff          = 25 * time.Millisecond
+	defaultDreamSessionThreshold = 5
+	defaultDreamCooldown         = 10 * time.Minute
 )
 
 var (
 	ErrWorkerLeaseHeld  = errors.New("alwayson worker lease is already held by another active consumer")
 	ErrDeferredNotFound = errors.New("deferred card not found")
+
+	memoryPluginToolNames = []string{
+		"memory_read",
+		"memory_write",
+		"progress_read",
+		"progress_write",
+	}
 )
 
 type DeferredCard struct {
@@ -46,60 +55,72 @@ type DeferredCard struct {
 	Args        json.RawMessage  `json:"args,omitempty" toml:"-"`
 	Hunks       []tools.DiffHunk `json:"hunks,omitempty" toml:"hunks,omitempty"`
 	Status      string           `json:"status,omitempty" toml:"status,omitempty"`
+	Remember    bool             `json:"remember,omitempty" toml:"remember,omitempty"`
+	Feedback    string           `json:"feedback,omitempty" toml:"feedback,omitempty"`
 	CreatedAt   time.Time        `json:"created_at" toml:"created_at"`
 	ResolvedAt  *time.Time       `json:"resolved_at,omitempty" toml:"resolved_at,omitempty"`
 }
 
-type deferredHunkRecord struct {
-	ID          string `toml:"id"`
-	Fingerprint string `toml:"fingerprint"`
-	Header      string `toml:"header"`
-	OldStart    int    `toml:"old_start"`
-	OldLines    int    `toml:"old_lines"`
-	NewStart    int    `toml:"new_start"`
-	NewLines    int    `toml:"new_lines"`
-	Preview     string `toml:"preview"`
+// DeferredResolution 表示用户对挂起工具卡片的审批决策（支持部分 hunk 选择、持久记住授权与转向反馈注入）。
+type DeferredResolution struct {
+	Decision        string   `json:"decision,omitempty"`
+	Approved        bool     `json:"approved"`
+	SelectedHunkIDs []string `json:"selected_hunk_ids,omitempty"`
+	Remember        bool     `json:"remember,omitempty"`
+	Feedback        string   `json:"feedback,omitempty"`
 }
 
+// Resolution 为 DeferredResolution 的别名，便于网关层直接引用。
+type Resolution = DeferredResolution
+
 type deferredFrontmatter struct {
-	ID              string               `toml:"id"`
-	RunID           string               `toml:"run_id"`
-	WorkspaceID     string               `toml:"workspace_id"`
-	SessionID       string               `toml:"session_id"`
-	AgentRole       string               `toml:"agent_role,omitempty"`
-	ToolCallID      string               `toml:"tool_call_id,omitempty"`
-	ToolName        string               `toml:"tool_name"`
-	ReasonCode      string               `toml:"reason_code"`
-	Reason          string               `toml:"reason"`
-	Fingerprint     string               `toml:"fingerprint,omitempty"`
-	ArgsJSON        string               `toml:"args_json,omitempty"`
-	Hunks           []deferredHunkRecord `toml:"hunks,omitempty"`
-	Status          string               `toml:"status"`
-	SelectedHunkIDs []string             `toml:"selected_hunk_ids,omitempty"`
-	CreatedAt       time.Time            `toml:"created_at"`
-	ResolvedAt      *time.Time           `toml:"resolved_at,omitempty"`
+	ID              string           `toml:"id" json:"id"`
+	RunID           string           `toml:"run_id" json:"run_id"`
+	WorkspaceID     string           `toml:"workspace_id" json:"workspace_id"`
+	SessionID       string           `toml:"session_id" json:"session_id"`
+	AgentRole       string           `toml:"agent_role,omitempty" json:"agent_role,omitempty"`
+	ToolCallID      string           `toml:"tool_call_id,omitempty" json:"tool_call_id,omitempty"`
+	ToolName        string           `toml:"tool_name" json:"tool_name"`
+	ReasonCode      string           `toml:"reason_code" json:"reason_code"`
+	Reason          string           `toml:"reason" json:"reason"`
+	Fingerprint     string           `toml:"fingerprint,omitempty" json:"fingerprint,omitempty"`
+	ArgsJSON        string           `toml:"args_json,omitempty" json:"args_json,omitempty"`
+	Hunks           []tools.DiffHunk `toml:"hunks,omitempty" json:"hunks,omitempty"`
+	Status          string           `toml:"status" json:"status"`
+	SelectedHunkIDs []string         `toml:"selected_hunk_ids,omitempty" json:"selected_hunk_ids,omitempty"`
+	Remember        bool             `toml:"remember,omitempty" json:"remember,omitempty"`
+	Feedback        string           `toml:"feedback,omitempty" json:"feedback,omitempty"`
+	CreatedAt       time.Time        `toml:"created_at" json:"created_at"`
+	ResolvedAt      *time.Time       `toml:"resolved_at,omitempty" json:"resolved_at,omitempty"`
 }
 
 type AlwaysOnState struct {
-	Running       bool           `json:"running"`
-	QueuedCount   int            `json:"queued_count"`
-	RunningCount  int            `json:"running_count"`
-	FailedCount   int            `json:"failed_count"`
-	DeferredCount int            `json:"deferred_count"`
-	Inbox         []InboxEvent   `json:"inbox"`
-	Timers        []TimerEntry   `json:"timers"`
-	Deferred      []DeferredCard `json:"deferred"`
-	Outbox        []OutboxItem   `json:"outbox"`
-	UpdatedAt     time.Time      `json:"updated_at"`
+	Running         bool             `json:"running"`
+	QueuedCount     int              `json:"queued_count"`
+	RunningCount    int              `json:"running_count"`
+	FailedCount     int              `json:"failed_count"`
+	DeferredCount   int              `json:"deferred_count"`
+	CandidatesCount int              `json:"candidates_count"`
+	Inbox           []InboxEvent     `json:"inbox"`
+	Timers          []TimerEntry     `json:"timers"`
+	Deferred        []DeferredCard   `json:"deferred"`
+	Outbox          []OutboxItem     `json:"outbox"`
+	Candidates      []CandidateSkill `json:"candidates,omitempty"`
+	UpdatedAt       time.Time        `json:"updated_at"`
 }
 
 type ServiceOptions struct {
-	Config       *config.Manager
-	Engine       *core.Engine
-	Notifier     Notifier
-	Now          func() time.Time
-	TickInterval time.Duration
-	RetryBackoff time.Duration
+	Config                *config.Manager
+	Engine                *core.Engine
+	Notifier              Notifier
+	Now                   func() time.Time
+	TickInterval          time.Duration
+	RetryBackoff          time.Duration
+	MaxInboxRetained      int
+	MaxOutboxRetained     int
+	DreamSessionThreshold int
+	DreamCooldown         time.Duration
+	DisableAutoDream      bool
 }
 
 type runNotificationCapture struct {
@@ -120,21 +141,33 @@ type Service struct {
 	tickInterval time.Duration
 	retryBackoff time.Duration
 
-	inbox  *inboxStore
-	timers *timerStore
-	memory *memoryStore
-	outbox *outboxStore
+	inbox   *inboxStore
+	timers  *timerStore
+	memory  *MemoryStore
+	outbox  *outboxStore
+	dreamer *Dreamer
 
 	wakeCh chan struct{}
 
 	captureMu sync.Mutex
 	captures  map[string]*runNotificationCapture // sessionID -> active Always-On run capture
 
-	lifeMu      sync.Mutex
-	running     bool
-	stopCancel  context.CancelFunc
-	leaseUnlock func()
-	wg          sync.WaitGroup
+	dreamMu                sync.Mutex
+	disableAutoDream       bool
+	dreamSessionThreshold  int
+	dreamCooldown          time.Duration
+	completedSinceDream    int
+	lastCompletedWorkspace string
+	lastDreamAt            time.Time
+	dreamRunning           bool
+
+	lifeMu          sync.Mutex
+	running         bool
+	ownsPluginMount bool
+	stopCancel      context.CancelFunc
+	leaseUnlock     func()
+	globalUnsub     func()
+	wg              sync.WaitGroup
 }
 
 func NewService(opts ServiceOptions) (*Service, error) {
@@ -161,6 +194,14 @@ func NewService(opts ServiceOptions) (*Service, error) {
 	if retryBackoff <= 0 {
 		retryBackoff = defaultRetryBackoff
 	}
+	dreamThresh := opts.DreamSessionThreshold
+	if dreamThresh <= 0 {
+		dreamThresh = defaultDreamSessionThreshold
+	}
+	dreamCooldown := opts.DreamCooldown
+	if dreamCooldown <= 0 {
+		dreamCooldown = defaultDreamCooldown
+	}
 
 	paths := opts.Config.Paths()
 	for _, dir := range []string{
@@ -169,6 +210,7 @@ func NewService(opts ServiceOptions) (*Service, error) {
 		filepath.Join(paths.AlwaysOnDir(), "deferred", "resolved"),
 		paths.MemoryDir(),
 		filepath.Join(paths.MemoryDir(), "notes"),
+		filepath.Join(paths.SkillsDir(), "_candidates"),
 		filepath.Join(paths.RuntimeDir(), "locks"),
 	} {
 		if err := os.MkdirAll(dir, 0o700); err != nil {
@@ -176,20 +218,30 @@ func NewService(opts ServiceOptions) (*Service, error) {
 		}
 	}
 
+	mem := NewMemoryStore(paths)
+	mem.nowFn = nowFn
+
 	svc := &Service{
-		cfg:          opts.Config,
-		engine:       opts.Engine,
-		paths:        paths,
-		notifier:     notifier,
-		now:          nowFn,
-		tickInterval: tickInt,
-		retryBackoff: retryBackoff,
-		inbox:        newInboxStore(paths),
-		timers:       newTimerStore(paths),
-		memory:       newMemoryStore(paths),
-		outbox:       newOutboxStore(paths),
-		wakeCh:       make(chan struct{}, 1),
-		captures:     make(map[string]*runNotificationCapture),
+		cfg:                   opts.Config,
+		engine:                opts.Engine,
+		paths:                 paths,
+		notifier:              notifier,
+		now:                   nowFn,
+		tickInterval:          tickInt,
+		retryBackoff:          retryBackoff,
+		inbox:                 newInboxStore(paths, opts.MaxInboxRetained),
+		timers:                newTimerStore(paths),
+		memory:                mem,
+		outbox:                newOutboxStore(paths, opts.MaxOutboxRetained),
+		wakeCh:                make(chan struct{}, 1),
+		captures:              make(map[string]*runNotificationCapture),
+		disableAutoDream:      opts.DisableAutoDream,
+		dreamSessionThreshold: dreamThresh,
+		dreamCooldown:         dreamCooldown,
+	}
+	svc.dreamer = &Dreamer{svc: svc}
+	mem.onMutate = func() {
+		svc.publishAlwaysOnEvent("memory_updated", nil)
 	}
 
 	if !svc.isPluginMounted() {
@@ -198,7 +250,144 @@ func NewService(opts ServiceOptions) (*Service, error) {
 		}
 	}
 
+	globalCh, unsub := svc.engine.SubscribeGlobal()
+	svc.globalUnsub = unsub
+	svc.wg.Add(1)
+	go func() {
+		defer svc.wg.Done()
+		svc.listenGlobalEvents(globalCh)
+	}()
+
 	return svc, nil
+}
+
+// Memory 暴露四层记忆存储实例（供 HTTP API、CLI、TUI 与插件工具统一读写）。
+func (s *Service) Memory() *MemoryStore {
+	return s.memory
+}
+
+// Dreamer 暴露闲时记忆蒸馏器实例。
+func (s *Service) Dreamer() *Dreamer {
+	return s.dreamer
+}
+
+func (s *Service) publishAlwaysOnEvent(action string, extra map[string]any) {
+	if s == nil || s.engine == nil {
+		return
+	}
+	payload := map[string]any{
+		"action": action,
+	}
+	for k, v := range extra {
+		payload[k] = v
+	}
+	s.engine.PublishSystemEvent(core.EventAlwaysOnUpdated, payload)
+}
+
+// listenGlobalEvents 订阅全局引擎事件总线：
+// 1. 捕获任意无人值守运行 (`POST /api/runs/stream`、CLI、ACP 或后台 worker) 触发的 `EventToolDeferred`，幂等写入 `alwayson/deferred/<id>.md`；
+// 2. 计数新完成的业务会话，以便后台空闲时自动触发 `Dreamer.RunDream`。
+func (s *Service) listenGlobalEvents(ch <-chan core.RunEvent) {
+	for ev := range ch {
+		switch ev.Type {
+		case core.EventToolDeferred:
+			var def core.DeferredToolPayload
+			switch p := ev.Payload.(type) {
+			case core.DeferredToolPayload:
+				def = p
+			case *core.DeferredToolPayload:
+				if p == nil {
+					continue
+				}
+				def = *p
+			default:
+				continue
+			}
+			if strings.TrimSpace(def.WorkspaceID) == "" {
+				def.WorkspaceID = ev.WorkspaceID
+			}
+			if strings.TrimSpace(def.SessionID) == "" {
+				def.SessionID = ev.SessionID
+			}
+			if strings.TrimSpace(def.RunID) == "" {
+				def.RunID = ev.RunID
+			}
+			role := strings.TrimSpace(ev.AgentRole)
+			if role == "" {
+				role = "coder"
+			}
+			_, _, _ = s.recordDeferredAndNotifyIfNew(def, role)
+
+		case core.EventRunCompleted:
+			role := strings.TrimSpace(ev.AgentRole)
+			if role == "dreamer" || role == "utility" {
+				continue
+			}
+			if out, ok := ev.Payload.(core.RunOutcome); ok && out.Status == "deferred" {
+				continue
+			}
+			s.dreamMu.Lock()
+			s.completedSinceDream++
+			if strings.TrimSpace(ev.WorkspaceID) != "" {
+				s.lastCompletedWorkspace = strings.TrimSpace(ev.WorkspaceID)
+			}
+			shouldWake := !s.disableAutoDream && s.completedSinceDream >= s.dreamSessionThreshold && !s.dreamRunning
+			s.dreamMu.Unlock()
+			if shouldWake {
+				s.signalWake()
+			}
+		}
+	}
+}
+
+func (s *Service) recordDreamCompleted(now time.Time) {
+	s.dreamMu.Lock()
+	s.completedSinceDream = 0
+	s.lastDreamAt = now.UTC()
+	s.dreamMu.Unlock()
+}
+
+func (s *Service) maybeAutoDream(ctx context.Context) {
+	if s.disableAutoDream {
+		return
+	}
+	now := s.now().UTC()
+	s.dreamMu.Lock()
+	if s.dreamRunning || s.completedSinceDream < s.dreamSessionThreshold {
+		s.dreamMu.Unlock()
+		return
+	}
+	if !s.lastDreamAt.IsZero() && now.Sub(s.lastDreamAt) < s.dreamCooldown {
+		s.dreamMu.Unlock()
+		return
+	}
+	wsID := s.lastCompletedWorkspace
+	s.dreamMu.Unlock()
+
+	// Only run idle dream pass when Engine has zero active runs and Inbox has no queued/running items.
+	if len(s.engine.ActiveRuns()) > 0 || s.inbox.hasActiveOrQueuedWork(now) {
+		return
+	}
+
+	s.dreamMu.Lock()
+	if s.dreamRunning || s.completedSinceDream < s.dreamSessionThreshold {
+		s.dreamMu.Unlock()
+		return
+	}
+	if !s.lastDreamAt.IsZero() && now.Sub(s.lastDreamAt) < s.dreamCooldown {
+		s.dreamMu.Unlock()
+		return
+	}
+	s.dreamRunning = true
+	s.dreamMu.Unlock()
+
+	defer func() {
+		s.dreamMu.Lock()
+		s.dreamRunning = false
+		s.dreamMu.Unlock()
+	}()
+
+	_, _ = s.dreamer.RunDream(ctx, wsID)
 }
 
 func (s *Service) isPluginMounted() bool {
@@ -216,33 +405,298 @@ func (s *Service) isPluginMounted() bool {
 
 func (s *Service) mountPluginTools() error {
 	hooks := s.engine.Hooks()
-	if hooks == nil {
-		return nil
-	}
-	for _, id := range hooks.MountedPlugins() {
-		if id == PluginID {
-			_ = hooks.UnmountPlugin(PluginID)
-			break
+	if hooks != nil {
+		for _, id := range hooks.MountedPlugins() {
+			if id == PluginID {
+				_ = hooks.UnmountPlugin(PluginID)
+				break
+			}
+		}
+		if err := hooks.MountPlugin(core.Plugin{
+			ID: PluginID,
+			Setup: func(sc *core.Scope) error {
+				sc.OnPreStep(s.onPreStepMemoryHook)
+				sc.RegisterTool(s.makeSetFollowUpTool())
+				sc.RegisterTool(s.makeNotifyUserTool())
+				return nil
+			},
+		}); err != nil {
+			return err
 		}
 	}
 
-	return hooks.MountPlugin(core.Plugin{
-		ID: PluginID,
-		Setup: func(sc *core.Scope) error {
-			sc.RegisterTool(s.makeSetFollowUpTool())
-			sc.RegisterTool(s.makeNotifyUserTool())
-			return nil
+	s.engine.RegisterPluginTools(
+		s.makeMemoryReadTool(),
+		s.makeMemoryWriteTool(),
+		s.makeProgressReadTool(),
+		s.makeProgressWriteTool(),
+	)
+
+	s.lifeMu.Lock()
+	s.ownsPluginMount = true
+	s.lifeMu.Unlock()
+	return nil
+}
+
+func (s *Service) onPreStepMemoryHook(_ context.Context, ev *core.PreStepEvent) error {
+	if ev == nil || ev.Step != 1 || strings.EqualFold(strings.TrimSpace(ev.AgentRole), "utility") {
+		return nil
+	}
+	reminders := s.memory.buildStepOneMemoryReminders(ev.WorkspaceID)
+	if len(reminders) > 0 {
+		ev.DynamicReminders = append(ev.DynamicReminders, reminders...)
+	}
+	return nil
+}
+
+func (s *Service) makeMemoryReadTool() tools.Tool {
+	return tools.Tool{
+		Name:            "memory_read",
+		Description:     "Read Gorness 4-layer global memory: Layer 1 ('instructions' -> INSTRUCTIONS.md), Layer 2 ('index' -> INDEX.md), or Layer 3 durable notes ('notes' list or specific note by 'slug').",
+		InputSchema:     json.RawMessage(`{"type":"object","properties":{"layer":{"type":"string","description":"Global memory layer: 'instructions', 'index', or 'notes'"},"slug":{"type":"string","description":"Optional note slug under memory/notes/<slug>.md"}}}`),
+		ReadOnly:        true,
+		Mutating:        false,
+		ConcurrencySafe: true,
+		Handler: func(_ context.Context, _ tools.CallContext, rawInput json.RawMessage) (tools.ToolResult, error) {
+			var in struct {
+				Layer string `json:"layer"`
+				Slug  string `json:"slug"`
+			}
+			if len(bytes.TrimSpace(rawInput)) > 0 {
+				if err := json.Unmarshal(rawInput, &in); err != nil {
+					return tools.ToolResult{}, fmt.Errorf("invalid memory_read input: %w", err)
+				}
+			}
+
+			if strings.TrimSpace(in.Slug) != "" {
+				note, err := s.memory.GetNote(in.Slug)
+				if err != nil {
+					return tools.ToolResult{}, err
+				}
+				encoded, _ := json.Marshal(note)
+				return tools.ToolResult{Output: string(encoded)}, nil
+			}
+
+			layer := strings.ToLower(strings.TrimSpace(in.Layer))
+			switch layer {
+			case "instructions", "instructions.md", "layer1", "index", "index.md", "layer2":
+				content, err := s.memory.GetGlobalLayer(layer)
+				if err != nil {
+					return tools.ToolResult{}, err
+				}
+				out, _ := json.Marshal(map[string]any{
+					"layer":   layer,
+					"content": content,
+				})
+				return tools.ToolResult{Output: string(out)}, nil
+
+			case "notes", "note", "layer3":
+				notes, err := s.memory.ListNotes()
+				if err != nil {
+					return tools.ToolResult{}, err
+				}
+				type noteMeta struct {
+					Slug      string    `json:"slug"`
+					Title     string    `json:"title"`
+					Summary   string    `json:"summary"`
+					Tags      []string  `json:"tags,omitempty"`
+					UpdatedAt time.Time `json:"updated_at"`
+				}
+				summaries := make([]noteMeta, len(notes))
+				for i, n := range notes {
+					summaries[i] = noteMeta{
+						Slug:      n.Slug,
+						Title:     n.Title,
+						Summary:   n.Summary,
+						Tags:      n.Tags,
+						UpdatedAt: n.UpdatedAt,
+					}
+				}
+				out, _ := json.Marshal(map[string]any{"notes": summaries})
+				return tools.ToolResult{Output: string(out)}, nil
+
+			case "":
+				inst, _ := s.memory.GetGlobalLayer(MemoryLayerInstructions)
+				idx, _ := s.memory.GetGlobalLayer(MemoryLayerIndex)
+				notes, _ := s.memory.ListNotes()
+				slugs := make([]string, len(notes))
+				for i, n := range notes {
+					slugs[i] = n.Slug
+				}
+				out, _ := json.Marshal(map[string]any{
+					"instructions": inst,
+					"index":        idx,
+					"note_slugs":   slugs,
+				})
+				return tools.ToolResult{Output: string(out)}, nil
+
+			default:
+				return tools.ToolResult{}, fmt.Errorf("%w: %q", ErrInvalidMemoryLayer, in.Layer)
+			}
 		},
-	})
+	}
+}
+
+func (s *Service) makeMemoryWriteTool() tools.Tool {
+	return tools.Tool{
+		Name:            "memory_write",
+		Description:     "Write or delete Gorness global memory: update Layer 1 ('instructions') or Layer 2 ('index'), or upsert/delete a Layer 3 note ('note') under memory/notes/<slug>.md with automatic INDEX.md pointer synchronization.",
+		InputSchema:     json.RawMessage(`{"type":"object","properties":{"layer":{"type":"string","description":"Target layer: 'instructions', 'index', or 'note' (default 'note')"},"slug":{"type":"string","description":"Note slug when writing or deleting a Layer 3 note"},"title":{"type":"string","description":"Human-readable note title"},"content":{"type":"string","description":"Markdown content to persist"},"tags":{"type":"array","items":{"type":"string"},"description":"Optional classification tags for Layer 3 notes"},"delete":{"type":"boolean","description":"Delete the specified Layer 3 note slug when true"}}}`),
+		ReadOnly:        false,
+		Mutating:        false,
+		ConcurrencySafe: true,
+		Handler: func(_ context.Context, _ tools.CallContext, rawInput json.RawMessage) (tools.ToolResult, error) {
+			var in struct {
+				Layer   string   `json:"layer"`
+				Slug    string   `json:"slug"`
+				Title   string   `json:"title"`
+				Content string   `json:"content"`
+				Tags    []string `json:"tags"`
+				Delete  bool     `json:"delete"`
+			}
+			if err := json.Unmarshal(rawInput, &in); err != nil {
+				return tools.ToolResult{}, fmt.Errorf("invalid memory_write input: %w", err)
+			}
+
+			layer := strings.ToLower(strings.TrimSpace(in.Layer))
+			if layer == "" {
+				layer = "note"
+			}
+
+			switch layer {
+			case "instructions", "instructions.md", "layer1", "index", "index.md", "layer2":
+				if err := s.memory.SaveGlobalLayer(layer, in.Content); err != nil {
+					return tools.ToolResult{}, err
+				}
+				out, _ := json.Marshal(map[string]any{"saved": true, "layer": layer})
+				return tools.ToolResult{Output: string(out)}, nil
+
+			case "note", "notes", "layer3":
+				slug := strings.TrimSpace(in.Slug)
+				if slug == "" && strings.TrimSpace(in.Title) != "" {
+					slug = sanitizeSlug(in.Title)
+				}
+				if slug == "" {
+					return tools.ToolResult{}, errors.New("memory_write for 'note' requires slug or title")
+				}
+				if in.Delete {
+					if err := s.memory.DeleteNote(slug); err != nil {
+						return tools.ToolResult{}, err
+					}
+					out, _ := json.Marshal(map[string]any{"deleted": true, "slug": slug})
+					return tools.ToolResult{Output: string(out)}, nil
+				}
+				note, err := s.memory.SaveNote(slug, in.Title, in.Content, in.Tags)
+				if err != nil {
+					return tools.ToolResult{}, err
+				}
+				out, _ := json.Marshal(note)
+				return tools.ToolResult{Output: string(out)}, nil
+
+			default:
+				return tools.ToolResult{}, fmt.Errorf("%w: %q", ErrInvalidMemoryLayer, in.Layer)
+			}
+		},
+	}
+}
+
+func (s *Service) makeProgressReadTool() tools.Tool {
+	return tools.Tool{
+		Name:            "progress_read",
+		Description:     "Read Layer 4 workspace-scoped progress memory under workspaces/<wsID>/memory/progress/<slug>.md (or list all progress entries when slug is omitted).",
+		InputSchema:     json.RawMessage(`{"type":"object","properties":{"workspace_id":{"type":"string","description":"Optional workspace ID (defaults to active workspace)"},"slug":{"type":"string","description":"Optional progress entry slug"}}}`),
+		ReadOnly:        true,
+		Mutating:        false,
+		ConcurrencySafe: true,
+		Handler: func(_ context.Context, call tools.CallContext, rawInput json.RawMessage) (tools.ToolResult, error) {
+			var in struct {
+				WorkspaceID string `json:"workspace_id"`
+				Slug        string `json:"slug"`
+			}
+			if len(bytes.TrimSpace(rawInput)) > 0 {
+				if err := json.Unmarshal(rawInput, &in); err != nil {
+					return tools.ToolResult{}, fmt.Errorf("invalid progress_read input: %w", err)
+				}
+			}
+			wsID := strings.TrimSpace(in.WorkspaceID)
+			if wsID == "" {
+				wsID = s.resolveWorkspaceIDFromCall(call)
+			}
+			if wsID == "" {
+				return tools.ToolResult{}, errors.New("unable to resolve workspace_id for progress_read")
+			}
+
+			if strings.TrimSpace(in.Slug) != "" {
+				entry, err := s.memory.GetProgress(wsID, in.Slug)
+				if err != nil {
+					return tools.ToolResult{}, err
+				}
+				out, _ := json.Marshal(entry)
+				return tools.ToolResult{Output: string(out)}, nil
+			}
+
+			entries, err := s.memory.ListProgress(wsID)
+			if err != nil {
+				return tools.ToolResult{}, err
+			}
+			out, _ := json.Marshal(map[string]any{"workspace_id": wsID, "entries": entries})
+			return tools.ToolResult{Output: string(out)}, nil
+		},
+	}
+}
+
+func (s *Service) makeProgressWriteTool() tools.Tool {
+	return tools.Tool{
+		Name:            "progress_write",
+		Description:     "Save or delete a Layer 4 workspace-scoped progress checkpoint under workspaces/<wsID>/memory/progress/<slug>.md.",
+		InputSchema:     json.RawMessage(`{"type":"object","properties":{"workspace_id":{"type":"string","description":"Optional workspace ID (defaults to active workspace)"},"slug":{"type":"string","description":"Progress entry slug (e.g. 'current', 'migration-plan')"},"content":{"type":"string","description":"Markdown progress checkpoint content"},"delete":{"type":"boolean","description":"Delete the progress entry when true"}},"required":["slug"]}`),
+		ReadOnly:        false,
+		Mutating:        false,
+		ConcurrencySafe: true,
+		Handler: func(_ context.Context, call tools.CallContext, rawInput json.RawMessage) (tools.ToolResult, error) {
+			var in struct {
+				WorkspaceID string `json:"workspace_id"`
+				Slug        string `json:"slug"`
+				Content     string `json:"content"`
+				Delete      bool   `json:"delete"`
+			}
+			if err := json.Unmarshal(rawInput, &in); err != nil {
+				return tools.ToolResult{}, fmt.Errorf("invalid progress_write input: %w", err)
+			}
+			wsID := strings.TrimSpace(in.WorkspaceID)
+			if wsID == "" {
+				wsID = s.resolveWorkspaceIDFromCall(call)
+			}
+			if wsID == "" {
+				return tools.ToolResult{}, errors.New("unable to resolve workspace_id for progress_write")
+			}
+
+			if in.Delete {
+				if err := s.memory.DeleteProgress(wsID, in.Slug); err != nil {
+					return tools.ToolResult{}, err
+				}
+				out, _ := json.Marshal(map[string]any{"deleted": true, "workspace_id": wsID, "slug": in.Slug})
+				return tools.ToolResult{Output: string(out)}, nil
+			}
+
+			entry, err := s.memory.SaveProgress(wsID, in.Slug, in.Content)
+			if err != nil {
+				return tools.ToolResult{}, err
+			}
+			out, _ := json.Marshal(entry)
+			return tools.ToolResult{Output: string(out)}, nil
+		},
+	}
 }
 
 func (s *Service) makeSetFollowUpTool() tools.Tool {
 	return tools.Tool{
-		Name:        "set_followup",
-		Description: "Schedule a durable Always-On follow-up alarm in timers.toml to re-awaken this session or workspace after a delay.",
-		InputSchema: json.RawMessage(`{"type":"object","properties":{"after_seconds":{"type":"integer","description":"Delay in seconds before follow-up fires"},"after":{"type":"string","description":"Optional Go duration string such as '5m' or '1h'"},"note":{"type":"string","description":"Reminder note for the follow-up wake"}},"required":["note"]}`),
-		ReadOnly:    false,
-		Mutating:    false, // Local harness scheduling metadata (safe in auto/accept_edits unattended runs)
+		Name:            "set_followup",
+		Description:     "Schedule a durable Always-On follow-up alarm in timers.toml to re-awaken this session or workspace after a delay.",
+		InputSchema:     json.RawMessage(`{"type":"object","properties":{"after_seconds":{"type":"integer","description":"Delay in seconds before follow-up fires"},"after":{"type":"string","description":"Optional Go duration string such as '5m' or '1h'"},"note":{"type":"string","description":"Reminder note for the follow-up wake"}},"required":["note"]}`),
+		ReadOnly:        false,
+		Mutating:        false,
+		ConcurrencySafe: true,
 		Handler: func(_ context.Context, call tools.CallContext, rawInput json.RawMessage) (tools.ToolResult, error) {
 			var in struct {
 				AfterSeconds int    `json:"after_seconds"`
@@ -289,11 +743,12 @@ func (s *Service) makeSetFollowUpTool() tools.Tool {
 
 func (s *Service) makeNotifyUserTool() tools.Tool {
 	return tools.Tool{
-		Name:        "notify_user",
-		Description: "Deliver an actionable alert to the Gorness Outbox and macOS Notification Center, automatically deduplicating findings already recorded in REPORTED.md.",
-		InputSchema: json.RawMessage(`{"type":"object","properties":{"title":{"type":"string","description":"Concise alert title"},"body":{"type":"string","description":"Actionable details for the user"}},"required":["title","body"]}`),
-		ReadOnly:    false,
-		Mutating:    false, // Local harness notification metadata (allowed in unattended auto runs)
+		Name:            "notify_user",
+		Description:     "Deliver an actionable alert to the Gorness Outbox and macOS Notification Center, automatically deduplicating findings already recorded in REPORTED.md.",
+		InputSchema:     json.RawMessage(`{"type":"object","properties":{"title":{"type":"string","description":"Concise alert title"},"body":{"type":"string","description":"Actionable details for the user"}},"required":["title","body"]}`),
+		ReadOnly:        false,
+		Mutating:        false,
+		ConcurrencySafe: true,
 		Handler: func(_ context.Context, call tools.CallContext, rawInput json.RawMessage) (tools.ToolResult, error) {
 			var in struct {
 				Title string `json:"title"`
@@ -342,16 +797,18 @@ func (s *Service) makeNotifyUserTool() tools.Tool {
 				}
 			}
 
-			if _, err := s.outbox.append(OutboxItem{
+			outItem, err := s.outbox.append(OutboxItem{
 				WorkspaceID: wsID,
 				SessionID:   call.SessionID,
 				Outcome:     OutcomeSend,
 				Title:       title,
 				Body:        body,
 				Delivered:   delivered,
-			}, s.now()); err != nil {
+			}, s.now())
+			if err != nil {
 				return tools.ToolResult{}, err
 			}
+			s.publishAlwaysOnEvent("outbox_sent", map[string]any{"outbox_id": outItem.ID})
 
 			return tools.ToolResult{
 				Output: fmt.Sprintf("Delivered alert %q to outbox (macOS notified=%v).", title, delivered),
@@ -373,6 +830,9 @@ func (s *Service) resolveWorkspaceIDFromCall(call tools.CallContext) string {
 		if meta, err := s.engine.Sessions().GetMeta(call.SessionID); err == nil && meta != nil {
 			return meta.WorkspaceID
 		}
+	}
+	if strings.TrimSpace(call.WorkspaceID) != "" {
+		return strings.TrimSpace(call.WorkspaceID)
 	}
 	if strings.TrimSpace(call.WorkspaceRoot) != "" {
 		if ws, err := s.engine.Workspaces().GetByPath(call.WorkspaceRoot); err == nil && ws != nil {
@@ -416,12 +876,13 @@ func (s *Service) signalWake() {
 }
 
 func (s *Service) Enqueue(ev InboxEvent) (bool, error) {
-	_, deduped, err := s.inbox.enqueue(ev, s.now())
+	stored, deduped, err := s.inbox.enqueue(ev, s.now())
 	if err != nil {
 		return false, err
 	}
 	if !deduped {
 		s.signalWake()
+		s.publishAlwaysOnEvent("inbox_enqueued", map[string]any{"event_id": stored.ID})
 	}
 	return deduped, nil
 }
@@ -432,6 +893,7 @@ func (s *Service) ScheduleFollowUp(wsID, sessionID string, after time.Duration, 
 		return nil, err
 	}
 	s.signalWake()
+	s.publishAlwaysOnEvent("timer_scheduled", map[string]any{"timer_id": entry.ID})
 	return entry, nil
 }
 
@@ -440,6 +902,42 @@ func (s *Service) UpsertCron(entry TimerEntry) error {
 		return err
 	}
 	s.signalWake()
+	s.publishAlwaysOnEvent("timer_upserted", map[string]any{"timer_id": entry.ID})
+	return nil
+}
+
+func (s *Service) UpdateTimer(id string, patch TimerPatch) (TimerEntry, error) {
+	updated, err := s.timers.update(id, patch, s.now())
+	if err != nil {
+		return TimerEntry{}, err
+	}
+	s.signalWake()
+	s.publishAlwaysOnEvent("timer_updated", map[string]any{"timer_id": updated.ID})
+	return updated, nil
+}
+
+func (s *Service) DeleteTimer(id string) error {
+	if err := s.timers.delete(id); err != nil {
+		return err
+	}
+	s.publishAlwaysOnEvent("timer_deleted", map[string]any{"timer_id": id})
+	return nil
+}
+
+func (s *Service) TriggerTimer(ctx context.Context, id string) error {
+	_ = ctx
+	now := s.now()
+	stored, err := s.timers.triggerNow(id, now, func(ev InboxEvent) (InboxEvent, bool, error) {
+		return s.inbox.enqueue(ev, now)
+	})
+	if err != nil {
+		return err
+	}
+	s.signalWake()
+	s.publishAlwaysOnEvent("timer_triggered", map[string]any{
+		"timer_id": id,
+		"event_id": stored.ID,
+	})
 	return nil
 }
 
@@ -459,12 +957,38 @@ func (s *Service) TickTimers(now time.Time) ([]InboxEvent, error) {
 	}
 	if len(enqueued) > 0 {
 		s.signalWake()
+		s.publishAlwaysOnEvent("timers_fired", map[string]any{"count": len(enqueued)})
 	}
 	return enqueued, nil
 }
 
 func (s *Service) ListOutbox(limit int) ([]OutboxItem, error) {
 	return s.outbox.list(limit)
+}
+
+func (s *Service) AckOutbox(ids []string) (int, error) {
+	acked, err := s.outbox.ack(ids, s.now())
+	if err != nil {
+		return 0, err
+	}
+	if acked > 0 {
+		s.publishAlwaysOnEvent("outbox_acked", map[string]any{"count": acked})
+	}
+	return acked, nil
+}
+
+// Compact 手动或定时压缩已确认的 Outbox 记录及已终态超限的 Inbox JSONL 历史。
+func (s *Service) Compact(now time.Time) error {
+	if now.IsZero() {
+		now = s.now()
+	}
+	if _, err := s.outbox.compact(); err != nil {
+		return err
+	}
+	if _, err := s.inbox.compact(now); err != nil {
+		return err
+	}
+	return nil
 }
 
 func (s *Service) ListDeferred() ([]DeferredCard, error) {
@@ -510,11 +1034,34 @@ func (s *Service) ListDeferred() ([]DeferredCard, error) {
 	return cards, nil
 }
 
-func (s *Service) ResolveDeferred(id string, approved bool, selectedHunks []string) error {
-	safeID := sanitizeDeferredID(id)
-	if safeID == "" {
+// ResolveDeferred 兼容三参调用 `(id, approved, selectedHunks)` 与扩展 `DeferredResolution` 选项（支持 `Remember` 与 `Feedback`）。
+func (s *Service) ResolveDeferred(id string, approved bool, selectedHunks []string, opts ...DeferredResolution) error {
+	res := DeferredResolution{
+		Approved:        approved,
+		SelectedHunkIDs: selectedHunks,
+	}
+	if len(opts) > 0 {
+		res = opts[0]
+		res.Approved = approved
+		if len(selectedHunks) > 0 && len(res.SelectedHunkIDs) == 0 {
+			res.SelectedHunkIDs = selectedHunks
+		}
+	}
+	return s.ResolveDeferredCard(id, res)
+}
+
+// ResolveDeferredCard 处理挂起工具调用卡片的完整审批决议，并向 Inbox 投递高优先级 `deferred_resume` 恢复事件。
+func (s *Service) ResolveDeferredCard(id string, res DeferredResolution) error {
+	switch strings.ToLower(strings.TrimSpace(res.Decision)) {
+	case "approve", "approved", "allow", "allowed", "accept", "accepted":
+		res.Approved = true
+	case "deny", "denied", "reject", "rejected":
+		res.Approved = false
+	}
+	if err := store.ValidateSafeID(id); err != nil || strings.Contains(id, "..") {
 		return fmt.Errorf("%w: invalid id %q", ErrDeferredNotFound, id)
 	}
+	safeID := id
 
 	var card DeferredCard
 	now := s.now().UTC()
@@ -540,6 +1087,8 @@ func (s *Service) ResolveDeferred(id string, approved bool, selectedHunks []stri
 		return err
 	}
 
+	feedback := strings.TrimSpace(res.Feedback)
+
 	// Step 2: Enqueue idempotent deferred_resume event FIRST (no nested locks) so a failed enqueue never loses the pending card.
 	resume := core.DeferredResume{
 		DeferredID:      card.ID,
@@ -547,8 +1096,10 @@ func (s *Service) ResolveDeferred(id string, approved bool, selectedHunks []stri
 		ToolName:        card.ToolName,
 		Args:            card.Args,
 		Fingerprint:     card.Fingerprint,
-		Approved:        approved,
-		SelectedHunkIDs: selectedHunks,
+		Approved:        res.Approved,
+		Remember:        res.Remember,
+		Feedback:        feedback,
+		SelectedHunkIDs: res.SelectedHunkIDs,
 	}
 	resumeJSON, err := json.Marshal(resume)
 	if err != nil {
@@ -566,7 +1117,9 @@ func (s *Service) ResolveDeferred(id string, approved bool, selectedHunks []stri
 		AgentRole:   card.AgentRole,
 		Payload: map[string]any{
 			"deferred_id":          card.ID,
-			"approved":             approved,
+			"approved":             res.Approved,
+			"remember":             res.Remember,
+			"feedback":             feedback,
 			"resume_approval":      resumeMap,
 			"resume_approval_json": string(resumeJSON),
 		},
@@ -576,16 +1129,23 @@ func (s *Service) ResolveDeferred(id string, approved bool, selectedHunks []stri
 		return err
 	}
 
+	// If Remember is requested on an approved card with a known fingerprint, also persist immediately in GrantStore.
+	if res.Approved && res.Remember && strings.TrimSpace(card.Fingerprint) != "" && s.engine.Grants() != nil {
+		_ = s.engine.Grants().SaveGrant(card.WorkspaceID, card.Fingerprint, card.ToolName, "approved via deferred card")
+	}
+
 	// Step 3: Atomically archive resolved card to deferred/resolved/<id>.md, remove pending file, and wake worker.
 	err = store.WithFlock(s.deferredLockPath(), true, func() error {
 		status := "denied"
-		if approved {
+		if res.Approved {
 			status = "approved"
 		}
 		card.Status = status
+		card.Remember = res.Remember
+		card.Feedback = feedback
 		card.ResolvedAt = &now
 
-		resolvedMD, fErr := formatDeferredCardMD(card, selectedHunks)
+		resolvedMD, fErr := formatDeferredCardMD(card, res.SelectedHunkIDs)
 		if fErr != nil {
 			return fErr
 		}
@@ -603,14 +1163,24 @@ func (s *Service) ResolveDeferred(id string, approved bool, selectedHunks []stri
 	}
 
 	s.signalWake()
+	s.publishAlwaysOnEvent("deferred_resolved", map[string]any{
+		"deferred_id": safeID,
+		"approved":    res.Approved,
+		"remember":    res.Remember,
+	})
 	return nil
 }
 
 func (s *Service) persistDeferredCard(def core.DeferredToolPayload, agentRole string) (DeferredCard, error) {
+	card, _, err := s.persistDeferredCardIfNew(def, agentRole, true)
+	return card, err
+}
+
+func (s *Service) persistDeferredCardIfNew(def core.DeferredToolPayload, agentRole string, overwrite bool) (DeferredCard, bool, error) {
 	now := s.now().UTC()
-	safeID := sanitizeDeferredID(def.ID)
-	if safeID == "" {
-		safeID = fmt.Sprintf("def_%d_%s", now.UnixMilli(), randomHex(4))
+	safeID := strings.TrimSpace(def.ID)
+	if store.ValidateSafeID(safeID) != nil || strings.Contains(safeID, "..") {
+		safeID = fmt.Sprintf("def_%d_%s", now.UnixMilli(), store.RandomHex(4))
 	}
 
 	card := DeferredCard{
@@ -632,17 +1202,77 @@ func (s *Service) persistDeferredCard(def core.DeferredToolPayload, agentRole st
 
 	mdBytes, err := formatDeferredCardMD(card, nil)
 	if err != nil {
-		return DeferredCard{}, err
+		return DeferredCard{}, false, err
 	}
 
 	cardPath := filepath.Join(s.deferredDir(), safeID+".md")
+	resolvedPath := filepath.Join(s.deferredResolvedDir(), safeID+".md")
+
+	var created bool
 	err = store.WithFlock(s.deferredLockPath(), true, func() error {
-		return store.AtomicWriteFile(cardPath, mdBytes, 0o600)
+		if !overwrite {
+			if raw, rErr := os.ReadFile(cardPath); rErr == nil {
+				if existing, pErr := parseDeferredCardMD(raw, safeID); pErr == nil {
+					card = existing
+				}
+				return nil
+			}
+			if _, rErr := os.Stat(resolvedPath); rErr == nil {
+				return nil
+			}
+		} else {
+			if _, sErr := os.Stat(cardPath); errors.Is(sErr, os.ErrNotExist) {
+				if _, rsErr := os.Stat(resolvedPath); errors.Is(rsErr, os.ErrNotExist) {
+					created = true
+				}
+			}
+		}
+		if wErr := store.AtomicWriteFile(cardPath, mdBytes, 0o600); wErr != nil {
+			return wErr
+		}
+		if !overwrite {
+			created = true
+		}
+		return nil
 	})
 	if err != nil {
-		return DeferredCard{}, err
+		return DeferredCard{}, false, err
 	}
-	return card, nil
+	return card, created, nil
+}
+
+func (s *Service) recordDeferredAndNotifyIfNew(def core.DeferredToolPayload, agentRole string) (DeferredCard, bool, error) {
+	card, created, err := s.persistDeferredCardIfNew(def, agentRole, false)
+	if err != nil {
+		return DeferredCard{}, false, err
+	}
+	if !created {
+		return card, false, nil
+	}
+
+	title := fmt.Sprintf("Approval Needed: %s", card.ToolName)
+	body := fmt.Sprintf("[%s] %s (card %s)", card.ReasonCode, card.Reason, card.ID)
+	delivered := false
+	if s.notifier != nil {
+		if nErr := s.notifier.NotifyMac(title, s.workspaceLabel(card.WorkspaceID), body); nErr == nil {
+			delivered = true
+		}
+	}
+	_, _ = s.outbox.append(OutboxItem{
+		WorkspaceID: card.WorkspaceID,
+		SessionID:   card.SessionID,
+		Outcome:     OutcomeDefer,
+		Title:       title,
+		Body:        body,
+		Delivered:   delivered,
+	}, s.now())
+	s.publishAlwaysOnEvent("deferred_created", map[string]any{
+		"deferred_id":  card.ID,
+		"workspace_id": card.WorkspaceID,
+		"session_id":   card.SessionID,
+		"tool_name":    card.ToolName,
+	})
+	return card, true, nil
 }
 
 func (s *Service) StateSnapshot() AlwaysOnState {
@@ -656,6 +1286,7 @@ func (s *Service) StateSnapshot() AlwaysOnState {
 	timers, _ := s.timers.list()
 	deferredCards, _ := s.ListDeferred()
 	outboxItems, _ := s.outbox.list(100)
+	candidates, _ := s.ListSkillCandidates()
 
 	var queuedCnt, runningCnt, failedCnt int
 	for _, ev := range inboxItems {
@@ -670,16 +1301,18 @@ func (s *Service) StateSnapshot() AlwaysOnState {
 	}
 
 	return AlwaysOnState{
-		Running:       running,
-		QueuedCount:   queuedCnt,
-		RunningCount:  runningCnt,
-		FailedCount:   failedCnt,
-		DeferredCount: len(deferredCards),
-		Inbox:         inboxItems,
-		Timers:        timers,
-		Deferred:      deferredCards,
-		Outbox:        outboxItems,
-		UpdatedAt:     now,
+		Running:         running,
+		QueuedCount:     queuedCnt,
+		RunningCount:    runningCnt,
+		FailedCount:     failedCnt,
+		DeferredCount:   len(deferredCards),
+		CandidatesCount: len(candidates),
+		Inbox:           inboxItems,
+		Timers:          timers,
+		Deferred:        deferredCards,
+		Outbox:          outboxItems,
+		Candidates:      candidates,
+		UpdatedAt:       now,
 	}
 }
 
@@ -704,18 +1337,17 @@ func (s *Service) Start(ctx context.Context) error {
 		return ErrWorkerLeaseHeld
 	}
 
+	s.lifeMu.Unlock()
 	if err := s.mountPluginTools(); err != nil {
 		unlock()
-		s.lifeMu.Unlock()
 		return err
 	}
-
 	if _, rErr := s.inbox.recoverOnStart(s.now()); rErr != nil {
 		unlock()
-		s.lifeMu.Unlock()
 		return rErr
 	}
 
+	s.lifeMu.Lock()
 	loopCtx, loopCancel := context.WithCancel(ctx)
 	s.running = true
 	s.stopCancel = loopCancel
@@ -740,18 +1372,33 @@ func (s *Service) Start(ctx context.Context) error {
 	}()
 
 	s.signalWake()
+	s.publishAlwaysOnEvent("worker_started", nil)
 	return nil
 }
 
 func (s *Service) Close() error {
 	s.lifeMu.Lock()
 	cancel := s.stopCancel
+	globalUnsub := s.globalUnsub
+	s.globalUnsub = nil
+	ownsMount := s.ownsPluginMount
+	s.ownsPluginMount = false
 	s.lifeMu.Unlock()
 
 	if cancel != nil {
 		cancel()
 	}
+	if globalUnsub != nil {
+		globalUnsub()
+	}
 	s.wg.Wait()
+
+	if ownsMount && s.engine != nil {
+		if hooks := s.engine.Hooks(); hooks != nil {
+			_ = hooks.UnmountPlugin(PluginID)
+		}
+		s.engine.UnregisterPluginTools(memoryPluginToolNames...)
+	}
 	return nil
 }
 
@@ -771,10 +1418,12 @@ func (s *Service) runWorkerLoop(ctx context.Context) {
 	timer := time.NewTimer(s.tickInterval)
 	defer timer.Stop()
 
+	var tickSeq uint64
 	for {
 		if ctx.Err() != nil {
 			return
 		}
+		tickSeq++
 
 		// 1. Move any due Follow-up / Cron timers into Inbox without invoking LLM directly.
 		_, _ = s.TickTimers(s.now())
@@ -796,6 +1445,13 @@ func (s *Service) runWorkerLoop(ctx context.Context) {
 				break
 			}
 			if len(batch) == 0 {
+				// 3. When queue is idle, check periodic JSONL compaction & idle Auto-Dreamer threshold/cooldown.
+				if tickSeq%8 == 0 {
+					_, _ = s.outbox.maybeCompact()
+					_, _ = s.inbox.maybeCompact(s.now())
+				}
+				s.maybeAutoDream(ctx)
+
 				waitDur := s.tickInterval
 				if nextWake > 0 && nextWake < waitDur {
 					waitDur = nextWake
@@ -849,7 +1505,6 @@ func (s *Service) executeClaimedBatch(ctx context.Context, batch []InboxEvent) {
 		return
 	}
 
-	// Pre-create session when unset so notify_user / set_followup capture state is race-free before StartRun begins.
 	autoCreatedSession := false
 	if sessionID == "" {
 		meta, cErr := s.engine.Sessions().Create(wsID, "Always-On Session", agentRole)
@@ -866,7 +1521,10 @@ func (s *Service) executeClaimedBatch(ctx context.Context, batch []InboxEvent) {
 		prompt = formatBatchPrompt(batch)
 	}
 
-	dynamicReminders := s.memory.buildDynamicReminders(wsID)
+	dynamicReminders := s.memory.buildUnattendedReminders(wsID)
+	if isResume && resumeReq != nil && resumeReq.Approved && strings.TrimSpace(resumeReq.Feedback) != "" {
+		dynamicReminders = append(dynamicReminders, "User approval steering feedback: "+sanitizeMemoryReminder(strings.TrimSpace(resumeReq.Feedback)))
+	}
 
 	capState := &runNotificationCapture{
 		wsID:      wsID,
@@ -927,7 +1585,6 @@ func (s *Service) executeClaimedBatch(ctx context.Context, batch []InboxEvent) {
 			}
 		case core.EventRunCancelled:
 			if ctx.Err() != nil {
-				// Daemon shutting down: restore queued state without burning attempts.
 				_ = s.inbox.requeueBusyBatch(ids, s.retryBackoff, s.now())
 				return
 			}
@@ -944,30 +1601,12 @@ func (s *Service) executeClaimedBatch(ctx context.Context, batch []InboxEvent) {
 	}
 
 	if deferredPayload != nil {
-		card, dErr := s.persistDeferredCard(*deferredPayload, agentRole)
-		if dErr != nil {
+		if _, _, dErr := s.recordDeferredAndNotifyIfNew(*deferredPayload, agentRole); dErr != nil {
 			_ = s.inbox.completeBatch(ids, sessionID, StatusFailed, dErr.Error(), s.retryBackoff, s.now())
 			return
 		}
-
-		title := fmt.Sprintf("Approval Needed: %s", card.ToolName)
-		body := fmt.Sprintf("[%s] %s (card %s)", card.ReasonCode, card.Reason, card.ID)
-		delivered := false
-		if s.notifier != nil {
-			if nErr := s.notifier.NotifyMac(title, s.workspaceLabel(wsID), body); nErr == nil {
-				delivered = true
-			}
-		}
-		_, _ = s.outbox.append(OutboxItem{
-			WorkspaceID: wsID,
-			SessionID:   sessionID,
-			Outcome:     OutcomeDefer,
-			Title:       title,
-			Body:        body,
-			Delivered:   delivered,
-		}, s.now())
-
 		_ = s.inbox.completeBatch(ids, sessionID, StatusDeferred, "", s.retryBackoff, s.now())
+		s.publishAlwaysOnEvent("batch_deferred", map[string]any{"session_id": sessionID})
 		return
 	}
 
@@ -986,14 +1625,13 @@ func (s *Service) executeClaimedBatch(ctx context.Context, batch []InboxEvent) {
 
 		recordedSession := sessionID
 		if autoCreatedSession && willRetry {
-			// Clear recordedSession so retry creates a fresh session rather than re-appending the prompt.
 			recordedSession = ""
-			// Only garbage-collect the failed session if no assistant/tool entries or side effects occurred.
 			if !hasSideEffects && s.isTrivialFailedAutoSession(sessionID) {
 				_ = s.engine.Sessions().Delete(sessionID)
 			}
 		}
 		_ = s.inbox.completeBatch(ids, recordedSession, StatusFailed, runFailedErr, s.retryBackoff, s.now())
+		s.publishAlwaysOnEvent("batch_failed", map[string]any{"session_id": recordedSession})
 		return
 	}
 
@@ -1002,7 +1640,6 @@ func (s *Service) executeClaimedBatch(ctx context.Context, batch []InboxEvent) {
 	suppressedTitle := capState.lastSuppressed
 	s.captureMu.Unlock()
 
-	// Silent-by-default Outbox contract: when nothing new required user notification, record Outcome="silent".
 	if sentCount == 0 {
 		silentTitle := suppressedTitle
 		silentBody := truncateString(collapseWhitespace(finalText), 240)
@@ -1017,6 +1654,7 @@ func (s *Service) executeClaimedBatch(ctx context.Context, batch []InboxEvent) {
 	}
 
 	_ = s.inbox.completeBatch(ids, sessionID, StatusDone, "", s.retryBackoff, s.now())
+	s.publishAlwaysOnEvent("batch_completed", map[string]any{"session_id": sessionID})
 }
 
 func (s *Service) hasPendingDeferredForSession(sessionID string) bool {
@@ -1103,19 +1741,6 @@ func renderEventBody(ev InboxEvent) string {
 }
 
 func formatDeferredCardMD(card DeferredCard, selectedHunks []string) ([]byte, error) {
-	hunkRecs := make([]deferredHunkRecord, len(card.Hunks))
-	for i, h := range card.Hunks {
-		hunkRecs[i] = deferredHunkRecord{
-			ID:          h.ID,
-			Fingerprint: h.Fingerprint,
-			Header:      h.Header,
-			OldStart:    h.OldStart,
-			OldLines:    h.OldLines,
-			NewStart:    h.NewStart,
-			NewLines:    h.NewLines,
-			Preview:     h.Preview,
-		}
-	}
 	argsStr := strings.TrimSpace(string(card.Args))
 	if argsStr == "" {
 		argsStr = "{}"
@@ -1137,9 +1762,11 @@ func formatDeferredCardMD(card DeferredCard, selectedHunks []string) ([]byte, er
 		Reason:          card.Reason,
 		Fingerprint:     card.Fingerprint,
 		ArgsJSON:        argsStr,
-		Hunks:           hunkRecs,
+		Hunks:           append([]tools.DiffHunk(nil), card.Hunks...),
 		Status:          status,
 		SelectedHunkIDs: selectedHunks,
+		Remember:        card.Remember,
+		Feedback:        card.Feedback,
 		CreatedAt:       card.CreatedAt.UTC(),
 		ResolvedAt:      card.ResolvedAt,
 	}
@@ -1173,29 +1800,20 @@ func formatDeferredCardMD(card DeferredCard, selectedHunks []string) ([]byte, er
 }
 
 func parseDeferredCardMD(raw []byte, fallbackID string) (DeferredCard, error) {
-	cleaned := strings.ReplaceAll(string(raw), "\r\n", "\n")
-	if strings.HasPrefix(cleaned, "+++\n") {
-		rest := strings.TrimPrefix(cleaned, "+++\n")
-		if closeIdx := strings.Index(rest, "\n+++"); closeIdx >= 0 {
-			header := rest[:closeIdx]
-			var fm deferredFrontmatter
-			if err := toml.Unmarshal([]byte(header), &fm); err == nil {
-				return frontmatterToDeferredCard(fm, fallbackID), nil
+	fm, _, err := config.ParseFrontmatterAs[deferredFrontmatter](string(raw))
+	if err != nil {
+		return DeferredCard{}, err
+	}
+	// Support legacy snake_case diff hunk frontmatter keys (`old_start`, etc.) if present.
+	if len(fm.Hunks) > 0 && fm.Hunks[0].OldStart == 0 && fm.Hunks[0].NewStart == 0 && strings.Contains(string(raw), "old_start") {
+		if meta, _, mErr := config.ParseFrontmatterMD(raw); mErr == nil {
+			if jb, jErr := json.Marshal(meta); jErr == nil {
+				var jsonFM deferredFrontmatter
+				if json.Unmarshal(jb, &jsonFM) == nil && len(jsonFM.Hunks) == len(fm.Hunks) {
+					fm.Hunks = jsonFM.Hunks
+				}
 			}
 		}
-	}
-
-	meta, _, err := config.ParseFrontmatterMD(raw)
-	if err != nil {
-		return DeferredCard{}, err
-	}
-	encoded, err := toml.Marshal(meta)
-	if err != nil {
-		return DeferredCard{}, err
-	}
-	var fm deferredFrontmatter
-	if err := toml.Unmarshal(encoded, &fm); err != nil {
-		return DeferredCard{}, err
 	}
 	return frontmatterToDeferredCard(fm, fallbackID), nil
 }
@@ -1211,19 +1829,6 @@ func frontmatterToDeferredCard(fm deferredFrontmatter, fallbackID string) Deferr
 	} else {
 		args = json.RawMessage(`{}`)
 	}
-	hunks := make([]tools.DiffHunk, len(fm.Hunks))
-	for i, hr := range fm.Hunks {
-		hunks[i] = tools.DiffHunk{
-			ID:          hr.ID,
-			Fingerprint: hr.Fingerprint,
-			Header:      hr.Header,
-			OldStart:    hr.OldStart,
-			OldLines:    hr.OldLines,
-			NewStart:    hr.NewStart,
-			NewLines:    hr.NewLines,
-			Preview:     hr.Preview,
-		}
-	}
 	return DeferredCard{
 		ID:          id,
 		RunID:       fm.RunID,
@@ -1236,26 +1841,11 @@ func frontmatterToDeferredCard(fm deferredFrontmatter, fallbackID string) Deferr
 		Reason:      fm.Reason,
 		Fingerprint: fm.Fingerprint,
 		Args:        args,
-		Hunks:       hunks,
+		Hunks:       append([]tools.DiffHunk(nil), fm.Hunks...),
 		Status:      fm.Status,
+		Remember:    fm.Remember,
+		Feedback:    fm.Feedback,
 		CreatedAt:   fm.CreatedAt,
 		ResolvedAt:  fm.ResolvedAt,
 	}
-}
-
-func sanitizeDeferredID(raw string) string {
-	trimmed := strings.TrimSpace(raw)
-	if trimmed == "" || trimmed == "." || trimmed == ".." {
-		return ""
-	}
-	var b strings.Builder
-	for _, r := range trimmed {
-		switch {
-		case (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '_' || r == '-':
-			b.WriteRune(r)
-		default:
-			b.WriteByte('_')
-		}
-	}
-	return strings.Trim(b.String(), "_")
 }

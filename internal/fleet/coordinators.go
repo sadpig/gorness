@@ -2,6 +2,7 @@ package fleet
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"regexp"
 	"strings"
@@ -10,6 +11,52 @@ import (
 
 	"gorness.dev/gorness/internal/config"
 )
+
+var errNodeStallReleased = errors.New("stalled node cancelled and blackboard tasks released")
+
+type assignedTaskBrief struct {
+	Task BlackboardTask
+	Body string
+}
+
+type coderAssignment struct {
+	Items []assignedTaskBrief
+}
+
+func (a coderAssignment) TaskIDs() []string {
+	ids := make([]string, 0, len(a.Items))
+	for _, it := range a.Items {
+		if it.Task.ID != "" {
+			ids = append(ids, it.Task.ID)
+		}
+	}
+	return ids
+}
+
+func (a coderAssignment) FormatBrief() string {
+	if len(a.Items) == 0 {
+		return ""
+	}
+	if len(a.Items) == 1 {
+		it := a.Items[0]
+		desc := strings.TrimSpace(it.Body)
+		if desc == "" || desc == strings.TrimSpace(it.Task.Title) {
+			return fmt.Sprintf("Assigned Disjoint Task [%s]: %s", it.Task.ID, it.Task.Title)
+		}
+		return fmt.Sprintf("Assigned Disjoint Task [%s]: %s\nTask Brief:\n%s", it.Task.ID, it.Task.Title, desc)
+	}
+	var lines []string
+	lines = append(lines, "Assigned Disjoint Tasks:")
+	for idx, it := range a.Items {
+		desc := strings.TrimSpace(it.Body)
+		if desc != "" && desc != strings.TrimSpace(it.Task.Title) {
+			lines = append(lines, fmt.Sprintf("%d. [%s] %s — %s", idx+1, it.Task.ID, it.Task.Title, desc))
+		} else {
+			lines = append(lines, fmt.Sprintf("%d. [%s] %s", idx+1, it.Task.ID, it.Task.Title))
+		}
+	}
+	return strings.Join(lines, "\n")
+}
 
 var (
 	reLinePrefix         = regexp.MustCompile(`^(?:#{1,6}\s+|>\s+|[-*+]\s+)+`)
@@ -83,7 +130,8 @@ func parseStructuredDirectiveLines(text, prefix string) []string {
 	upperPrefix := strings.ToUpper(strings.TrimSpace(prefix))
 	var items []string
 	for _, rawLine := range strings.Split(text, "\n") {
-		line := strings.TrimSpace(strings.TrimLeft(strings.TrimSpace(rawLine), "-*0123456789. "))
+		line := strings.TrimSpace(strings.TrimLeft(strings.TrimSpace(rawLine), "-*0123456789.) "))
+		line = strings.TrimSpace(reInlineCodeOrBold.Replace(line))
 		if len(line) > len(upperPrefix) && strings.EqualFold(line[:len(upperPrefix)], upperPrefix) {
 			rest := strings.TrimSpace(line[len(upperPrefix):])
 			if rest != "" {
@@ -92,6 +140,173 @@ func parseStructuredDirectiveLines(text, prefix string) []string {
 		}
 	}
 	return items
+}
+
+var reNumberedOrBulletItem = regexp.MustCompile(`^(?:[-*+]\s+|\d+[.)]\s+)(.+)$`)
+
+func splitTitleAndDetail(raw, fallbackDetail string) (string, string) {
+	trimmed := strings.TrimSpace(raw)
+	for _, sep := range []string{" :: ", " — ", " -- ", " | "} {
+		if head, tail, ok := strings.Cut(trimmed, sep); ok && strings.TrimSpace(head) != "" && strings.TrimSpace(tail) != "" {
+			return strings.TrimSpace(head), strings.TrimSpace(tail)
+		}
+	}
+	if strings.TrimSpace(fallbackDetail) != "" {
+		return trimmed, strings.TrimSpace(fallbackDetail)
+	}
+	return trimmed, trimmed
+}
+
+func parseTaskBreakdownSpecs(leadText, goal string, numCoders int) []SubtaskSpec {
+	var specs []SubtaskSpec
+
+	// 1. Explicit `TASK: <title> [:: <detail>]` directives from Lead or Goal.
+	for _, src := range []string{leadText, goal} {
+		if len(specs) > 0 {
+			break
+		}
+		for _, item := range parseStructuredDirectiveLines(src, "TASK:") {
+			title, detail := splitTitleAndDetail(item, "")
+			if title != "" {
+				specs = append(specs, SubtaskSpec{Title: title, Description: detail})
+			}
+		}
+	}
+
+	// 2. Markdown numbered or bulleted items from Lead output when multiple coders need distinct briefs.
+	if len(specs) == 0 && strings.TrimSpace(leadText) != "" && numCoders > 1 {
+		for _, rawLine := range strings.Split(leadText, "\n") {
+			m := reNumberedOrBulletItem.FindStringSubmatch(strings.TrimSpace(rawLine))
+			if len(m) == 2 {
+				cand := strings.TrimSpace(stripInlineEmphasisPreserveSnake(m[1]))
+				if cand != "" {
+					title, detail := splitTitleAndDetail(cand, "")
+					specs = append(specs, SubtaskSpec{Title: title, Description: detail})
+				}
+			}
+		}
+	}
+
+	// 3. Multi-clause goal decomposition (numbered items or `;` separated clauses) when multiple coders run without a Lead breakdown.
+	if len(specs) == 0 && numCoders > 1 {
+		for _, rawLine := range strings.Split(goal, "\n") {
+			m := reNumberedOrBulletItem.FindStringSubmatch(strings.TrimSpace(rawLine))
+			if len(m) == 2 {
+				cand := strings.TrimSpace(m[1])
+				if cand != "" {
+					title, detail := splitTitleAndDetail(cand, "")
+					specs = append(specs, SubtaskSpec{Title: title, Description: detail})
+				}
+			}
+		}
+		if len(specs) == 0 && strings.Contains(goal, ";") {
+			parts := strings.Split(goal, ";")
+			if len(parts) >= 2 {
+				for _, p := range parts {
+					if cand := strings.TrimSpace(p); cand != "" {
+						title, detail := splitTitleAndDetail(cand, "")
+						specs = append(specs, SubtaskSpec{Title: title, Description: detail})
+					}
+				}
+			}
+		}
+	}
+
+	if numCoders <= 1 {
+		if len(specs) == 0 {
+			fallbackDetail := strings.TrimSpace(leadText)
+			if fallbackDetail == "" {
+				fallbackDetail = goal
+			}
+			specs = append(specs, SubtaskSpec{Title: goal, Description: fallbackDetail})
+		}
+		return specs
+	}
+
+	// Ensure at least numCoders distinct task cards exist so parallel worktrees never receive identical briefs.
+	shortGoal := goal
+	if len(shortGoal) > 96 {
+		shortGoal = shortGoal[:96] + "..."
+	}
+	for len(specs) < numCoders {
+		idx := len(specs) + 1
+		specs = append(specs, SubtaskSpec{
+			Title: fmt.Sprintf("Partition %d/%d: %s", idx, numCoders, shortGoal),
+			Description: fmt.Sprintf(
+				"Exclusive specialist partition %d of %d for mission goal: %s\nImplement only partition %d/%d scope and avoid duplicating sibling partitions.",
+				idx, numCoders, goal, idx, numCoders,
+			),
+		})
+	}
+	return specs
+}
+
+// resolveOrSeedDisjointTasks 从黑板 `tasks/*.md` 加载现有待办任务（若为空则根据 Lead 拆解写入独立任务卡），
+// 并按无交集分桶分配给 numCoders 个并行编码节点，彻底消除多 Worktree 重复收到相同目标的问题。
+func (rt *missionRuntime) resolveOrSeedDisjointTasks(idPrefix, leadText, goal string, numCoders int) []coderAssignment {
+	if numCoders <= 0 {
+		return nil
+	}
+
+	loadOpen := func() []assignedTaskBrief {
+		all, err := rt.bb.ListTasks()
+		if err != nil {
+			return nil
+		}
+		var open []assignedTaskBrief
+		for _, t := range all {
+			if t.Status != TaskOpen {
+				continue
+			}
+			fullTask, body, rErr := rt.bb.GetTaskWithBody(t.ID)
+			if rErr == nil {
+				open = append(open, assignedTaskBrief{Task: fullTask, Body: body})
+			} else {
+				open = append(open, assignedTaskBrief{Task: t, Body: t.Title})
+			}
+		}
+		return open
+	}
+
+	openTasks := loadOpen()
+	if len(openTasks) == 0 {
+		specs := parseTaskBreakdownSpecs(leadText, goal, numCoders)
+		for i, sp := range specs {
+			tid := strings.TrimSpace(sp.ID)
+			if tid == "" {
+				tid = fmt.Sprintf("%s-%d", idPrefix, i+1)
+			}
+			t, err := rt.bb.CreateTask(tid, "", sp.Title, sp.Description, 0)
+			if err == nil {
+				openTasks = append(openTasks, assignedTaskBrief{Task: t, Body: sp.Description})
+			}
+		}
+		rt.syncBlackboardState(EventTaskUpdated, "", "", fmt.Sprintf("seeded %d disjoint task(s)", len(openTasks)))
+	} else if len(openTasks) < numCoders {
+		shortGoal := goal
+		if len(shortGoal) > 96 {
+			shortGoal = shortGoal[:96] + "..."
+		}
+		for len(openTasks) < numCoders {
+			idx := len(openTasks) + 1
+			tid := fmt.Sprintf("%s-part-%d", idPrefix, idx)
+			desc := fmt.Sprintf("Supplemental specialist partition %d of %d for goal: %s", idx, numCoders, goal)
+			t, err := rt.bb.CreateTask(tid, "", fmt.Sprintf("Partition %d/%d: %s", idx, numCoders, shortGoal), desc, 0)
+			if err == nil {
+				openTasks = append(openTasks, assignedTaskBrief{Task: t, Body: desc})
+			} else {
+				break
+			}
+		}
+		rt.syncBlackboardState(EventTaskUpdated, "", "", "expanded tasks for parallel specialists")
+	}
+
+	assignments := make([]coderAssignment, numCoders)
+	for idx, item := range openTasks {
+		slot := idx % numCoders
+		assignments[slot].Items = append(assignments[slot].Items, item)
+	}
+	return assignments
 }
 
 func defaultWorkflowNodesAndEdges(topo TopologyKind) ([]config.WorkflowNodeSpec, []config.WorkflowEdgeSpec) {
@@ -243,6 +458,7 @@ func (rt *missionRuntime) runParallelExplore(ctx context.Context) error {
 			"Synthesize the parallel explorer findings for mission goal:\n%s\n\nExplorer Reports:\n%s",
 			rt.snap.Goal, combined,
 		)
+		synthPrompt = appendPeerNotesSection(synthPrompt, rt.peerNotesPromptBlock(lead.ID))
 		leadOut, err := rt.runNode(ctx, lead.ID, synthPrompt, "", nil)
 		if err != nil {
 			return err
@@ -302,6 +518,7 @@ func (rt *missionRuntime) runReviewLoop(ctx context.Context) error {
 				coder.ID, round, maxRounds, rt.snap.Goal, lastCritique,
 			)
 		}
+		prompt = appendPeerNotesSection(prompt, rt.peerNotesPromptBlock(coder.ID))
 
 		if _, err := rt.runNode(ctx, coder.ID, prompt, wtPath, nil); err != nil {
 			return err
@@ -340,21 +557,35 @@ func (rt *missionRuntime) runReviewLoop(ctx context.Context) error {
 	return fmt.Errorf("review-loop exhausted %d rounds without passing verification: %s", maxRounds, lastCritique)
 }
 
-// 3. TopoWorktreeTeam: 独立 Git Worktree 并发专家战队 + Refinery 串行变基测试盲审快进合入
+// 3. TopoWorktreeTeam: 独立 Git Worktree 并发专家战队（无交集独立任务分发） + Refinery 串行变基测试盲审快进合入
 func (rt *missionRuntime) runWorktreeTeam(ctx context.Context) error {
+	lead := rt.firstNodeByRole("lead")
 	coders := rt.nodesByRole("coder")
 	if len(coders) == 0 {
 		return fmt.Errorf("worktree-team requires at least one coder node")
 	}
 	verifier := rt.firstNodeByRole("verifier")
 
+	var leadPlan string
+	if lead != nil {
+		planPrompt := fmt.Sprintf(
+			"Decompose the mission goal into %d disjoint specialist tasks for isolated Git worktrees.\nEmit one `TASK: <concise title> :: <distinct file scope & brief>` per line.\nGoal: %s",
+			len(coders), rt.snap.Goal,
+		)
+		leadOut, err := rt.runNode(ctx, lead.ID, planPrompt, "", nil)
+		if err != nil {
+			return err
+		}
+		leadPlan = leadOut.FinalText
+		_, _ = rt.recordNote(lead.ID, "Worktree Task Breakdown", leadPlan)
+	}
+
+	assignments := rt.resolveOrSeedDisjointTasks("task", leadPlan, rt.snap.Goal, len(coders))
+
 	leases := make(map[string]*WorktreeLease, len(coders))
-	tasks := make(map[string]BlackboardTask, len(coders))
-	for i, c := range coders {
-		tid := fmt.Sprintf("task-%d", i+1)
-		t, err := rt.bb.CreateTask(tid, "", fmt.Sprintf("%s: %s", c.Label, rt.snap.Goal), rt.snap.Goal, 0)
-		if err == nil {
-			tasks[c.ID] = t
+	for _, c := range coders {
+		if lead != nil {
+			rt.pulseEdge(lead.ID, c.ID, "dispatch task")
 		}
 		if rt.shouldUseWorktree(c.ID) {
 			lease, err := rt.acquireNodeWorktree(ctx, c.ID, c.ID)
@@ -367,7 +598,6 @@ func (rt *missionRuntime) runWorktreeTeam(ctx context.Context) error {
 			leases[c.ID] = lease
 		}
 	}
-	rt.syncBlackboardState(EventTaskUpdated, "", "", "seeded worktree-team tasks")
 
 	defer func() {
 		for nid, l := range leases {
@@ -387,7 +617,7 @@ func (rt *missionRuntime) runWorktreeTeam(ctx context.Context) error {
 	for i, coder := range coders {
 		i, coder := i, coder
 		lease := leases[coder.ID]
-		task := tasks[coder.ID]
+		assignment := assignments[i]
 
 		wg.Add(1)
 		go func() {
@@ -413,15 +643,18 @@ func (rt *missionRuntime) runWorktreeTeam(ctx context.Context) error {
 				branchName = lease.Branch
 				wtPath = lease.Path
 			}
-			if task.ID != "" {
-				_, _, _ = rt.bb.ClaimTask(task.ID, coder.ID, branchName)
-				rt.syncBlackboardState(EventTaskUpdated, coder.ID, task.ID, "claimed by "+coder.ID)
+			for _, tid := range assignment.TaskIDs() {
+				_, _, _ = rt.bb.ClaimTask(tid, coder.ID, branchName)
+				rt.syncBlackboardState(EventTaskUpdated, coder.ID, tid, "claimed by "+coder.ID)
 			}
 
+			taskBrief := assignment.FormatBrief()
 			prompt := fmt.Sprintf(
-				"Worktree Specialist Assignment (node=%s, label=%s, specialist=%d/%d):\nMission Goal: %s\nWork strictly within your isolated Git worktree.",
-				coder.ID, coder.Label, i+1, len(coders), rt.snap.Goal,
+				"Worktree Specialist Assignment (node=%s, label=%s, specialist=%d/%d):\n%s\nMission Context: %s\nWork strictly within your isolated Git worktree and assigned task scope.",
+				coder.ID, coder.Label, i+1, len(coders), taskBrief, rt.snap.Goal,
 			)
+			prompt = appendPeerNotesSection(prompt, rt.peerNotesPromptBlock(coder.ID))
+
 			coderOut, err := rt.runNode(runCtx, coder.ID, prompt, wtPath, nil)
 			if err != nil {
 				cancelTeam()
@@ -431,7 +664,7 @@ func (rt *missionRuntime) runWorktreeTeam(ctx context.Context) error {
 			// 编码运行已完成，立即释放并发槽位供其他队友或 Refinery Verifier 使用
 			releaseSem()
 
-			_, _ = rt.recordNote(coder.ID, coder.Label+" Implementation", coderOut.FinalText)
+			_, _ = rt.recordNote(coder.ID, "Specialist Patch Ready", coderOut.FinalText)
 
 			if verifier != nil {
 				rt.pulseEdge(coder.ID, verifier.ID, "enqueue rebase & test")
@@ -455,9 +688,9 @@ func (rt *missionRuntime) runWorktreeTeam(ctx context.Context) error {
 				return
 			}
 
-			if task.ID != "" {
-				_, _ = rt.bb.CompleteTask(task.ID, coder.ID, landRes.LandedCommit)
-				rt.syncBlackboardState(EventTaskUpdated, coder.ID, task.ID, "landed "+landRes.LandedCommit)
+			for _, tid := range assignment.TaskIDs() {
+				_, _ = rt.bb.CompleteTask(tid, coder.ID, landRes.LandedCommit)
+				rt.syncBlackboardState(EventTaskUpdated, coder.ID, tid, "landed "+landRes.LandedCommit)
 			}
 
 			// 合入成功后立即清理该队友的临时工作树
@@ -545,6 +778,7 @@ func (rt *missionRuntime) runEventPipeline(ctx context.Context) error {
 		return err
 	}
 	coderPrompt := fmt.Sprintf("Build Stage for pipeline goal:\n%s\n\nRecon Context:\n%s", rt.snap.Goal, reconText)
+	coderPrompt = appendPeerNotesSection(coderPrompt, rt.peerNotesPromptBlock(coder.ID))
 	if _, err := rt.runNode(ctx, coder.ID, coderPrompt, wtPath, nil); err != nil {
 		return err
 	}
@@ -579,6 +813,7 @@ func (rt *missionRuntime) runEventPipeline(ctx context.Context) error {
 			"Debug Stage for pipeline goal:\n%s\n\nGate Failure (%s):\n%s",
 			rt.snap.Goal, landRes.Stage, landRes.Reason,
 		)
+		dbgPrompt = appendPeerNotesSection(dbgPrompt, rt.peerNotesPromptBlock(debugger.ID))
 		dbgOut, err := rt.runNode(ctx, debugger.ID, dbgPrompt, wtPath, nil)
 		if err != nil {
 			return err
@@ -686,16 +921,29 @@ func (rt *missionRuntime) runSharedBoard(ctx context.Context) error {
 				}
 
 				workerPrompt := fmt.Sprintf(
-					"Shared Blackboard Task [id=%s, depth=%d, max_depth=%d, node=%s]:\nTitle: %s\nDetails: %s\nMission Goal: %s\nIf this task should be decomposed further (and depth < %d), reply with `SPLIT_TASK: <subtask>` lines; otherwise implement/complete it.",
+					"Shared Blackboard Task [id=%s, depth=%d, max_depth=%d, node=%s]:\nTitle: %s\nDetails: %s\nMission Goal: %s\nIf this task should be decomposed further (and depth < %d), call `blackboard_split_task` or reply with `SPLIT_TASK: <subtask>` lines; otherwise implement/complete it.",
 					claimed.ID, claimed.Depth, MaxTaskSplitDepth, worker.ID, claimed.Title, taskBody, rt.snap.Goal, MaxTaskSplitDepth,
 				)
+				workerPrompt = appendPeerNotesSection(workerPrompt, rt.peerNotesPromptBlock(worker.ID))
 				wOut, wErr := rt.runNode(ctx, worker.ID, workerPrompt, wtPath, nil)
 				<-sem
 				if wErr != nil {
 					if lease != nil {
 						rt.releaseWorktree(context.Background(), worker.ID, lease, true)
 					}
+					if errors.Is(wErr, errNodeStallReleased) {
+						// Witness 已将该僵死工人的任务卡释放回 open，交由后续轮次或其他对等工人接手，不中断全局黑板
+						return
+					}
 					errCh <- wErr
+					return
+				}
+
+				// 若节点运行中已通过 blackboard_split_task 工具将该卡动态拆解，则直接释放临时工作树进入下一轮收敛
+				if curTask, _, gErr := rt.bb.GetTaskWithBody(claimed.ID); gErr == nil && curTask.Status == TaskSplit {
+					if lease != nil {
+						rt.releaseWorktree(ctx, worker.ID, lease, true)
+					}
 					return
 				}
 
@@ -777,7 +1025,7 @@ func countUnfinishedBoardTasks(tasks []BlackboardTask) int {
 	return n
 }
 
-// 6. TopoHybridFleet: 默认旗舰混合舰队（Lead 架构拆解 -> Explorer 并发侦察 -> Worktree Coder 隔离实现 -> Verifier 对抗门控合入）
+// 6. TopoHybridFleet: 默认旗舰混合舰队（Lead 架构拆解独立任务 -> Explorer 并发侦察 -> Worktree Coder 无交集隔离实现 -> Verifier 对抗门控合入）
 func (rt *missionRuntime) runHybridFleet(ctx context.Context) error {
 	lead := rt.firstNodeByRole("lead")
 	explorers := rt.nodesByRole("explorer")
@@ -786,7 +1034,11 @@ func (rt *missionRuntime) runHybridFleet(ctx context.Context) error {
 
 	var planSummary string
 	if lead != nil {
-		leadOut, err := rt.runNode(ctx, lead.ID, fmt.Sprintf("Plan architecture and implementation tasks for mission goal:\n%s", rt.snap.Goal), "", nil)
+		leadPrompt := fmt.Sprintf(
+			"Plan architecture and decompose concrete disjoint implementation tasks for mission goal:\n%s\nEmit one `TASK: <concise title> :: <distinct scope and files>` line per implementation task (%d coder specialist(s)).",
+			rt.snap.Goal, max(1, len(coders)),
+		)
+		leadOut, err := rt.runNode(ctx, lead.ID, leadPrompt, "", nil)
 		if err != nil {
 			return err
 		}
@@ -817,6 +1069,7 @@ func (rt *missionRuntime) runHybridFleet(ctx context.Context) error {
 				defer func() { <-sem }()
 
 				expPrompt := fmt.Sprintf("Reconnaissance for hybrid-fleet goal:\n%s\n\nLead Plan:\n%s", rt.snap.Goal, planSummary)
+				expPrompt = appendPeerNotesSection(expPrompt, rt.peerNotesPromptBlock(exp.ID))
 				out, err := rt.runNode(ctx, exp.ID, expPrompt, "", nil)
 				if err != nil {
 					errCh <- err
@@ -842,6 +1095,8 @@ func (rt *missionRuntime) runHybridFleet(ctx context.Context) error {
 		return nil
 	}
 
+	assignments := rt.resolveOrSeedDisjointTasks("task-hybrid", planSummary, rt.snap.Goal, len(coders))
+
 	sem := make(chan struct{}, rt.maxConcurrency)
 	errCh := make(chan error, len(coders))
 	var wg sync.WaitGroup
@@ -853,11 +1108,10 @@ func (rt *missionRuntime) runHybridFleet(ctx context.Context) error {
 
 	for i, coder := range coders {
 		i, coder := i, coder
+		assignment := assignments[i]
 		if lead != nil {
 			rt.pulseEdge(lead.ID, coder.ID, "implement")
 		}
-		tid := fmt.Sprintf("task-hybrid-%d", i+1)
-		task, _ := rt.bb.CreateTask(tid, "", fmt.Sprintf("%s: %s", coder.Label, rt.snap.Goal), planSummary, 0)
 
 		wg.Add(1)
 		go func() {
@@ -878,11 +1132,12 @@ func (rt *missionRuntime) runHybridFleet(ctx context.Context) error {
 				wtPath = lease.Path
 				branch = lease.Branch
 			}
-			if task.ID != "" {
-				_, _, _ = rt.bb.ClaimTask(task.ID, coder.ID, branch)
-				rt.syncBlackboardState(EventTaskUpdated, coder.ID, task.ID, "claimed by "+coder.ID)
+			for _, tid := range assignment.TaskIDs() {
+				_, _, _ = rt.bb.ClaimTask(tid, coder.ID, branch)
+				rt.syncBlackboardState(EventTaskUpdated, coder.ID, tid, "claimed by "+coder.ID)
 			}
 
+			taskBrief := assignment.FormatBrief()
 			var critique string
 			for round := 1; round <= maxRounds; round++ {
 				select {
@@ -893,19 +1148,21 @@ func (rt *missionRuntime) runHybridFleet(ctx context.Context) error {
 				}
 
 				cPrompt := fmt.Sprintf(
-					"Hybrid Fleet Implementation (node=%s, round=%d/%d):\nGoal: %s\n\nLead Plan:\n%s\n\nExplorer Recon:\n%s",
-					coder.ID, round, maxRounds, rt.snap.Goal, planSummary, reconCombined,
+					"Hybrid Fleet Implementation (node=%s, specialist=%d/%d, round=%d/%d):\n%s\n\nMission Goal: %s\n\nLead Plan:\n%s\n\nExplorer Recon:\n%s",
+					coder.ID, i+1, len(coders), round, maxRounds, taskBrief, rt.snap.Goal, planSummary, reconCombined,
 				)
 				if critique != "" {
 					cPrompt += "\n\nPrevious Verifier Critique to Fix:\n" + critique
 				}
+				cPrompt = appendPeerNotesSection(cPrompt, rt.peerNotesPromptBlock(coder.ID))
 
-				_, cErr := rt.runNode(ctx, coder.ID, cPrompt, wtPath, nil)
+				cOut, cErr := rt.runNode(ctx, coder.ID, cPrompt, wtPath, nil)
 				<-sem
 				if cErr != nil {
 					errCh <- cErr
 					return
 				}
+				_, _ = rt.recordNote(coder.ID, "Hybrid Specialist Implementation", cOut.FinalText)
 
 				if verifier != nil {
 					rt.pulseEdge(coder.ID, verifier.ID, fmt.Sprintf("audit (round %d)", round))
@@ -917,9 +1174,9 @@ func (rt *missionRuntime) runHybridFleet(ctx context.Context) error {
 					return
 				}
 				if landRes.Accepted {
-					if task.ID != "" {
-						_, _ = rt.bb.CompleteTask(task.ID, coder.ID, landRes.LandedCommit)
-						rt.syncBlackboardState(EventTaskUpdated, coder.ID, task.ID, "landed "+landRes.LandedCommit)
+					for _, tid := range assignment.TaskIDs() {
+						_, _ = rt.bb.CompleteTask(tid, coder.ID, landRes.LandedCommit)
+						rt.syncBlackboardState(EventTaskUpdated, coder.ID, tid, "landed "+landRes.LandedCommit)
 					}
 					if lease != nil {
 						rt.releaseWorktree(ctx, coder.ID, lease, true)

@@ -12,6 +12,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"gorness.dev/gorness/internal/config"
@@ -23,19 +24,23 @@ const (
 	OutcomeSilent = "silent"
 	OutcomeDefer  = "defer"
 
+	defaultMaxOutboxRetained = 200
+
 	osaScriptBinPath = "/usr/bin/osascript"
 	osaTimeout       = 5 * time.Second
 )
 
 type OutboxItem struct {
-	ID          string    `json:"id" toml:"id"`
-	WorkspaceID string    `json:"workspace_id" toml:"workspace_id"`
-	SessionID   string    `json:"session_id,omitempty" toml:"session_id,omitempty"`
-	Outcome     string    `json:"outcome" toml:"outcome"` // "send" | "silent" | "defer"
-	Title       string    `json:"title,omitempty" toml:"title,omitempty"`
-	Body        string    `json:"body,omitempty" toml:"body,omitempty"`
-	Delivered   bool      `json:"delivered" toml:"delivered"`
-	CreatedAt   time.Time `json:"created_at" toml:"created_at"`
+	ID          string     `json:"id" toml:"id"`
+	WorkspaceID string     `json:"workspace_id" toml:"workspace_id"`
+	SessionID   string     `json:"session_id,omitempty" toml:"session_id,omitempty"`
+	Outcome     string     `json:"outcome" toml:"outcome"` // "send" | "silent" | "defer"
+	Title       string     `json:"title,omitempty" toml:"title,omitempty"`
+	Body        string     `json:"body,omitempty" toml:"body,omitempty"`
+	Delivered   bool       `json:"delivered" toml:"delivered"`
+	Acked       bool       `json:"acked,omitempty" toml:"acked,omitempty"`
+	AckedAt     *time.Time `json:"acked_at,omitempty" toml:"acked_at,omitempty"`
+	CreatedAt   time.Time  `json:"created_at" toml:"created_at"`
 }
 
 type Notifier interface {
@@ -97,11 +102,25 @@ func (n *OSAScriptNotifier) NotifyMac(title, subtitle, body string) error {
 }
 
 type outboxStore struct {
-	paths config.VaultPaths
+	paths       config.VaultPaths
+	maxRetained int
+
+	mu          sync.Mutex
+	loaded      bool
+	lastModNano int64
+	lastSize    int64
+	items       []OutboxItem
 }
 
-func newOutboxStore(paths config.VaultPaths) *outboxStore {
-	return &outboxStore{paths: paths}
+func newOutboxStore(paths config.VaultPaths, maxRetained ...int) *outboxStore {
+	bound := defaultMaxOutboxRetained
+	if len(maxRetained) > 0 && maxRetained[0] > 0 {
+		bound = maxRetained[0]
+	}
+	return &outboxStore{
+		paths:       paths,
+		maxRetained: bound,
+	}
 }
 
 func (s *outboxStore) lockPath() string {
@@ -114,7 +133,7 @@ func (s *outboxStore) filePath() string {
 
 func (s *outboxStore) append(item OutboxItem, now time.Time) (OutboxItem, error) {
 	if strings.TrimSpace(item.ID) == "" {
-		item.ID = fmt.Sprintf("out_%d_%s", now.UTC().UnixMilli(), randomHex(5))
+		item.ID = fmt.Sprintf("out_%d_%s", now.UTC().UnixMilli(), store.RandomHex(5))
 	}
 	if strings.TrimSpace(item.Outcome) == "" {
 		item.Outcome = OutcomeSilent
@@ -126,7 +145,23 @@ func (s *outboxStore) append(item OutboxItem, now time.Time) (OutboxItem, error)
 	}
 
 	err := store.WithFlock(s.lockPath(), true, func() error {
-		return appendJSONLineNoEscape(s.filePath(), item)
+		s.mu.Lock()
+		defer s.mu.Unlock()
+
+		if err := s.ensureLoadedLocked(); err != nil {
+			return err
+		}
+		if err := store.AppendJSONLine(s.filePath(), item); err != nil {
+			return err
+		}
+		s.items = append(s.items, cloneOutboxItem(item))
+
+		if len(s.items) > s.maxRetained*2 {
+			_, err := s.compactLocked()
+			return err
+		}
+		s.refreshFileStatLocked()
+		return nil
 	})
 	if err != nil {
 		return OutboxItem{}, err
@@ -137,40 +172,235 @@ func (s *outboxStore) append(item OutboxItem, now time.Time) (OutboxItem, error)
 func (s *outboxStore) list(limit int) ([]OutboxItem, error) {
 	var out []OutboxItem
 	err := store.WithFlock(s.lockPath(), false, func() error {
-		f, err := os.Open(s.filePath())
-		if err != nil {
-			if errors.Is(err, os.ErrNotExist) {
-				return nil
-			}
-			return fmt.Errorf("open outbox.jsonl: %w", err)
-		}
-		defer f.Close()
+		s.mu.Lock()
+		defer s.mu.Unlock()
 
-		reader := bufio.NewReader(f)
-		for {
-			line, rErr := reader.ReadBytes('\n')
-			trimmed := bytes.TrimSpace(line)
-			if len(trimmed) > 0 {
-				var item OutboxItem
-				if uErr := json.Unmarshal(trimmed, &item); uErr != nil {
-					return fmt.Errorf("parse outbox.jsonl: %w", uErr)
-				}
-				out = append(out, item)
-			}
-			if errors.Is(rErr, io.EOF) {
-				break
-			}
-			if rErr != nil {
-				return fmt.Errorf("read outbox.jsonl: %w", rErr)
-			}
+		if err := s.ensureLoadedLocked(); err != nil {
+			return err
+		}
+		start := 0
+		if limit > 0 && len(s.items) > limit {
+			start = len(s.items) - limit
+		}
+		out = make([]OutboxItem, len(s.items)-start)
+		for i, it := range s.items[start:] {
+			out[i] = cloneOutboxItem(it)
 		}
 		return nil
 	})
 	if err != nil {
 		return nil, err
 	}
-	if limit > 0 && len(out) > limit {
-		out = out[len(out)-limit:]
-	}
 	return out, nil
+}
+
+func (s *outboxStore) ack(ids []string, now time.Time) (int, error) {
+	idSet := make(map[string]bool, len(ids))
+	for _, raw := range ids {
+		if trimmed := strings.TrimSpace(raw); trimmed != "" {
+			idSet[trimmed] = true
+		}
+	}
+	if len(idSet) == 0 {
+		return 0, nil
+	}
+
+	nowUTC := now.UTC()
+	var ackedCount int
+	err := store.WithFlock(s.lockPath(), true, func() error {
+		s.mu.Lock()
+		defer s.mu.Unlock()
+
+		if err := s.ensureLoadedLocked(); err != nil {
+			return err
+		}
+		for i := range s.items {
+			if idSet[s.items[i].ID] && !s.items[i].Acked {
+				s.items[i].Acked = true
+				ts := nowUTC
+				s.items[i].AckedAt = &ts
+				ackedCount++
+			}
+		}
+		if ackedCount == 0 {
+			return nil
+		}
+		return s.rewriteLocked(s.items)
+	})
+	return ackedCount, err
+}
+
+// compact 清理已确认 (`acked == true`) 及超出容量上限的历史 Outbox 行，原子重写 `outbox.jsonl`。
+func (s *outboxStore) compact() (int, error) {
+	var removed int
+	err := store.WithFlock(s.lockPath(), true, func() error {
+		s.mu.Lock()
+		defer s.mu.Unlock()
+
+		if err := s.ensureLoadedLocked(); err != nil {
+			return err
+		}
+		n, err := s.compactLocked()
+		removed = n
+		return err
+	})
+	return removed, err
+}
+
+func (s *outboxStore) maybeCompact() (int, error) {
+	s.mu.Lock()
+	needs := s.loaded && len(s.items) > s.maxRetained
+	if !needs && s.loaded {
+		for _, it := range s.items {
+			if it.Acked && len(s.items) > s.maxRetained/2 {
+				needs = true
+				break
+			}
+		}
+	}
+	s.mu.Unlock()
+	if !needs {
+		return 0, nil
+	}
+	return s.compact()
+}
+
+func (s *outboxStore) compactLocked() (int, error) {
+	before := len(s.items)
+	kept := make([]OutboxItem, 0, len(s.items))
+	for _, it := range s.items {
+		if it.Acked {
+			continue
+		}
+		kept = append(kept, it)
+	}
+	if s.maxRetained > 0 && len(kept) > s.maxRetained {
+		needDrop := len(kept) - s.maxRetained
+		filtered := make([]OutboxItem, 0, len(kept))
+		for _, it := range kept {
+			if needDrop > 0 && it.Outcome == OutcomeSilent {
+				needDrop--
+				continue
+			}
+			filtered = append(filtered, it)
+		}
+		kept = filtered
+		if len(kept) > s.maxRetained {
+			kept = kept[len(kept)-s.maxRetained:]
+		}
+	}
+	removed := before - len(kept)
+	if removed == 0 {
+		return 0, nil
+	}
+	if err := s.rewriteLocked(kept); err != nil {
+		return 0, err
+	}
+	return removed, nil
+}
+
+func (s *outboxStore) ensureLoadedLocked() error {
+	modNano, size := statSignature(s.filePath())
+	if s.loaded && s.lastModNano == modNano && s.lastSize == size {
+		return nil
+	}
+	if modNano == -1 {
+		s.items = nil
+		s.loaded = true
+		s.lastModNano = -1
+		s.lastSize = -1
+		return nil
+	}
+
+	f, err := os.Open(s.filePath())
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			s.items = nil
+			s.loaded = true
+			s.lastModNano = -1
+			s.lastSize = -1
+			return nil
+		}
+		return fmt.Errorf("open outbox.jsonl: %w", err)
+	}
+	defer f.Close()
+
+	var parsed []OutboxItem
+	idxByID := make(map[string]int)
+	reader := bufio.NewReader(f)
+	for {
+		line, rErr := reader.ReadBytes('\n')
+		trimmed := bytes.TrimSpace(line)
+		if len(trimmed) > 0 {
+			var item OutboxItem
+			if uErr := json.Unmarshal(trimmed, &item); uErr != nil {
+				return fmt.Errorf("parse outbox.jsonl: %w", uErr)
+			}
+			if item.ID != "" {
+				if idx, ok := idxByID[item.ID]; ok {
+					parsed[idx] = item
+				} else {
+					idxByID[item.ID] = len(parsed)
+					parsed = append(parsed, item)
+				}
+			} else {
+				parsed = append(parsed, item)
+			}
+		}
+		if errors.Is(rErr, io.EOF) {
+			break
+		}
+		if rErr != nil {
+			return fmt.Errorf("read outbox.jsonl: %w", rErr)
+		}
+	}
+
+	s.items = parsed
+	s.loaded = true
+	s.lastModNano = modNano
+	s.lastSize = size
+	return nil
+}
+
+func (s *outboxStore) rewriteLocked(items []OutboxItem) error {
+	var buf bytes.Buffer
+	for _, it := range items {
+		line, err := store.MarshalJSONLine(it)
+		if err != nil {
+			return fmt.Errorf("marshal outbox item: %w", err)
+		}
+		buf.Write(line)
+	}
+	if err := store.AtomicWriteFile(s.filePath(), buf.Bytes(), 0o600); err != nil {
+		return err
+	}
+	cloned := make([]OutboxItem, len(items))
+	for i, it := range items {
+		cloned[i] = cloneOutboxItem(it)
+	}
+	s.items = cloned
+	s.loaded = true
+	s.refreshFileStatLocked()
+	return nil
+}
+
+func (s *outboxStore) refreshFileStatLocked() {
+	s.lastModNano, s.lastSize = statSignature(s.filePath())
+}
+
+func cloneOutboxItem(it OutboxItem) OutboxItem {
+	cp := it
+	if it.AckedAt != nil {
+		t := *it.AckedAt
+		cp.AckedAt = &t
+	}
+	return cp
+}
+
+func statSignature(path string) (int64, int64) {
+	fi, err := os.Stat(path)
+	if err != nil {
+		return -1, -1
+	}
+	return fi.ModTime().UnixNano(), fi.Size()
 }

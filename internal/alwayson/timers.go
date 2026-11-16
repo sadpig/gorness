@@ -20,19 +20,34 @@ const (
 	TimerKindCron     = "cron"
 )
 
+var ErrTimerNotFound = errors.New("timer not found")
+
 var standardCronParser = cron.NewParser(
 	cron.Minute | cron.Hour | cron.Dom | cron.Month | cron.Dow | cron.Descriptor,
 )
 
 type TimerEntry struct {
-	ID          string    `toml:"id" json:"id"`
-	WorkspaceID string    `toml:"workspace_id" json:"workspace_id"`
-	SessionID   string    `toml:"session_id,omitempty" json:"session_id,omitempty"`
-	Kind        string    `toml:"kind" json:"kind"`
-	CronExpr    string    `toml:"cron_expr,omitempty" json:"cron_expr,omitempty"`
-	Note        string    `toml:"note,omitempty" json:"note,omitempty"`
-	DueAt       time.Time `toml:"due_at" json:"due_at"`
-	Enabled     bool      `toml:"enabled" json:"enabled"`
+	ID          string     `toml:"id" json:"id"`
+	WorkspaceID string     `toml:"workspace_id" json:"workspace_id"`
+	SessionID   string     `toml:"session_id,omitempty" json:"session_id,omitempty"`
+	AgentRole   string     `toml:"agent_role,omitempty" json:"agent_role,omitempty"`
+	Kind        string     `toml:"kind" json:"kind"`
+	CronExpr    string     `toml:"cron_expr,omitempty" json:"cron_expr,omitempty"`
+	Note        string     `toml:"note,omitempty" json:"note,omitempty"`
+	DueAt       time.Time  `toml:"due_at" json:"due_at"`
+	LastFiredAt *time.Time `toml:"last_fired_at,omitempty" json:"last_fired_at,omitempty"`
+	Enabled     bool       `toml:"enabled" json:"enabled"`
+}
+
+// TimerPatch 支持对现有定时器的局部更新（启用/禁用、Cron 表达式、备注、角色、延迟重设等）。
+type TimerPatch struct {
+	CronExpr     *string    `json:"cron_expr,omitempty" toml:"cron_expr,omitempty"`
+	Note         *string    `json:"note,omitempty" toml:"note,omitempty"`
+	AgentRole    *string    `json:"agent_role,omitempty" toml:"agent_role,omitempty"`
+	SessionID    *string    `json:"session_id,omitempty" toml:"session_id,omitempty"`
+	Enabled      *bool      `json:"enabled,omitempty" toml:"enabled,omitempty"`
+	AfterSeconds *int       `json:"after_seconds,omitempty" toml:"after_seconds,omitempty"`
+	DueAt        *time.Time `json:"due_at,omitempty" toml:"due_at,omitempty"`
 }
 
 type timersDoc struct {
@@ -79,7 +94,7 @@ func (s *timerStore) scheduleFollowUp(
 	}
 
 	entry := TimerEntry{
-		ID:          fmt.Sprintf("fup_%d_%s", now.UTC().UnixMilli(), randomHex(4)),
+		ID:          fmt.Sprintf("fup_%d_%s", now.UTC().UnixMilli(), store.RandomHex(4)),
 		WorkspaceID: cleanWS,
 		SessionID:   strings.TrimSpace(sessionID),
 		Kind:        TimerKindFollowUp,
@@ -115,10 +130,13 @@ func (s *timerStore) upsertCron(entry TimerEntry, now time.Time) error {
 
 	entry.ID = strings.TrimSpace(entry.ID)
 	if entry.ID == "" {
-		entry.ID = fmt.Sprintf("cron_%d_%s", now.UTC().UnixMilli(), randomHex(4))
+		entry.ID = fmt.Sprintf("cron_%d_%s", now.UTC().UnixMilli(), store.RandomHex(4))
+	} else if err := store.ValidateSafeID(entry.ID); err != nil {
+		return err
 	}
 	entry.WorkspaceID = cleanWS
 	entry.SessionID = strings.TrimSpace(entry.SessionID)
+	entry.AgentRole = strings.TrimSpace(entry.AgentRole)
 	entry.Kind = TimerKindCron
 	entry.CronExpr = strings.TrimSpace(entry.CronExpr)
 	entry.Note = strings.TrimSpace(entry.Note)
@@ -148,6 +166,163 @@ func (s *timerStore) upsertCron(entry TimerEntry, now time.Time) error {
 	})
 }
 
+func (s *timerStore) update(id string, patch TimerPatch, now time.Time) (TimerEntry, error) {
+	if err := store.ValidateSafeID(id); err != nil {
+		return TimerEntry{}, err
+	}
+	nowUTC := now.UTC()
+	var updated TimerEntry
+
+	err := store.WithFlock(s.lockPath(), true, func() error {
+		entries, err := s.readUnlocked()
+		if err != nil {
+			return err
+		}
+		idx := -1
+		for i := range entries {
+			if entries[i].ID == id {
+				idx = i
+				break
+			}
+		}
+		if idx < 0 {
+			return fmt.Errorf("%w: %s", ErrTimerNotFound, id)
+		}
+
+		cur := entries[idx]
+		if patch.Note != nil {
+			cur.Note = strings.TrimSpace(*patch.Note)
+		}
+		if patch.AgentRole != nil {
+			cur.AgentRole = strings.TrimSpace(*patch.AgentRole)
+		}
+		if patch.SessionID != nil {
+			cur.SessionID = strings.TrimSpace(*patch.SessionID)
+		}
+		if patch.CronExpr != nil {
+			expr := strings.TrimSpace(*patch.CronExpr)
+			sched, pErr := ParseCronSchedule(expr)
+			if pErr != nil {
+				return pErr
+			}
+			cur.Kind = TimerKindCron
+			cur.CronExpr = expr
+			if patch.DueAt == nil && patch.AfterSeconds == nil {
+				cur.DueAt = sched.Next(nowUTC)
+			}
+		}
+		if patch.AfterSeconds != nil {
+			cur.DueAt = nowUTC.Add(time.Duration(*patch.AfterSeconds) * time.Second)
+		}
+		if patch.DueAt != nil && !patch.DueAt.IsZero() {
+			cur.DueAt = patch.DueAt.UTC()
+		}
+		if patch.Enabled != nil {
+			wasDisabled := !cur.Enabled
+			cur.Enabled = *patch.Enabled
+			if cur.Enabled && wasDisabled && patch.DueAt == nil && patch.AfterSeconds == nil &&
+				(cur.Kind == TimerKindCron || strings.TrimSpace(cur.CronExpr) != "") &&
+				(cur.DueAt.IsZero() || !cur.DueAt.After(nowUTC)) {
+				if sched, pErr := ParseCronSchedule(cur.CronExpr); pErr == nil {
+					cur.DueAt = sched.Next(nowUTC)
+				}
+			}
+		}
+
+		entries[idx] = cur
+		updated = cur
+		return s.writeUnlocked(entries)
+	})
+	return updated, err
+}
+
+func (s *timerStore) delete(id string) error {
+	if err := store.ValidateSafeID(id); err != nil {
+		return err
+	}
+	return store.WithFlock(s.lockPath(), true, func() error {
+		entries, err := s.readUnlocked()
+		if err != nil {
+			return err
+		}
+		kept := make([]TimerEntry, 0, len(entries))
+		found := false
+		for _, e := range entries {
+			if e.ID == id {
+				found = true
+				continue
+			}
+			kept = append(kept, e)
+		}
+		if !found {
+			return fmt.Errorf("%w: %s", ErrTimerNotFound, id)
+		}
+		return s.writeUnlocked(kept)
+	})
+}
+
+func (s *timerStore) triggerNow(
+	id string,
+	now time.Time,
+	enqueueFn func(InboxEvent) (InboxEvent, bool, error),
+) (InboxEvent, error) {
+	if err := store.ValidateSafeID(id); err != nil {
+		return InboxEvent{}, err
+	}
+	nowUTC := now.UTC()
+	var target TimerEntry
+	err := store.WithFlock(s.lockPath(), false, func() error {
+		entries, rErr := s.readUnlocked()
+		if rErr != nil {
+			return rErr
+		}
+		for _, e := range entries {
+			if e.ID == id {
+				target = e
+				return nil
+			}
+		}
+		return fmt.Errorf("%w: %s", ErrTimerNotFound, id)
+	})
+	if err != nil {
+		return InboxEvent{}, err
+	}
+
+	ev := makeTimerInboxEvent(target, nowUTC, true)
+	stored, _, enqErr := enqueueFn(ev)
+	if enqErr != nil {
+		return InboxEvent{}, enqErr
+	}
+
+	_ = store.WithFlock(s.lockPath(), true, func() error {
+		entries, rErr := s.readUnlocked()
+		if rErr != nil {
+			return rErr
+		}
+		kept := make([]TimerEntry, 0, len(entries))
+		changed := false
+		for _, e := range entries {
+			if e.ID != id {
+				kept = append(kept, e)
+				continue
+			}
+			changed = true
+			if e.Kind == TimerKindCron || strings.TrimSpace(e.CronExpr) != "" {
+				firedAt := nowUTC
+				e.LastFiredAt = &firedAt
+				kept = append(kept, e)
+			}
+			// One-shot follow-up timer triggered manually is auto-removed cleanly.
+		}
+		if !changed {
+			return nil
+		}
+		return s.writeUnlocked(kept)
+	})
+
+	return stored, nil
+}
+
 func (s *timerStore) list() ([]TimerEntry, error) {
 	var out []TimerEntry
 	err := store.WithFlock(s.lockPath(), false, func() error {
@@ -161,7 +336,7 @@ func (s *timerStore) list() ([]TimerEntry, error) {
 	return out, err
 }
 
-// tickDue 扫描到期定时器，先通过 enqueueFn 幂等投递至 Inbox（绝不直接调用 LLM），再原子推进/禁用 timers.toml。
+// tickDue 扫描到期定时器，先通过 enqueueFn 幂等投递至 Inbox（绝不直接调用 LLM），再原子推进 Cron 并清理已触发的一次性 Follow-up。
 func (s *timerStore) tickDue(
 	now time.Time,
 	enqueueFn func(InboxEvent) (InboxEvent, bool, error),
@@ -212,37 +387,7 @@ func (s *timerStore) tickDue(
 	var fired []firedResult
 
 	for _, e := range dueSnapshot {
-		kind := strings.TrimSpace(e.Kind)
-		if kind == "" {
-			if strings.TrimSpace(e.CronExpr) != "" {
-				kind = TimerKindCron
-			} else {
-				kind = TimerKindFollowUp
-			}
-		}
-		key := fmt.Sprintf("%s:timer:%s", e.WorkspaceID, e.ID)
-		if e.SessionID != "" {
-			key = fmt.Sprintf("%s:%s", e.WorkspaceID, e.SessionID)
-		}
-
-		ev := InboxEvent{
-			InboxKey:    key,
-			Source:      "timer:" + kind,
-			SourceID:    fmt.Sprintf("%s@%d", e.ID, e.DueAt.UTC().UnixNano()),
-			WorkspaceID: e.WorkspaceID,
-			SessionID:   e.SessionID,
-			AgentRole:   "coder",
-			Payload: map[string]any{
-				"timer_id":  e.ID,
-				"kind":      kind,
-				"cron_expr": e.CronExpr,
-				"note":      e.Note,
-				"text":      formatTimerNoteText(kind, e.ID, e.Note),
-				"due_at":    e.DueAt.UTC().Format(time.RFC3339Nano),
-			},
-			CreatedAt: nowUTC,
-		}
-
+		ev := makeTimerInboxEvent(e, nowUTC, false)
 		stored, deduped, enqErr := enqueueFn(ev)
 		if enqErr != nil {
 			return nil, enqErr
@@ -270,39 +415,91 @@ func (s *timerStore) tickDue(
 			return err
 		}
 		changed := false
-		for i := range entries {
-			firedDue, hit := firedMap[entries[i].ID]
-			if !hit || !entries[i].Enabled {
+		kept := make([]TimerEntry, 0, len(entries))
+		for _, cur := range entries {
+			_, hit := firedMap[cur.ID]
+			if !hit || !cur.Enabled {
+				// Also prune any legacy disabled one-shot follow-up entries left on disk.
+				if !cur.Enabled && cur.Kind != TimerKindCron && strings.TrimSpace(cur.CronExpr) == "" {
+					changed = true
+					continue
+				}
+				kept = append(kept, cur)
 				continue
 			}
 			// Guard against racing external edit that already pushed DueAt into the future.
-			if !entries[i].DueAt.IsZero() && entries[i].DueAt.After(nowUTC) {
+			if !cur.DueAt.IsZero() && cur.DueAt.After(nowUTC) {
+				kept = append(kept, cur)
 				continue
 			}
-			_ = firedDue
 			changed = true
-			if entries[i].Kind == TimerKindCron || strings.TrimSpace(entries[i].CronExpr) != "" {
-				sched, pErr := ParseCronSchedule(entries[i].CronExpr)
+			if cur.Kind == TimerKindCron || strings.TrimSpace(cur.CronExpr) != "" {
+				firedAt := nowUTC
+				cur.LastFiredAt = &firedAt
+				sched, pErr := ParseCronSchedule(cur.CronExpr)
 				if pErr != nil {
-					entries[i].Enabled = false
+					cur.Enabled = false
 				} else {
-					entries[i].DueAt = sched.Next(nowUTC)
-					entries[i].Enabled = true
+					cur.DueAt = sched.Next(nowUTC)
+					cur.Enabled = true
 				}
-			} else {
-				entries[i].Enabled = false
+				kept = append(kept, cur)
 			}
+			// Fired one-shot follow-up timers are auto-removed cleanly instead of accumulating.
 		}
 		if !changed {
 			return nil
 		}
-		return s.writeUnlocked(entries)
+		return s.writeUnlocked(kept)
 	})
 	if err != nil {
 		return nil, err
 	}
 
 	return enqueuedEvents, nil
+}
+
+func makeTimerInboxEvent(e TimerEntry, nowUTC time.Time, manual bool) InboxEvent {
+	kind := strings.TrimSpace(e.Kind)
+	if kind == "" {
+		if strings.TrimSpace(e.CronExpr) != "" {
+			kind = TimerKindCron
+		} else {
+			kind = TimerKindFollowUp
+		}
+	}
+	key := fmt.Sprintf("%s:timer:%s", e.WorkspaceID, e.ID)
+	if e.SessionID != "" {
+		key = fmt.Sprintf("%s:%s", e.WorkspaceID, e.SessionID)
+	}
+	role := strings.TrimSpace(e.AgentRole)
+	if role == "" {
+		role = "coder"
+	}
+	source := "timer:" + kind
+	sourceID := fmt.Sprintf("%s@%d", e.ID, e.DueAt.UTC().UnixNano())
+	if manual {
+		source = "timer:manual"
+		sourceID = fmt.Sprintf("%s@manual@%d_%s", e.ID, nowUTC.UnixNano(), store.RandomHex(3))
+	}
+	return InboxEvent{
+		InboxKey:    key,
+		Source:      source,
+		SourceID:    sourceID,
+		WorkspaceID: e.WorkspaceID,
+		SessionID:   e.SessionID,
+		AgentRole:   role,
+		Payload: map[string]any{
+			"timer_id":  e.ID,
+			"kind":      kind,
+			"cron_expr": e.CronExpr,
+			"note":      e.Note,
+			"manual":    manual,
+			"text":      formatTimerNoteText(kind, e.ID, e.Note),
+			"due_at":    e.DueAt.UTC().Format(time.RFC3339Nano),
+		},
+		CreatedAt: nowUTC,
+	}
 }
 
 func (s *timerStore) readUnlocked() ([]TimerEntry, error) {

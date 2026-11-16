@@ -35,9 +35,33 @@ type dreamJSONEnvelope struct {
 	Notes  []dreamNoteSpec      `json:"notes"`
 }
 
+type dreamFrontmatterHeader struct {
+	ID          string   `toml:"id" json:"id"`
+	Name        string   `toml:"name" json:"name"`
+	Description string   `toml:"description" json:"description"`
+	Paths       []string `toml:"paths,omitempty" json:"paths,omitempty"`
+}
+
+// Dreamer 负责在空闲窗口蒸馏近期会话经验至四层记忆与候选技能目录 (`skills/_candidates/<slug>/SKILL.md`)。
+type Dreamer struct {
+	svc *Service
+}
+
+// RunDream 执行一次完整闲时记忆蒸馏，返回本次写入的候选 SKILL.md 路径列表。
+func (d *Dreamer) RunDream(ctx context.Context, wsID string) ([]string, error) {
+	if d == nil || d.svc == nil {
+		return nil, errors.New("dreamer requires an initialized Always-On Service")
+	}
+	return d.svc.runDreamInternal(ctx, wsID)
+}
+
 // RunDreamPass 在空闲整理阶段使用 dreamer 角色回顾近期会话轨迹，
 // 将高频排障经验与工作流提炼为指针记忆（memory/INDEX.md + notes/*.md）及候选技能（~/.gorness/skills/_candidates/<slug>/SKILL.md）。
 func (s *Service) RunDreamPass(ctx context.Context, wsID string) ([]string, error) {
+	return s.dreamer.RunDream(ctx, wsID)
+}
+
+func (s *Service) runDreamInternal(ctx context.Context, wsID string) ([]string, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -49,8 +73,11 @@ func (s *Service) RunDreamPass(ctx context.Context, wsID string) ([]string, erro
 	snap := s.cfg.Current()
 	var wsRoleModel string
 	if cleanWS != "" {
-		if _, vErr := validateSafeWorkspaceID(cleanWS); vErr != nil {
-			return nil, vErr
+		if err := store.ValidateSafeID(cleanWS); err != nil {
+			return nil, err
+		}
+		if strings.Contains(cleanWS, "..") {
+			return nil, fmt.Errorf("%w: %q", store.ErrInvalidID, cleanWS)
 		}
 		ws, err := s.engine.Workspaces().Get(cleanWS)
 		if err != nil {
@@ -117,7 +144,7 @@ func (s *Service) RunDreamPass(ctx context.Context, wsID string) ([]string, erro
 	now := s.now().UTC()
 	skills, notes := parseDreamerOutput(rawOut.String(), cleanWS)
 
-	candidatesRoot := filepath.Join(s.paths.SkillsDir(), "_candidates")
+	candidatesRoot := s.candidatesRootDir()
 	createdPaths := make([]string, 0, len(skills))
 
 	for _, sk := range skills {
@@ -136,12 +163,13 @@ func (s *Service) RunDreamPass(ctx context.Context, wsID string) ([]string, erro
 
 		skillFile := filepath.Join(candidatesRoot, slug, "SKILL.md")
 		formattedMD := formatCandidateSkillMD(slug, desc, sk.Paths, body)
-		if err := store.AtomicWriteFile(skillFile, []byte(formattedMD), 0o600); err != nil {
+		if err := store.WithFlock(s.candidatesLockPath(), true, func() error {
+			return store.AtomicWriteFile(skillFile, []byte(formattedMD), 0o600)
+		}); err != nil {
 			return nil, fmt.Errorf("write candidate SKILL.md %s: %w", skillFile, err)
 		}
 		createdPaths = append(createdPaths, skillFile)
 
-		// Synchronize a corresponding pointer note in memory/INDEX.md + memory/notes/<slug>.md.
 		_, _ = s.memory.upsertNote(
 			"dream-"+slug,
 			"Dreamed Skill: "+slug,
@@ -163,6 +191,12 @@ func (s *Service) RunDreamPass(ctx context.Context, wsID string) ([]string, erro
 		)
 		_, _ = s.memory.writeWorkspaceProgress(cleanWS, "dream-latest", progBody)
 	}
+
+	s.recordDreamCompleted(now)
+	s.publishAlwaysOnEvent("dream_completed", map[string]any{
+		"workspace_id": cleanWS,
+		"candidates":   createdPaths,
+	})
 
 	return createdPaths, nil
 }
@@ -236,23 +270,20 @@ func parseDreamerOutput(raw string, wsID string) ([]dreamCandidateSpec, []dreamN
 		}
 	}
 
-	// 2. Try SKILL.md frontmatter (--- or +++).
+	// 2. Try SKILL.md frontmatter (--- or +++) via config.ParseFrontmatterAs.
 	for _, cand := range candidates {
 		if strings.HasPrefix(cand, "---") || strings.HasPrefix(cand, "+++") {
-			meta, body, err := config.ParseFrontmatterMD([]byte(cand))
-			if err == nil && len(meta) > 0 {
-				name := strings.TrimSpace(fmt.Sprint(meta["name"]))
-				if meta["name"] == nil || name == "" {
-					name = strings.TrimSpace(fmt.Sprint(meta["id"]))
-				}
-				desc := ""
-				if meta["description"] != nil {
-					desc = strings.TrimSpace(fmt.Sprint(meta["description"]))
+			fm, body, err := config.ParseFrontmatterAs[dreamFrontmatterHeader](cand)
+			if err == nil {
+				name := strings.TrimSpace(fm.Name)
+				if name == "" {
+					name = strings.TrimSpace(fm.ID)
 				}
 				if name != "" {
 					return []dreamCandidateSpec{{
 						Name:        name,
-						Description: desc,
+						Description: strings.TrimSpace(fm.Description),
+						Paths:       fm.Paths,
 						Body:        strings.TrimSpace(body),
 					}}, nil
 				}

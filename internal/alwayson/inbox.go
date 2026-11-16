@@ -3,8 +3,6 @@ package alwayson
 import (
 	"bufio"
 	"bytes"
-	"crypto/rand"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -12,7 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-	"sync/atomic"
+	"sync"
 	"time"
 
 	"github.com/pelletier/go-toml/v2"
@@ -30,9 +28,9 @@ const (
 	StatusDeferred = "deferred"
 
 	SourceDeferredResume = "deferred_resume"
-)
 
-var idFallbackSeq atomic.Uint64
+	defaultMaxInboxTerminalRetained = 250
+)
 
 type InboxEvent struct {
 	ID          string         `json:"id" toml:"id"`
@@ -77,11 +75,28 @@ type syncedInboxRecord struct {
 }
 
 type inboxStore struct {
-	paths config.VaultPaths
+	paths               config.VaultPaths
+	maxTerminalRetained int
+
+	mu           sync.Mutex
+	loaded       bool
+	jsonlModNano int64
+	jsonlSize    int64
+	stateModNano int64
+	stateSize    int64
+	records      []syncedInboxRecord
+	seenSources  map[string]string
 }
 
-func newInboxStore(paths config.VaultPaths) *inboxStore {
-	return &inboxStore{paths: paths}
+func newInboxStore(paths config.VaultPaths, maxTerminalRetained ...int) *inboxStore {
+	bound := defaultMaxInboxTerminalRetained
+	if len(maxTerminalRetained) > 0 && maxTerminalRetained[0] > 0 {
+		bound = maxTerminalRetained[0]
+	}
+	return &inboxStore{
+		paths:               paths,
+		maxTerminalRetained: bound,
+	}
 }
 
 func (s *inboxStore) lockPath() string {
@@ -103,25 +118,27 @@ func (s *inboxStore) statePath() string {
 func (s *inboxStore) recoverOnStart(now time.Time) ([]InboxEvent, error) {
 	var out []InboxEvent
 	err := store.WithFlock(s.lockPath(), true, func() error {
-		records, _, err := s.loadUnlocked(now)
-		if err != nil {
+		s.mu.Lock()
+		defer s.mu.Unlock()
+
+		if err := s.ensureLoadedLocked(now); err != nil {
 			return err
 		}
-		for i := range records {
-			if records[i].event.Status == StatusRunning {
-				if records[i].event.Attempts >= MaxAttempts {
-					records[i].event.Status = StatusFailed
+		for i := range s.records {
+			if s.records[i].event.Status == StatusRunning {
+				if s.records[i].event.Attempts >= MaxAttempts {
+					s.records[i].event.Status = StatusFailed
 				} else {
-					records[i].event.Status = StatusQueued
+					s.records[i].event.Status = StatusQueued
 				}
-				records[i].notBefore = time.Time{}
-				records[i].updatedAt = now.UTC()
+				s.records[i].notBefore = time.Time{}
+				s.records[i].updatedAt = now.UTC()
 			}
 		}
-		if err := s.writeStateUnlocked(records, now); err != nil {
+		if err := s.writeStateLocked(now); err != nil {
 			return err
 		}
-		out = extractEvents(records)
+		out = extractEvents(s.records)
 		return nil
 	})
 	return out, err
@@ -136,22 +153,23 @@ func (s *inboxStore) enqueue(ev InboxEvent, now time.Time) (InboxEvent, bool, er
 	var deduped bool
 
 	err := store.WithFlock(s.lockPath(), true, func() error {
-		records, seenSources, err := s.loadUnlocked(now)
-		if err != nil {
+		s.mu.Lock()
+		defer s.mu.Unlock()
+
+		if err := s.ensureLoadedLocked(now); err != nil {
 			return err
 		}
 
 		srcKey := makeSourceDedupKey(ev.Source, ev.SourceID)
 		if srcKey != "" {
-			if _, exists := seenSources[srcKey]; exists {
+			if _, exists := s.seenSources[srcKey]; exists {
 				deduped = true
 				return nil
 			}
 		}
 
 		norm := normalizeNewInboxEvent(ev, now)
-		// Ensure ID uniqueness too.
-		for _, r := range records {
+		for _, r := range s.records {
 			if r.event.ID == norm.ID {
 				deduped = true
 				stored = cloneInboxEvent(r.event)
@@ -159,17 +177,21 @@ func (s *inboxStore) enqueue(ev InboxEvent, now time.Time) (InboxEvent, bool, er
 			}
 		}
 
-		if err := appendJSONLineNoEscape(s.jsonlPath(), norm); err != nil {
+		if err := store.AppendJSONLine(s.jsonlPath(), norm); err != nil {
 			return err
 		}
 
-		records = append(records, syncedInboxRecord{
+		s.records = append(s.records, syncedInboxRecord{
 			event:     norm,
 			updatedAt: norm.CreatedAt,
 		})
-		if err := s.writeStateUnlocked(records, now); err != nil {
+		if srcKey != "" {
+			s.seenSources[srcKey] = norm.ID
+		}
+		if err := s.writeStateLocked(now); err != nil {
 			return err
 		}
+		s.refreshDiskStatLocked()
 		stored = cloneInboxEvent(norm)
 		return nil
 	})
@@ -179,9 +201,7 @@ func (s *inboxStore) enqueue(ev InboxEvent, now time.Time) (InboxEvent, bool, er
 	return stored, deduped, nil
 }
 
-// claimNextBatch 在排他文件锁下挑选下一组已满足防抖窗口的可执行微批事件：
-// - deferred_resume 高优先级审批恢复事件零延迟优先出队；
-// - 同一 InboxKey 下的连发排队事件在 InboxDebounceMS 防抖窗口收敛后一次性打包为单批返回。
+// claimNextBatch 在排他文件锁与内存投影下挑选下一组已满足防抖窗口的可执行微批事件。
 func (s *inboxStore) claimNextBatch(
 	now time.Time,
 	debounce time.Duration,
@@ -198,13 +218,15 @@ func (s *inboxStore) claimNextBatch(
 	var nextWake time.Duration
 
 	err := store.WithFlock(s.lockPath(), true, func() error {
-		records, _, err := s.loadUnlocked(now)
-		if err != nil {
+		s.mu.Lock()
+		defer s.mu.Unlock()
+
+		if err := s.ensureLoadedLocked(now); err != nil {
 			return err
 		}
 
 		runningKeys := make(map[string]bool)
-		for _, r := range records {
+		for _, r := range s.records {
 			if r.event.Status == StatusRunning {
 				runningKeys[r.event.InboxKey] = true
 			}
@@ -224,25 +246,25 @@ func (s *inboxStore) claimNextBatch(
 		}
 
 		// 1. High-priority pass: deferred_resume events bypass debounce unless cooling down from ErrSessionBusy / retry.
-		for i := range records {
-			if records[i].event.Status != StatusQueued || records[i].event.Source != SourceDeferredResume {
+		for i := range s.records {
+			if s.records[i].event.Status != StatusQueued || s.records[i].event.Source != SourceDeferredResume {
 				continue
 			}
-			if runningKeys[records[i].event.InboxKey] {
+			if runningKeys[s.records[i].event.InboxKey] {
 				continue
 			}
-			if !records[i].notBefore.IsZero() && now.Before(records[i].notBefore) {
-				noteWait(records[i].notBefore)
+			if !s.records[i].notBefore.IsZero() && now.Before(s.records[i].notBefore) {
+				noteWait(s.records[i].notBefore)
 				continue
 			}
-			records[i].event.Status = StatusRunning
-			records[i].event.Attempts++
-			records[i].notBefore = time.Time{}
-			records[i].updatedAt = now.UTC()
-			if err := s.writeStateUnlocked(records, now); err != nil {
+			s.records[i].event.Status = StatusRunning
+			s.records[i].event.Attempts++
+			s.records[i].notBefore = time.Time{}
+			s.records[i].updatedAt = now.UTC()
+			if err := s.writeStateLocked(now); err != nil {
 				return err
 			}
-			claimed = []InboxEvent{cloneInboxEvent(records[i].event)}
+			claimed = []InboxEvent{cloneInboxEvent(s.records[i].event)}
 			return nil
 		}
 
@@ -259,7 +281,7 @@ func (s *inboxStore) claimNextBatch(
 		var orderedKeys []string
 		byKey := make(map[string]*keyGroup)
 
-		for i, r := range records {
+		for i, r := range s.records {
 			if r.event.Status != StatusQueued || r.event.Source == SourceDeferredResume {
 				continue
 			}
@@ -322,13 +344,13 @@ func (s *inboxStore) claimNextBatch(
 			if !now.Before(readyAt) {
 				claimed = make([]InboxEvent, 0, len(g.indices))
 				for _, idx := range g.indices {
-					records[idx].event.Status = StatusRunning
-					records[idx].event.Attempts++
-					records[idx].notBefore = time.Time{}
-					records[idx].updatedAt = now.UTC()
-					claimed = append(claimed, cloneInboxEvent(records[idx].event))
+					s.records[idx].event.Status = StatusRunning
+					s.records[idx].event.Attempts++
+					s.records[idx].notBefore = time.Time{}
+					s.records[idx].updatedAt = now.UTC()
+					claimed = append(claimed, cloneInboxEvent(s.records[idx].event))
 				}
-				return s.writeStateUnlocked(records, now)
+				return s.writeStateLocked(now)
 			}
 
 			noteWait(readyAt)
@@ -361,34 +383,41 @@ func (s *inboxStore) completeBatch(
 	}
 
 	return store.WithFlock(s.lockPath(), true, func() error {
-		records, _, err := s.loadUnlocked(now)
-		if err != nil {
+		s.mu.Lock()
+		defer s.mu.Unlock()
+
+		if err := s.ensureLoadedLocked(now); err != nil {
 			return err
 		}
-		for i := range records {
-			if !idSet[records[i].event.ID] {
+		for i := range s.records {
+			if !idSet[s.records[i].event.ID] {
 				continue
 			}
-			if strings.TrimSpace(sessionID) != "" && records[i].event.SessionID == "" {
-				records[i].event.SessionID = strings.TrimSpace(sessionID)
+			if strings.TrimSpace(sessionID) != "" && s.records[i].event.SessionID == "" {
+				s.records[i].event.SessionID = strings.TrimSpace(sessionID)
 			}
-			records[i].updatedAt = now.UTC()
-			records[i].lastError = strings.TrimSpace(errMsg)
+			s.records[i].updatedAt = now.UTC()
+			s.records[i].lastError = strings.TrimSpace(errMsg)
 
 			if outcomeStatus == StatusFailed {
-				if records[i].event.Attempts >= MaxAttempts {
-					records[i].event.Status = StatusFailed
-					records[i].notBefore = time.Time{}
+				if s.records[i].event.Attempts >= MaxAttempts {
+					s.records[i].event.Status = StatusFailed
+					s.records[i].notBefore = time.Time{}
 				} else {
-					records[i].event.Status = StatusQueued
-					records[i].notBefore = now.UTC().Add(retryBackoff)
+					s.records[i].event.Status = StatusQueued
+					s.records[i].notBefore = now.UTC().Add(retryBackoff)
 				}
 			} else {
-				records[i].event.Status = outcomeStatus
-				records[i].notBefore = time.Time{}
+				s.records[i].event.Status = outcomeStatus
+				s.records[i].notBefore = time.Time{}
 			}
 		}
-		return s.writeStateUnlocked(records, now)
+
+		if s.countTerminalLocked() > s.maxTerminalRetained*2 {
+			_, err := s.compactLocked(now)
+			return err
+		}
+		return s.writeStateLocked(now)
 	})
 }
 
@@ -405,39 +434,165 @@ func (s *inboxStore) requeueBusyBatch(ids []string, cooldown time.Duration, now 
 	}
 
 	return store.WithFlock(s.lockPath(), true, func() error {
-		records, _, err := s.loadUnlocked(now)
-		if err != nil {
+		s.mu.Lock()
+		defer s.mu.Unlock()
+
+		if err := s.ensureLoadedLocked(now); err != nil {
 			return err
 		}
-		for i := range records {
-			if !idSet[records[i].event.ID] {
+		for i := range s.records {
+			if !idSet[s.records[i].event.ID] {
 				continue
 			}
-			if records[i].event.Attempts > 0 {
-				records[i].event.Attempts--
+			if s.records[i].event.Attempts > 0 {
+				s.records[i].event.Attempts--
 			}
-			records[i].event.Status = StatusQueued
-			records[i].updatedAt = now.UTC()
-			records[i].notBefore = now.UTC().Add(cooldown)
+			s.records[i].event.Status = StatusQueued
+			s.records[i].updatedAt = now.UTC()
+			s.records[i].notBefore = now.UTC().Add(cooldown)
 		}
-		return s.writeStateUnlocked(records, now)
+		return s.writeStateLocked(now)
 	})
 }
 
 func (s *inboxStore) list(now time.Time) ([]InboxEvent, error) {
 	var out []InboxEvent
 	err := store.WithFlock(s.lockPath(), false, func() error {
-		records, _, err := s.loadUnlocked(now)
-		if err != nil {
+		s.mu.Lock()
+		defer s.mu.Unlock()
+
+		if err := s.ensureLoadedLocked(now); err != nil {
 			return err
 		}
-		out = extractEvents(records)
+		out = extractEvents(s.records)
 		return nil
 	})
 	return out, err
 }
 
-func (s *inboxStore) loadUnlocked(now time.Time) ([]syncedInboxRecord, map[string]string, error) {
+func (s *inboxStore) hasActiveOrQueuedWork(now time.Time) bool {
+	var busy bool
+	_ = store.WithFlock(s.lockPath(), false, func() error {
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		if err := s.ensureLoadedLocked(now); err != nil {
+			return nil
+		}
+		for _, r := range s.records {
+			if r.event.Status == StatusQueued || r.event.Status == StatusRunning {
+				busy = true
+				return nil
+			}
+		}
+		return nil
+	})
+	return busy
+}
+
+// compact 定期压缩已终态 (`done`/`failed`) 且超出有界保留窗口的队列记录，原子重写 `inbox.jsonl` 与 `inbox.state.toml`。
+func (s *inboxStore) compact(now time.Time) (int, error) {
+	var removed int
+	err := store.WithFlock(s.lockPath(), true, func() error {
+		s.mu.Lock()
+		defer s.mu.Unlock()
+
+		if err := s.ensureLoadedLocked(now); err != nil {
+			return err
+		}
+		n, err := s.compactLocked(now)
+		removed = n
+		return err
+	})
+	return removed, err
+}
+
+func (s *inboxStore) maybeCompact(now time.Time) (int, error) {
+	s.mu.Lock()
+	needs := s.loaded && s.countTerminalLocked() > s.maxTerminalRetained
+	s.mu.Unlock()
+	if !needs {
+		return 0, nil
+	}
+	return s.compact(now)
+}
+
+func (s *inboxStore) countTerminalLocked() int {
+	cnt := 0
+	for _, r := range s.records {
+		if r.event.Status == StatusDone || r.event.Status == StatusFailed {
+			cnt++
+		}
+	}
+	return cnt
+}
+
+func (s *inboxStore) compactLocked(now time.Time) (int, error) {
+	terminalTotal := s.countTerminalLocked()
+	if terminalTotal <= s.maxTerminalRetained {
+		return 0, nil
+	}
+	dropCount := terminalTotal - s.maxTerminalRetained
+	dropped := 0
+
+	kept := make([]syncedInboxRecord, 0, len(s.records)-dropCount)
+	seen := make(map[string]string, len(s.records)-dropCount)
+	for _, r := range s.records {
+		isTerminal := r.event.Status == StatusDone || r.event.Status == StatusFailed
+		if isTerminal && dropped < dropCount {
+			dropped++
+			continue
+		}
+		kept = append(kept, r)
+		if sk := makeSourceDedupKey(r.event.Source, r.event.SourceID); sk != "" {
+			seen[sk] = r.event.ID
+		}
+	}
+
+	var buf bytes.Buffer
+	for _, r := range kept {
+		line, err := store.MarshalJSONLine(r.event)
+		if err != nil {
+			return 0, fmt.Errorf("marshal compacted inbox event: %w", err)
+		}
+		buf.Write(line)
+	}
+	if err := store.AtomicWriteFile(s.jsonlPath(), buf.Bytes(), 0o600); err != nil {
+		return 0, err
+	}
+
+	s.records = kept
+	s.seenSources = seen
+	if err := s.writeStateLocked(now); err != nil {
+		return 0, err
+	}
+	s.refreshDiskStatLocked()
+	return dropped, nil
+}
+
+func (s *inboxStore) ensureLoadedLocked(now time.Time) error {
+	jMod, jSize := statSignature(s.jsonlPath())
+	sMod, sSize := statSignature(s.statePath())
+	if s.loaded &&
+		s.jsonlModNano == jMod && s.jsonlSize == jSize &&
+		s.stateModNano == sMod && s.stateSize == sSize {
+		return nil
+	}
+
+	records, seenSources, err := s.loadFromDiskLocked(now)
+	if err != nil {
+		return err
+	}
+	s.records = records
+	s.seenSources = seenSources
+	s.loaded = true
+	s.jsonlModNano = jMod
+	s.jsonlSize = jSize
+	s.stateModNano = sMod
+	s.stateSize = sSize
+	return nil
+}
+
+func (s *inboxStore) loadFromDiskLocked(now time.Time) ([]syncedInboxRecord, map[string]string, error) {
 	stateByID := make(map[string]inboxItemState)
 	if rawState, err := os.ReadFile(s.statePath()); err == nil && len(bytes.TrimSpace(rawState)) > 0 {
 		var doc inboxStateDoc
@@ -489,7 +644,6 @@ func (s *inboxStore) loadUnlocked(now time.Time) ([]syncedInboxRecord, map[strin
 			} else {
 				if srcKey != "" {
 					if ownerID, dup := seenSources[srcKey]; dup && ownerID != ev.ID {
-						// Ignore duplicate (source, source_id) entries in inbox.jsonl.
 						if errors.Is(rErr, io.EOF) {
 							break
 						}
@@ -539,12 +693,12 @@ func (s *inboxStore) loadUnlocked(now time.Time) ([]syncedInboxRecord, map[strin
 	return records, seenSources, nil
 }
 
-func (s *inboxStore) writeStateUnlocked(records []syncedInboxRecord, now time.Time) error {
+func (s *inboxStore) writeStateLocked(now time.Time) error {
 	doc := inboxStateDoc{
 		UpdatedAt: now.UTC(),
-		Items:     make([]inboxItemState, len(records)),
+		Items:     make([]inboxItemState, len(s.records)),
 	}
-	for i, r := range records {
+	for i, r := range s.records {
 		upd := r.updatedAt
 		if upd.IsZero() {
 			upd = now.UTC()
@@ -569,14 +723,24 @@ func (s *inboxStore) writeStateUnlocked(records []syncedInboxRecord, now time.Ti
 	if err != nil {
 		return fmt.Errorf("marshal inbox.state.toml: %w", err)
 	}
-	return store.AtomicWriteFile(s.statePath(), encoded, 0o600)
+	if err := store.AtomicWriteFile(s.statePath(), encoded, 0o600); err != nil {
+		return err
+	}
+	s.refreshDiskStatLocked()
+	return nil
+}
+
+func (s *inboxStore) refreshDiskStatLocked() {
+	s.jsonlModNano, s.jsonlSize = statSignature(s.jsonlPath())
+	s.stateModNano, s.stateSize = statSignature(s.statePath())
+	s.loaded = true
 }
 
 func normalizeNewInboxEvent(ev InboxEvent, now time.Time) InboxEvent {
 	cp := cloneInboxEvent(ev)
 	cp.ID = strings.TrimSpace(cp.ID)
 	if cp.ID == "" {
-		cp.ID = fmt.Sprintf("ev_%d_%s", now.UTC().UnixMilli(), randomHex(6))
+		cp.ID = fmt.Sprintf("ev_%d_%s", now.UTC().UnixMilli(), store.RandomHex(6))
 	}
 	cp.Source = strings.TrimSpace(cp.Source)
 	if cp.Source == "" {
@@ -673,42 +837,4 @@ func cloneInboxEvent(ev InboxEvent) InboxEvent {
 		}
 	}
 	return cp
-}
-
-func appendJSONLineNoEscape(path string, v any) error {
-	var buf bytes.Buffer
-	enc := json.NewEncoder(&buf)
-	enc.SetEscapeHTML(false)
-	if err := enc.Encode(v); err != nil {
-		return err
-	}
-	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
-		return fmt.Errorf("create parent dir for %s: %w", path, err)
-	}
-	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
-	if err != nil {
-		return fmt.Errorf("open append %s: %w", path, err)
-	}
-	data := buf.Bytes()
-	for len(data) > 0 {
-		n, wErr := f.Write(data)
-		if wErr != nil {
-			_ = f.Close()
-			return fmt.Errorf("write %s: %w", path, wErr)
-		}
-		data = data[n:]
-	}
-	if sErr := f.Sync(); sErr != nil {
-		_ = f.Close()
-		return fmt.Errorf("sync %s: %w", path, sErr)
-	}
-	return f.Close()
-}
-
-func randomHex(numBytes int) string {
-	b := make([]byte, numBytes)
-	if _, err := rand.Read(b); err != nil {
-		return fmt.Sprintf("%012x", idFallbackSeq.Add(1))
-	}
-	return hex.EncodeToString(b)
 }

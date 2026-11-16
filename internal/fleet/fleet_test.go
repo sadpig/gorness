@@ -1596,3 +1596,635 @@ func TestWorktreePoolSeatbeltStrictGitStatusWriteDeniesAndHostGitSafety(t *testi
 		t.Fatalf("SECURITY VIOLATION: host git executed malicious .git/hooks/pre-commit!")
 	}
 }
+
+func emitGenericToolCallTurn(callID, toolName string, input map[string]any) (<-chan llm.StreamEvent, error) {
+	rawArgs, _ := json.Marshal(input)
+	ch := make(chan llm.StreamEvent, 4)
+	ch <- llm.StreamEvent{
+		Type:       llm.StreamToolCall,
+		ToolCallID: callID,
+		ToolName:   toolName,
+		ToolInput:  rawArgs,
+	}
+	ch <- llm.StreamEvent{
+		Type:         llm.StreamDone,
+		StopReason:   "tool_use",
+		InputTokens:  90,
+		OutputTokens: 45,
+	}
+	close(ch)
+	return ch, nil
+}
+
+func TestBlackboardDeduplicationSnapshotOmitsTasksNotesAndStaticMissionMD(t *testing.T) {
+	vaultDir := filepath.Join(t.TempDir(), "vault")
+	paths := config.VaultPaths{Root: vaultDir}
+
+	bb, err := NewMarkdownBlackboard(paths, "ws-dedup-1", "msn-dedup-1")
+	if err != nil {
+		t.Fatalf("NewMarkdownBlackboard: %v", err)
+	}
+
+	now := time.Now().UTC().Truncate(time.Second)
+	snap := &MissionSnapshot{
+		ID:          "msn-dedup-1",
+		WorkspaceID: "ws-dedup-1",
+		WorkflowID:  "hybrid-fleet",
+		Goal:        "Deduplicate snapshot.toml and MISSION.md storage",
+		Topology:    TopoHybridFleet,
+		Status:      MissionRunning,
+		Nodes: []FleetNode{
+			{ID: "coder", Label: "Coder", RoleID: "coder", Status: NodeRunning, Tokens: 10, UpdatedAt: now},
+		},
+		Edges:     []FleetEdge{{From: "lead", To: "coder", Kind: "dispatch"}},
+		CreatedAt: now,
+		UpdatedAt: now,
+	}
+	if err := bb.InitMission(snap); err != nil {
+		t.Fatalf("InitMission: %v", err)
+	}
+
+	initialMissionMD, err := os.ReadFile(bb.MissionMD())
+	if err != nil {
+		t.Fatalf("ReadFile MISSION.md: %v", err)
+	}
+
+	if _, err := bb.CreateTask("task-1", "", "Task One", "Implement part one", 0); err != nil {
+		t.Fatalf("CreateTask: %v", err)
+	}
+	if _, err := bb.AddNote("coder", "Design Note", "Keep snapshot.toml task-free"); err != nil {
+		t.Fatalf("AddNote: %v", err)
+	}
+
+	// Simulate live runtime SaveSnapshot while Status == MissionRunning (carrying in-memory Tasks/Notes slices).
+	snap.Nodes[0].Tokens = 777
+	snap.Tasks = []BlackboardTask{{ID: "task-1", Title: "Task One", Status: TaskClaimed}}
+	snap.Notes = []BlackboardNote{{ID: "0001-coder", Seq: 1, NodeID: "coder", Body: "Keep snapshot.toml task-free"}}
+	if err := bb.SaveSnapshot(snap); err != nil {
+		t.Fatalf("SaveSnapshot running: %v", err)
+	}
+
+	// 1. snapshot.toml MUST NOT duplicate Tasks or Notes!
+	rawSnapTOML, err := os.ReadFile(bb.SnapshotFile())
+	if err != nil {
+		t.Fatalf("ReadFile snapshot.toml: %v", err)
+	}
+	snapTOMLStr := string(rawSnapTOML)
+	if strings.Contains(snapTOMLStr, "[[tasks]]") || strings.Contains(snapTOMLStr, "[[notes]]") || strings.Contains(snapTOMLStr, "Task One") {
+		t.Fatalf("expected snapshot.toml to omit duplicated Tasks/Notes slices, got:\n%s", snapTOMLStr)
+	}
+
+	// 2. Live running SaveSnapshot MUST NOT rewrite static MISSION.md!
+	liveMissionMD, err := os.ReadFile(bb.MissionMD())
+	if err != nil {
+		t.Fatalf("ReadFile MISSION.md after live SaveSnapshot: %v", err)
+	}
+	if string(liveMissionMD) != string(initialMissionMD) {
+		t.Fatalf("expected MISSION.md to stay untouched during live running SaveSnapshot")
+	}
+
+	// 3. LoadSnapshot loads live DAG state from snapshot.toml + Tasks/Notes from tasks/*.md & notes/*.md!
+	loaded, err := bb.LoadSnapshot()
+	if err != nil {
+		t.Fatalf("LoadSnapshot: %v", err)
+	}
+	if loaded.Nodes[0].Tokens != 777 || len(loaded.Tasks) != 1 || len(loaded.Notes) != 1 {
+		t.Fatalf("unexpected loaded snapshot: nodes=%+v tasks=%+v notes=%+v", loaded.Nodes, loaded.Tasks, loaded.Notes)
+	}
+
+	// 4. Terminal SaveSnapshot updates MISSION.md with final synthesis markdown (still without Tasks/Notes).
+	snap.Status = MissionCompleted
+	snap.Summary = "All specialist patches verified and landed."
+	if err := bb.SaveSnapshot(snap); err != nil {
+		t.Fatalf("SaveSnapshot completed: %v", err)
+	}
+	finalMissionMD, err := os.ReadFile(bb.MissionMD())
+	if err != nil {
+		t.Fatalf("ReadFile final MISSION.md: %v", err)
+	}
+	if !strings.Contains(string(finalMissionMD), "## Summary") || !strings.Contains(string(finalMissionMD), "All specialist patches verified and landed.") {
+		t.Fatalf("expected final synthesis summary in MISSION.md, got:\n%s", string(finalMissionMD))
+	}
+	if strings.Contains(string(finalMissionMD), "[[tasks]]") || strings.Contains(string(finalMissionMD), "[[notes]]") {
+		t.Fatalf("MISSION.md must not duplicate Tasks/Notes, got:\n%s", string(finalMissionMD))
+	}
+}
+
+func TestBlackboardExtraToolsPeerNotePromptInjectionAndDisjointCoderTasks(t *testing.T) {
+	var (
+		mu           sync.Mutex
+		coderPrompts = make(map[string]string)
+		leadStep     atomic.Int32
+		boardStep    atomic.Int32
+	)
+
+	streamer := llm.StreamerFunc(func(ctx context.Context, req llm.Request) (<-chan llm.StreamEvent, error) {
+		promptText := flattenHistoryText(req.History)
+
+		if strings.Contains(req.StaticSystem, "Adversarial Verifier") || req.Provider.ID == "openai" {
+			return emitTextTurn("VERDICT: ACCEPT\nVerified disjoint specialist tasks and blackboard tools.", 80, 20)
+		}
+
+		// Part B: Shared-board worker exercising blackboard_split_task, blackboard_read_notes, blackboard_post_note, blackboard_complete_task, blackboard_claim_task
+		if strings.Contains(promptText, "BB_EXTRA_TOOLS_MISSION") {
+			if strings.Contains(req.StaticSystem, "Lead Architect") {
+				return emitTextTurn("TASK: Parent Board Epic", 50, 20)
+			}
+			step := boardStep.Add(1)
+			switch step {
+			case 1:
+				return emitGenericToolCallTurn("bb_1", "blackboard_post_note", map[string]any{
+					"title": "Worker Coordination Note",
+					"body":  "Splitting epic into child unit.",
+				})
+			case 2:
+				return emitGenericToolCallTurn("bb_2", "blackboard_read_notes", map[string]any{
+					"limit": 5,
+				})
+			case 3:
+				return emitGenericToolCallTurn("bb_3", "blackboard_split_task", map[string]any{
+					"task_id": "task-1",
+					"subtasks": []map[string]any{
+						{"id": "task-1-sub", "title": "Leaf Subtask Unit", "description": "Implement leaf subtask"},
+					},
+				})
+			case 4:
+				return emitTextTurn("Split parent task via blackboard_split_task tool.", 40, 15)
+			case 5:
+				// Next round worker claims task-1-sub automatically; exercise blackboard_claim_task (returns false since none left open) + blackboard_complete_task
+				return emitGenericToolCallTurn("bb_4", "blackboard_claim_task", map[string]any{})
+			case 6:
+				return emitGenericToolCallTurn("bb_5", "blackboard_complete_task", map[string]any{
+					"task_id": "task-1-sub",
+					"summary": "Completed leaf subtask via blackboard_complete_task tool.",
+				})
+			default:
+				return emitTextTurn("Finished leaf subtask.", 40, 15)
+			}
+		}
+
+		// Part A: Hybrid-fleet Lead + Explorer + 2 parallel Coders receiving disjoint task briefs + peer notes!
+		if strings.Contains(req.StaticSystem, "Lead Architect") {
+			if leadStep.Add(1) == 1 {
+				return emitGenericToolCallTurn("lead_note_1", "blackboard_post_note", map[string]any{
+					"title": "API Error Contract",
+					"body":  "Use ErrTokenExpired sentinel across auth & limiter.",
+				})
+			}
+			return emitTextTurn(
+				"TASK: Auth Validator Slice :: Implement JWT validator in auth_slice.go\nTASK: Rate Limiter Slice :: Implement token bucket in limiter_slice.go",
+				90, 40,
+			)
+		}
+		if strings.Contains(req.StaticSystem, "Fast Explorer") {
+			return emitTextTurn("Recon complete: base.go exposes BaseValue().", 60, 20)
+		}
+
+		if strings.Contains(promptText, "node=coder_a") {
+			mu.Lock()
+			coderPrompts["coder_a"] = promptText
+			mu.Unlock()
+		} else if strings.Contains(promptText, "node=coder_b") {
+			mu.Lock()
+			coderPrompts["coder_b"] = promptText
+			mu.Unlock()
+		}
+		return emitTextTurn("Implemented assigned disjoint slice.", 70, 25)
+	})
+
+	mgr, _, cfgMgr, ws, _ := setupTestFleet(t, streamer, nil)
+
+	// Register custom 2-coder hybrid workflow to test disjoint task assignment in TopoHybridFleet.
+	customWF := `id = "hybrid-two-coders"
+name = "Hybrid Two Coders"
+topology = "hybrid-fleet"
+max_concurrency = 4
+use_worktrees = false
+max_rounds = 2
+
+[[nodes]]
+id = "lead"
+label = "Lead Architect"
+role = "lead"
+
+[[nodes]]
+id = "explorer"
+label = "Fast Explorer"
+role = "explorer"
+
+[[nodes]]
+id = "coder_a"
+label = "Coder Alpha"
+role = "coder"
+
+[[nodes]]
+id = "coder_b"
+label = "Coder Beta"
+role = "coder"
+
+[[nodes]]
+id = "verifier"
+label = "Verifier"
+role = "verifier"
+`
+	wfPath := filepath.Join(cfgMgr.Paths().WorkflowsDir(), "hybrid-two-coders.toml")
+	if err := store.AtomicWriteFile(wfPath, []byte(customWF), 0o600); err != nil {
+		t.Fatalf("write custom workflow: %v", err)
+	}
+	if _, err := cfgMgr.Reload(); err != nil {
+		t.Fatalf("Reload config: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	noWT := false
+	snapA, streamA, err := mgr.StartMission(ctx, MissionRequest{
+		WorkspaceID:  ws.ID,
+		WorkflowID:   "hybrid-two-coders",
+		Goal:         "DISJOINT_HYBRID_GOAL",
+		UseWorktrees: &noWT,
+	})
+	if err != nil {
+		t.Fatalf("StartMission hybrid-two-coders: %v", err)
+	}
+	_ = collectMissionEvents(streamA)
+
+	finalA, err := mgr.GetMission(ws.ID, snapA.ID)
+	if err != nil || finalA.Status != MissionCompleted {
+		t.Fatalf("expected hybrid-two-coders completed, got %+v (err=%v)", finalA, err)
+	}
+
+	mu.Lock()
+	promptA := coderPrompts["coder_a"]
+	promptB := coderPrompts["coder_b"]
+	mu.Unlock()
+
+	if !strings.Contains(promptA, "Assigned Disjoint Task [task-hybrid-1]: Auth Validator Slice") ||
+		!strings.Contains(promptA, "Task Brief:\nImplement JWT validator in auth_slice.go") ||
+		strings.Contains(promptA, "Assigned Disjoint Task [task-hybrid-2]") {
+		t.Fatalf("expected coder_a to receive disjoint task-hybrid-1 (Auth Validator Slice), got:\n%s", promptA)
+	}
+	if !strings.Contains(promptB, "Assigned Disjoint Task [task-hybrid-2]: Rate Limiter Slice") ||
+		!strings.Contains(promptB, "Task Brief:\nImplement token bucket in limiter_slice.go") ||
+		strings.Contains(promptB, "Assigned Disjoint Task [task-hybrid-1]") {
+		t.Fatalf("expected coder_b to receive disjoint task-hybrid-2 (Rate Limiter Slice), got:\n%s", promptB)
+	}
+	for id, p := range map[string]string{"coder_a": promptA, "coder_b": promptB} {
+		if !strings.Contains(p, "<peer_blackboard_notes>") || !strings.Contains(p, "ErrTokenExpired") {
+			t.Fatalf("expected specialist %s prompt to inject peer BlackboardNote summary, got:\n%s", id, p)
+		}
+	}
+
+	// Part B: Run 1-worker shared-board mission exercising all 5 ExtraTools!
+	singleBoardWF := `id = "board-single-tools"
+name = "Board Single Tools"
+topology = "shared-board"
+max_concurrency = 1
+use_worktrees = false
+
+[[nodes]]
+id = "lead"
+label = "Lead"
+role = "lead"
+
+[[nodes]]
+id = "worker_1"
+label = "Worker 1"
+role = "coder"
+`
+	if err := store.AtomicWriteFile(filepath.Join(cfgMgr.Paths().WorkflowsDir(), "board-single-tools.toml"), []byte(singleBoardWF), 0o600); err != nil {
+		t.Fatalf("write board-single-tools.toml: %v", err)
+	}
+	if _, err := cfgMgr.Reload(); err != nil {
+		t.Fatalf("Reload config 2: %v", err)
+	}
+
+	snapB, streamB, err := mgr.StartMission(ctx, MissionRequest{
+		WorkspaceID:  ws.ID,
+		WorkflowID:   "board-single-tools",
+		Goal:         "BB_EXTRA_TOOLS_MISSION",
+		UseWorktrees: &noWT,
+	})
+	if err != nil {
+		t.Fatalf("StartMission board-single-tools: %v", err)
+	}
+	_ = collectMissionEvents(streamB)
+
+	finalB, err := mgr.GetMission(ws.ID, snapB.ID)
+	if err != nil || finalB.Status != MissionCompleted {
+		t.Fatalf("expected board-single-tools completed, got %+v (err=%v)", finalB, err)
+	}
+	foundSplit := false
+	foundSubDone := false
+	for _, tk := range finalB.Tasks {
+		if tk.ID == "task-1" && tk.Status == TaskSplit {
+			foundSplit = true
+		}
+		if tk.ID == "task-1-sub" && tk.Status == TaskCompleted {
+			foundSubDone = true
+		}
+	}
+	if !foundSplit || !foundSubDone {
+		t.Fatalf("expected task-1 split and task-1-sub completed via ExtraTools, got %+v", finalB.Tasks)
+	}
+}
+
+func TestActiveWitnessSteerBeforeCancelRequeueApprovalBridgingAndSystemEvents(t *testing.T) {
+	var (
+		coderAttempts atomic.Int32
+		sawFleetSysEv atomic.Bool
+	)
+
+	streamer := llm.StreamerFunc(func(ctx context.Context, req llm.Request) (<-chan llm.StreamEvent, error) {
+		promptText := flattenHistoryText(req.History)
+		if strings.Contains(req.StaticSystem, "Adversarial Verifier") || req.Provider.ID == "openai" {
+			return emitTextTurn("VERDICT: ACCEPT\nClean.", 40, 15)
+		}
+		if strings.Contains(req.StaticSystem, "Lead Architect") || strings.Contains(req.StaticSystem, "Fast Explorer") {
+			return emitTextTurn("TASK: Test Witness & Approvals", 40, 15)
+		}
+
+		// Approval bridging mission
+		if strings.Contains(promptText, "APPROVAL_BRIDGE_GOAL") {
+			if historyHasToolResult(req.History) {
+				return emitTextTurn("Approved command finished.", 40, 15)
+			}
+			return emitGenericToolCallTurn("call_ask_cmd", "run_command", map[string]any{
+				"command": "git push --dry-run",
+			})
+		}
+
+		// Witness 2-stall cancel + requeue recovery mission:
+		// Attempt 1 hangs until Witness steers once AND then cancels on 2nd stall; Attempt 2 succeeds immediately!
+		if strings.Contains(promptText, "WITNESS_REQUEUE_GOAL") {
+			att := coderAttempts.Add(1)
+			if att == 1 {
+				ch := make(chan llm.StreamEvent)
+				go func() {
+					<-ctx.Done()
+					close(ch)
+				}()
+				return ch, nil
+			}
+			return emitTextTurn("Recovered cleanly on Witness requeue attempt #2.", 50, 20)
+		}
+
+		return emitTextTurn("ok", 20, 10)
+	})
+
+	_, eng, cfgMgr, ws, _ := setupTestFleet(t, streamer, nil)
+	mgr, err := NewManager(ManagerOptions{
+		Config:        cfgMgr,
+		Engine:        eng,
+		StallTimeout:  75 * time.Millisecond,
+		CheckInterval: 20 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatalf("NewManager with short StallTimeout: %v", err)
+	}
+	defer func() { _ = mgr.Close() }()
+
+	globalCh, unsubGlobal := eng.SubscribeGlobal()
+	defer unsubGlobal()
+	go func() {
+		for ev := range globalCh {
+			if ev.Type == core.EventFleetUpdated {
+				sawFleetSysEv.Store(true)
+			}
+		}
+	}()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	noWT := false
+
+	// 1. Test Witness 1st-stall Steer -> 2nd-stall StopRun + task release -> automatic requeue success!
+	snapW, streamW, err := mgr.StartMission(ctx, MissionRequest{
+		WorkspaceID:  ws.ID,
+		Topology:     TopoReviewLoop,
+		Goal:         "WITNESS_REQUEUE_GOAL",
+		UseWorktrees: &noWT,
+	})
+	if err != nil {
+		t.Fatalf("StartMission WITNESS_REQUEUE_GOAL: %v", err)
+	}
+	eventsW := collectMissionEvents(streamW)
+	finalW, err := mgr.GetMission(ws.ID, snapW.ID)
+	if err != nil || finalW.Status != MissionCompleted {
+		t.Fatalf("expected WITNESS_REQUEUE_GOAL to recover and complete, got %+v (err=%v)", finalW, err)
+	}
+	if coderAttempts.Load() < 2 {
+		t.Fatalf("expected Witness to cancel stalled attempt #1 and requeue attempt #2, attempts=%d", coderAttempts.Load())
+	}
+	stallEvents := 0
+	for _, ev := range eventsW {
+		if ev.Type == EventNodeStalled {
+			stallEvents++
+		}
+	}
+	if stallEvents < 2 {
+		t.Fatalf("expected >=2 EventNodeStalled events (1st steer + 2nd cancel/requeue), got %d", stallEvents)
+	}
+
+	// 2. Test EventApprovalRequired bridging into MissionEvent (with Witness paused so human wait doesn't stall!)
+	snapApp, streamApp, err := mgr.StartMission(ctx, MissionRequest{
+		WorkspaceID:  ws.ID,
+		Topology:     TopoReviewLoop,
+		Goal:         "APPROVAL_BRIDGE_GOAL",
+		PermMode:     core.PermModeAsk,
+		UseWorktrees: &noWT,
+	})
+	if err != nil {
+		t.Fatalf("StartMission APPROVAL_BRIDGE_GOAL: %v", err)
+	}
+
+	sawApprovalMissionEv := false
+	for ev := range streamApp {
+		if ev.Type == EventApprovalRequired {
+			sawApprovalMissionEv = true
+			// Wait > SettleWindow (500ms) AND >7x StallTimeout (75ms) before resolving,
+			// proving Witness is paused during human approval wait and respecting 500ms settle lock!
+			time.Sleep(550 * time.Millisecond)
+			for _, pending := range eng.Broker().ListPending(ws.ID) {
+				if rErr := eng.Broker().Deny(pending.ID, "denied in test"); rErr != nil {
+					t.Errorf("Broker.Deny(%s): %v", pending.ID, rErr)
+				}
+			}
+		}
+	}
+	if !sawApprovalMissionEv {
+		t.Fatal("expected core.EventApprovalRequired to bridge into MissionEvent(approval_required)")
+	}
+	finalApp, err := mgr.GetMission(ws.ID, snapApp.ID)
+	if err != nil || finalApp.Status != MissionCompleted {
+		t.Fatalf("expected APPROVAL_BRIDGE_GOAL mission to complete after approval resolution, got %+v (err=%v)", finalApp, err)
+	}
+	if !sawFleetSysEv.Load() {
+		t.Fatal("expected core.EventFleetUpdated to be published on Engine global event bus")
+	}
+}
+
+func TestStartupCrashRecoveryDeleteMissionAndSessionWorktreeDiffAndLand(t *testing.T) {
+	blockCh := make(chan struct{})
+	streamer := llm.StreamerFunc(func(ctx context.Context, req llm.Request) (<-chan llm.StreamEvent, error) {
+		promptText := flattenHistoryText(req.History)
+		if strings.Contains(promptText, "HOLD_RUNNING_MISSION") {
+			ch := make(chan llm.StreamEvent)
+			go func() {
+				select {
+				case <-blockCh:
+				case <-ctx.Done():
+				}
+				close(ch)
+			}()
+			return ch, nil
+		}
+		return emitTextTurn("VERDICT: ACCEPT\nok", 30, 10)
+	})
+
+	mgr1, eng, cfgMgr, ws, repoDir := setupTestFleet(t, streamer, nil)
+	_ = mgr1.Close()
+
+	// 1. Seed a stale "running" mission + claimed task simulating a prior daemon crash.
+	crashedBB, err := NewMarkdownBlackboard(cfgMgr.Paths(), ws.ID, "msn-crashed-1")
+	if err != nil {
+		t.Fatalf("NewMarkdownBlackboard: %v", err)
+	}
+	now := time.Now().UTC()
+	if err := crashedBB.InitMission(&MissionSnapshot{
+		ID:          "msn-crashed-1",
+		WorkspaceID: ws.ID,
+		WorkflowID:  "hybrid-fleet",
+		Goal:        "Simulated crashed mission",
+		Topology:    TopoHybridFleet,
+		Status:      MissionRunning,
+		Nodes: []FleetNode{
+			{ID: "coder", Label: "Coder", RoleID: "coder", Status: NodeRunning, ActiveRunID: "run_dead_1", UpdatedAt: now},
+		},
+		CreatedAt: now,
+		UpdatedAt: now,
+	}); err != nil {
+		t.Fatalf("InitMission crashed: %v", err)
+	}
+	if _, err := crashedBB.CreateTask("task-orphan-1", "", "Orphan Task", "desc", 0); err != nil {
+		t.Fatalf("CreateTask orphan: %v", err)
+	}
+	if _, _, err := crashedBB.ClaimTask("task-orphan-1", "coder", "gorness/fleet/msn-crashed-1/coder"); err != nil {
+		t.Fatalf("ClaimTask orphan: %v", err)
+	}
+
+	// Boot a fresh Manager -> startup recovery MUST mark msn-crashed-1 as "interrupted" and release task-orphan-1!
+	mgr, err := NewManager(ManagerOptions{
+		Config: cfgMgr,
+		Engine: eng,
+	})
+	if err != nil {
+		t.Fatalf("NewManager recovery: %v", err)
+	}
+	defer func() {
+		close(blockCh)
+		_ = mgr.Close()
+	}()
+
+	if mgr.Pool() == nil || mgr.Refinery() == nil {
+		t.Fatal("expected non-nil mgr.Pool() and mgr.Refinery()")
+	}
+
+	recovered, err := mgr.GetMission(ws.ID, "msn-crashed-1")
+	if err != nil {
+		t.Fatalf("GetMission msn-crashed-1: %v", err)
+	}
+	if recovered.Status != MissionInterrupted {
+		t.Fatalf("expected stale running mission to be marked %q on startup, got %q", MissionInterrupted, recovered.Status)
+	}
+	if len(recovered.Nodes) != 1 || recovered.Nodes[0].Status != NodeCancelled || recovered.Nodes[0].ActiveRunID != "" {
+		t.Fatalf("expected crashed node to be cancelled with cleared ActiveRunID, got %+v", recovered.Nodes)
+	}
+	if len(recovered.Tasks) != 1 || recovered.Tasks[0].Status != TaskOpen || recovered.Tasks[0].OwnerNodeID != "" {
+		t.Fatalf("expected stranded claimed task to be released to open, got %+v", recovered.Tasks)
+	}
+
+	// 2. DeleteMission must succeed on interrupted/finished mission and remove directory!
+	if err := mgr.DeleteMission("msn-crashed-1"); err != nil {
+		t.Fatalf("DeleteMission interrupted: %v", err)
+	}
+	if _, err := mgr.GetMission(ws.ID, "msn-crashed-1"); !errors.Is(err, ErrMissionNotFound) {
+		t.Fatalf("expected ErrMissionNotFound after DeleteMission, got %v", err)
+	}
+
+	// DeleteMission must REFUSE while a mission is actively running, then succeed once stopped!
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	noWT := false
+	liveSnap, liveStream, err := mgr.StartMission(ctx, MissionRequest{
+		MissionID:    "msn-live-guard",
+		WorkspaceID:  ws.ID,
+		Topology:     TopoReviewLoop,
+		Goal:         "HOLD_RUNNING_MISSION",
+		UseWorktrees: &noWT,
+	})
+	if err != nil {
+		t.Fatalf("StartMission live: %v", err)
+	}
+	if err := mgr.DeleteMission(liveSnap.ID); err == nil {
+		t.Fatal("expected DeleteMission to refuse deleting an actively running mission")
+	}
+	if err := mgr.StopMission(ws.ID, liveSnap.ID); err != nil {
+		t.Fatalf("StopMission: %v", err)
+	}
+	_ = collectMissionEvents(liveStream)
+	if err := mgr.DeleteMission(liveSnap.ID); err != nil {
+		t.Fatalf("DeleteMission after StopMission: %v", err)
+	}
+
+	// 3. DiffSessionWorktree & LandSessionWorktree end-to-end verification!
+	sessLease, err := mgr.Pool().Acquire(ctx, repoDir, "sess_wt_demo", "chat_1", "main")
+	if err != nil {
+		t.Fatalf("Pool.Acquire session worktree: %v", err)
+	}
+	defer func() { _ = mgr.Pool().Release(ctx, sessLease, true) }()
+
+	// Clean worktree before edits -> dirty == false
+	cleanDiff, cleanDirty, err := mgr.DiffSessionWorktree(repoDir, sessLease.Path)
+	if err != nil || cleanDirty || strings.TrimSpace(cleanDiff) != "" {
+		t.Fatalf("expected clean session worktree (dirty=false), got dirty=%v diff=%q err=%v", cleanDirty, cleanDiff, err)
+	}
+
+	// Write a new Go file + test inside session worktree
+	if err := os.WriteFile(filepath.Join(sessLease.Path, "session_feat.go"), []byte("package fleetdemo\n\nfunc SessionAnswer() int {\n\treturn BaseValue() + 32\n}\n"), 0o644); err != nil {
+		t.Fatalf("write session_feat.go: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(sessLease.Path, "session_feat_test.go"), []byte("package fleetdemo\n\nimport \"testing\"\n\nfunc TestSessionAnswer(t *testing.T) {\n\tif SessionAnswer() != 42 {\n\t\tt.Fatalf(\"want 42\")\n\t}\n}\n"), 0o644); err != nil {
+		t.Fatalf("write session_feat_test.go: %v", err)
+	}
+
+	dirtyDiff, dirty, err := mgr.DiffSessionWorktree(repoDir, sessLease.Path)
+	if err != nil || !dirty || !strings.Contains(dirtyDiff, "SessionAnswer") {
+		t.Fatalf("expected dirty=true with SessionAnswer diff, got dirty=%v err=%v diff:\n%s", dirty, err, dirtyDiff)
+	}
+
+	report, err := mgr.LandSessionWorktree(ctx, repoDir, sessLease.Path, sessLease.Branch, "go test ./...")
+	if err != nil {
+		t.Fatalf("LandSessionWorktree error: %v", err)
+	}
+	if !report.Accepted || report.LandedCommit == "" {
+		t.Fatalf("expected LandSessionWorktree Accepted=true with LandedCommit, got %+v", report)
+	}
+	if _, err := os.Stat(filepath.Join(repoDir, "session_feat.go")); err != nil {
+		t.Fatalf("expected session_feat.go fast-forward merged into main workspace repo: %v", err)
+	}
+
+	afterDiff, afterDirty, err := mgr.DiffSessionWorktree(repoDir, sessLease.Path)
+	if err != nil || afterDirty || strings.TrimSpace(afterDiff) != "" {
+		t.Fatalf("expected session worktree clean relative to main after landing, got dirty=%v diff=%q err=%v", afterDirty, afterDiff, err)
+	}
+
+	// 4. Verify ZERO .json files anywhere inside vault!
+	_ = filepath.WalkDir(cfgMgr.Paths().Root, func(path string, d os.DirEntry, walkErr error) error {
+		if walkErr == nil && !d.IsDir() && strings.HasSuffix(strings.ToLower(d.Name()), ".json") {
+			t.Fatalf("INVARIANT VIOLATION: unexpected .json file created inside vault: %s", path)
+		}
+		return nil
+	})
+}

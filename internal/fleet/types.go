@@ -44,11 +44,12 @@ func ParseTopologyKind(raw string) (TopologyKind, error) {
 }
 
 const (
-	MissionPending   = "pending"
-	MissionRunning   = "running"
-	MissionCompleted = "completed"
-	MissionFailed    = "failed"
-	MissionCancelled = "cancelled"
+	MissionPending     = "pending"
+	MissionRunning     = "running"
+	MissionCompleted   = "completed"
+	MissionFailed      = "failed"
+	MissionCancelled   = "cancelled"
+	MissionInterrupted = "interrupted"
 
 	NodeIdle      = "idle"
 	NodeRunning   = "running"
@@ -79,6 +80,7 @@ const (
 	EventNodeDelta        = "node_delta"
 	EventNodeSteered      = "node_steered"
 	EventNodeStalled      = "node_stalled"
+	EventApprovalRequired = "approval_required"
 	EventEdgePulse        = "edge_pulse"
 	EventTaskUpdated      = "task_updated"
 	EventNoteAdded        = "note_added"
@@ -90,7 +92,11 @@ const (
 	EventMissionCompleted = "mission_completed"
 	EventMissionFailed    = "mission_failed"
 	EventMissionCancelled = "mission_cancelled"
+	EventMissionDeleted   = "mission_deleted"
 )
+
+// MergeReport 为 Refinery 合入门控报告类型别名（供 Fleet 与会话级 Worktree 合入共享）。
+type MergeReport = LandResult
 
 var (
 	ErrInvalidID       = store.ErrInvalidID
@@ -234,16 +240,13 @@ type MissionEvent struct {
 	Timestamp   time.Time        `json:"timestamp"`
 }
 
-// ValidateID 严格拦截路径分隔符、控制字符及 "." / ".." 穿越段，保护 missions/ 与 runtime/worktrees/ 边界。
+// ValidateID 复用 store.ValidateSafeID 并拦截任何内嵌 ".." 段，保护 missions/ 与 runtime/worktrees/ 边界。
 func ValidateID(id string) error {
-	trimmed := strings.TrimSpace(id)
-	if trimmed == "" || trimmed != id || id == "." || id == ".." || strings.Contains(id, "..") {
-		return fmt.Errorf("%w: %q", ErrInvalidID, id)
+	if err := store.ValidateSafeID(id); err != nil {
+		return err
 	}
-	for _, r := range id {
-		if r == '/' || r == '\\' || r < 0x20 || r == 0x7f {
-			return fmt.Errorf("%w: %q", ErrInvalidID, id)
-		}
+	if strings.Contains(id, "..") {
+		return fmt.Errorf("%w: %q", ErrInvalidID, id)
 	}
 	return nil
 }
@@ -263,7 +266,7 @@ func ensureStrictSubpath(baseDir, targetPath string) error {
 
 func isTerminalMissionStatus(status string) bool {
 	switch status {
-	case MissionCompleted, MissionFailed, MissionCancelled:
+	case MissionCompleted, MissionFailed, MissionCancelled, MissionInterrupted:
 		return true
 	default:
 		return false

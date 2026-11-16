@@ -5,6 +5,8 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+
+	"gorness.dev/gorness/internal/config"
 )
 
 const LaunchdLabel = "dev.gorness.daemon"
@@ -35,8 +37,8 @@ func GenerateLaunchdPlist(binPath, vaultRoot string) ([]byte, string) {
 		cleanVault = filepath.Join(homeDir, ".gorness")
 	}
 
-	stdoutLog := filepath.Join(cleanVault, "runtime", "logs", "daemon.stdout.log")
-	stderrLog := filepath.Join(cleanVault, "runtime", "logs", "daemon.stderr.log")
+	paths := config.VaultPaths{Root: cleanVault}
+	daemonLog := filepath.Join(paths.LogsDir(), "daemon.log")
 	plistPath := filepath.Join(homeDir, "Library", "LaunchAgents", LaunchdLabel+".plist")
 
 	var b strings.Builder
@@ -55,8 +57,8 @@ func GenerateLaunchdPlist(binPath, vaultRoot string) ([]byte, string) {
 	b.WriteString("\t<key>RunAtLoad</key>\n\t<true/>\n")
 	b.WriteString("\t<key>KeepAlive</key>\n\t<true/>\n")
 	b.WriteString("\t<key>ProcessType</key>\n\t<string>Background</string>\n")
-	fmt.Fprintf(&b, "\t<key>StandardOutPath</key>\n\t<string>%s</string>\n", escapePlistXML(stdoutLog))
-	fmt.Fprintf(&b, "\t<key>StandardErrorPath</key>\n\t<string>%s</string>\n", escapePlistXML(stderrLog))
+	fmt.Fprintf(&b, "\t<key>StandardOutPath</key>\n\t<string>%s</string>\n", escapePlistXML(daemonLog))
+	fmt.Fprintf(&b, "\t<key>StandardErrorPath</key>\n\t<string>%s</string>\n", escapePlistXML(daemonLog))
 	b.WriteString("</dict>\n")
 	b.WriteString("</plist>\n")
 
