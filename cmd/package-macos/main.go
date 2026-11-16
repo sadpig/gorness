@@ -385,24 +385,11 @@ func main() {
 		os.Exit(1)
 	}
 
-	fmt.Println("[5/6] Staging dist/Gorness.app...")
-	finalApp := filepath.Join(outDir, AppBundleName)
-	_ = os.RemoveAll(finalApp)
-	if err := runCmd(repoRoot, nil, "/usr/bin/ditto", "--norsrc", "--noextattr", stagedApp, finalApp); err != nil {
-		fmt.Fprintf(os.Stderr, "copy final app failed: %v\n", err)
-		os.Exit(1)
-	}
-	_ = runCmd(repoRoot, nil, "/usr/bin/xattr", "-cr", finalApp)
-	if err := runCmd(repoRoot, nil, "/usr/bin/codesign", "--verify", "--deep", "--strict", finalApp); err != nil {
-		fmt.Fprintf(os.Stderr, "verify dist app signature failed: %v\n", err)
-		os.Exit(1)
-	}
-
 	if !skipDMG {
-		fmt.Println("[6/6] Building drag-and-drop macOS Disk Image (.dmg)...")
+		fmt.Println("[5/6] Building drag-and-drop macOS Disk Image (.dmg) from clean signed bundle...")
 		dmgRoot := filepath.Join(tmpDir, "dmg-root")
 		_ = os.MkdirAll(dmgRoot, 0o755)
-		if err := runCmd(repoRoot, nil, "/usr/bin/ditto", "--norsrc", "--noextattr", finalApp, filepath.Join(dmgRoot, AppBundleName)); err != nil {
+		if err := runCmd(repoRoot, nil, "/bin/cp", "-R", stagedApp, filepath.Join(dmgRoot, AppBundleName)); err != nil {
 			fmt.Fprintf(os.Stderr, "stage dmg app: %v\n", err)
 			os.Exit(1)
 		}
@@ -416,15 +403,23 @@ func main() {
 		fmt.Printf("  ✓ DMG ready: %s\n", dmgPath)
 	}
 
+	fmt.Println("[6/6] Exporting dist/Gorness.app...")
+	finalApp := filepath.Join(outDir, AppBundleName)
+	_ = os.RemoveAll(finalApp)
+	if err := runCmd(repoRoot, nil, "/bin/cp", "-R", stagedApp, finalApp); err != nil {
+		fmt.Fprintf(os.Stderr, "copy final app failed: %v\n", err)
+		os.Exit(1)
+	}
+	_ = exec.Command("/usr/bin/xattr", "-d", "com.apple.FinderInfo", finalApp).Run()
+
 	if installApps {
 		destApp := filepath.Join("/Applications", AppBundleName)
-		fmt.Printf("[Install] Installing %s...\n", destApp)
+		fmt.Printf("[Install] Installing %s from clean signed bundle...\n", destApp)
 		_ = os.RemoveAll(destApp)
-		if err := runCmd(repoRoot, nil, "/usr/bin/ditto", "--norsrc", "--noextattr", finalApp, destApp); err != nil {
+		if err := runCmd(repoRoot, nil, "/bin/cp", "-R", stagedApp, destApp); err != nil {
 			fmt.Fprintf(os.Stderr, "install /Applications/Gorness.app failed: %v\n", err)
 			os.Exit(1)
 		}
-		_ = runCmd(repoRoot, nil, "/usr/bin/xattr", "-cr", destApp)
 		if err := runCmd(repoRoot, nil, "/usr/bin/codesign", "--verify", "--deep", "--strict", destApp); err != nil {
 			fmt.Fprintf(os.Stderr, "verify /Applications/Gorness.app signature failed: %v\n", err)
 			os.Exit(1)
