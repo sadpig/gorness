@@ -2,6 +2,7 @@ package config
 
 import (
 	"bytes"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strconv"
@@ -9,6 +10,33 @@ import (
 
 	"github.com/pelletier/go-toml/v2"
 )
+
+// ParseFrontmatterAs decodes Markdown +++ (TOML) or --- (TOML / YAML subset) frontmatter directly
+// into typed target struct T, returning (meta, body, err).
+func ParseFrontmatterAs[T any](raw string) (T, string, error) {
+	var out T
+	metaMap, body, err := ParseFrontmatterMD([]byte(raw))
+	if err != nil {
+		return out, "", err
+	}
+	if len(metaMap) == 0 {
+		return out, body, nil
+	}
+	encoded, err := toml.Marshal(metaMap)
+	if err == nil {
+		if uErr := toml.Unmarshal(encoded, &out); uErr == nil {
+			return out, body, nil
+		}
+	}
+	jsonBytes, jErr := json.Marshal(metaMap)
+	if jErr != nil {
+		return out, "", fmt.Errorf("marshal frontmatter map: %w", jErr)
+	}
+	if uErr := json.Unmarshal(jsonBytes, &out); uErr != nil {
+		return out, "", fmt.Errorf("unmarshal frontmatter struct: %w", uErr)
+	}
+	return out, body, nil
+}
 
 // ParseFrontmatterMD 解析支持 +++ (TOML) 与 --- (TOML 或 YAML 风格 key: value / 多行块标量 / 缩进子块) 头部元数据的 Markdown 文档。
 func ParseFrontmatterMD(raw []byte) (meta map[string]any, body string, err error) {

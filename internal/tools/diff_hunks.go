@@ -9,6 +9,7 @@ import (
 	"os"
 	"strings"
 
+	"gorness.dev/gorness/internal/config"
 	"gorness.dev/gorness/internal/store"
 )
 
@@ -226,9 +227,9 @@ func ApplySelectedHunks(
 
 	// 写入前执行原子前置哈希与规范路径二次校验，严防审批窗口期内发生外部修改或父目录软链掉包。
 	if staged.canonAbs != "" {
-		nowCanon, cErr := resolveCanonicalPath(staged.AbsPath, 0)
+		nowCanon, cErr := config.CanonicalPath(staged.AbsPath)
 		if cErr != nil {
-			return false, 0, cErr
+			return false, 0, wrapOnlyErr(cErr)
 		}
 		if nowCanon != staged.canonAbs {
 			return false, 0, fmt.Errorf("%w: canonical target changed before apply (%s -> %s)", ErrStalePrecondition, staged.canonAbs, nowCanon)
@@ -341,7 +342,7 @@ func buildStagedResult(
 	preconditionHash string,
 ) *StagedEdit {
 	hunks, spans := computeHunksAndSpans(relPath, kind, beforeBytes, proposedBytes)
-	canonAbs, _ := resolveCanonicalPath(absPath, 0)
+	canonAbs, _ := config.CanonicalPath(absPath)
 	return &StagedEdit{
 		AbsPath:          absPath,
 		RelPath:          relPath,

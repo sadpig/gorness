@@ -2,14 +2,13 @@ package config
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -17,14 +16,15 @@ import (
 )
 
 type Options struct {
-	VaultRoot     string
-	UserHomeDir   string
-	KeychainFunc  KeychainFunc
-	KeychainStore KeychainStore
-	EnvLookup     func(key string) (string, bool)
-	CmdRunner     func(ctx context.Context, shellCmd string) (string, error)
-	CmdTTL        time.Duration
-	Now           func() time.Time
+	VaultRoot      string
+	UserHomeDir    string
+	KeychainFunc   KeychainFunc
+	KeychainStore  KeychainStore
+	SecurityRunner SecurityRunnerFunc
+	EnvLookup      func(key string) (string, bool)
+	CmdRunner      func(ctx context.Context, shellCmd string) (string, error)
+	CmdTTL         time.Duration
+	Now            func() time.Time
 }
 
 type fileLoadError struct {
@@ -47,6 +47,10 @@ type Manager struct {
 	secrets     *DefaultSecretResolver
 	now         func() time.Time
 	current     atomic.Pointer[Snapshot]
+
+	reloadMu    sync.RWMutex
+	reloadSeq   uint64
+	onReloadFns map[uint64]func(*Snapshot)
 }
 
 func NewManager(opts Options) (*Manager, error) {
@@ -80,6 +84,7 @@ func NewManager(opts Options) (*Manager, error) {
 	resolver := NewSecretResolver(SecretResolverOptions{
 		KeychainFunc:      opts.KeychainFunc,
 		KeychainStore:     opts.KeychainStore,
+		SecurityRunner:    opts.SecurityRunner,
 		EnvLookup:         opts.EnvLookup,
 		CmdRunner:         opts.CmdRunner,
 		CmdTTL:            opts.CmdTTL,
@@ -110,6 +115,27 @@ func (m *Manager) Secrets() SecretResolver {
 	return m.secrets
 }
 
+func (m *Manager) Keychain() KeychainStore {
+	if m == nil || m.secrets == nil {
+		return NewMacOSKeychainStore(nil)
+	}
+	return m.secrets.Keychain()
+}
+
+func (m *Manager) SetSecret(key, value string) error {
+	if m == nil || m.secrets == nil {
+		return errors.New("nil config manager")
+	}
+	return m.secrets.SetSecret(key, value)
+}
+
+func (m *Manager) DeleteSecret(key string) error {
+	if m == nil || m.secrets == nil {
+		return errors.New("nil config manager")
+	}
+	return m.secrets.DeleteSecret(key)
+}
+
 func (m *Manager) Current() *Snapshot {
 	return m.current.Load()
 }
@@ -124,7 +150,48 @@ func (m *Manager) Reload() (*Snapshot, error) {
 		return m.Current(), err
 	}
 	m.current.Store(snap)
+	m.notifyReload(snap)
 	return snap, nil
+}
+
+// OnReload registers a listener invoked whenever Reload or Watch commits a new Snapshot.
+func (m *Manager) OnReload(fn func(*Snapshot)) func() {
+	if m == nil || fn == nil {
+		return func() {}
+	}
+	m.reloadMu.Lock()
+	if m.onReloadFns == nil {
+		m.onReloadFns = make(map[uint64]func(*Snapshot))
+	}
+	m.reloadSeq++
+	id := m.reloadSeq
+	m.onReloadFns[id] = fn
+	m.reloadMu.Unlock()
+
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			m.reloadMu.Lock()
+			delete(m.onReloadFns, id)
+			m.reloadMu.Unlock()
+		})
+	}
+}
+
+func (m *Manager) notifyReload(snap *Snapshot) {
+	if m == nil || snap == nil {
+		return
+	}
+	m.reloadMu.RLock()
+	fns := make([]func(*Snapshot), 0, len(m.onReloadFns))
+	for _, fn := range m.onReloadFns {
+		fns = append(fns, fn)
+	}
+	m.reloadMu.RUnlock()
+
+	for _, fn := range fns {
+		fn(snap)
+	}
 }
 
 // ForWorkspace 基于当前全局快照合并项目 <wsRoot>/.gorness/ 局部配置：
@@ -205,6 +272,8 @@ func (m *Manager) ForWorkspace(wsRoot string, trustedHashes map[string]string) (
 			DefaultEffort   string `toml:"default_effort"`
 			Theme           string `toml:"theme"`
 			Language        string `toml:"language"`
+			UITheme         string `toml:"ui_theme"`
+			UILang          string `toml:"ui_lang"`
 			MaxSteps        int    `toml:"max_steps"`
 		}
 		if err := toml.Unmarshal(raw, &wsCfg); err != nil {
@@ -224,6 +293,12 @@ func (m *Manager) ForWorkspace(wsRoot string, trustedHashes map[string]string) (
 		}
 		if wsCfg.Language != "" {
 			snap.Global.Language = wsCfg.Language
+		}
+		if wsCfg.UITheme != "" {
+			snap.Global.UITheme = wsCfg.UITheme
+		}
+		if wsCfg.UILang != "" {
+			snap.Global.UILang = wsCfg.UILang
 		}
 		if wsCfg.MaxSteps > 0 {
 			snap.Global.MaxSteps = wsCfg.MaxSteps
@@ -380,18 +455,28 @@ func (m *Manager) ForWorkspace(wsRoot string, trustedHashes map[string]string) (
 		}
 	}
 
+	// 6. hooks.toml 覆盖（校验符号链接边界；未授信工作区 .gorness/hooks.toml 一律跳过并告警）
+	wsHooksPath := filepath.Join(wsGorness, "hooks.toml")
+	if raw, ok, err := readSafeWorkspaceFile(wsHooksPath, canonWs, canonVault, &warnings); err != nil {
+		return nil, nil, err
+	} else if ok {
+		if !isWorkspaceFileTrusted(wsRoot, canonWs, wsHooksPath, raw, trustedHashes) {
+			warnings = append(warnings, fmt.Sprintf("skipped untrusted workspace hooks config %s (SHA-256 not in trustedHashes)", wsHooksPath))
+		} else {
+			wsHooks, err := parseHooksTOML(raw, wsHooksPath)
+			if err != nil {
+				return nil, nil, &fileLoadError{File: wsHooksPath, Err: err}
+			}
+			snap.Hooks = snap.Hooks.Merge(wsHooks)
+		}
+	}
+
 	snap.UntrustedWarnings = warnings
 	return snap, warnings, nil
 }
 
 func isPathWithinOrEqual(path, root string) bool {
-	if path == root {
-		return true
-	}
-	if root == string(filepath.Separator) {
-		return strings.HasPrefix(path, root)
-	}
-	return strings.HasPrefix(path, root+string(filepath.Separator))
+	return IsWithinRoot(path, root)
 }
 
 func isSafeWorkspacePath(targetPath, canonWs, canonVault string) (canonTarget string, exists bool, safe bool) {
@@ -443,48 +528,17 @@ func readSafeWorkspaceFile(lexicalPath, canonWs, canonVault string, warnings *[]
 }
 
 func isWorkspaceFileTrusted(wsRoot, canonWs, absFile string, raw []byte, trustedHashes map[string]string) bool {
-	if len(trustedHashes) == 0 {
-		return false
+	base := canonWs
+	if base == "" {
+		base = wsRoot
 	}
-	sumBytes := sha256.Sum256(raw)
-	actualHex := hex.EncodeToString(sumBytes[:])
-
-	candidates := []string{absFile}
-	canonFile, canonErr := filepath.EvalSymlinks(absFile)
-	if canonErr == nil && canonFile != absFile {
-		candidates = append(candidates, canonFile)
+	if IsWorkspaceFileTrusted(base, absFile, raw, trustedHashes) {
+		return true
 	}
-	for _, base := range []string{wsRoot, canonWs} {
-		if base == "" {
-			continue
-		}
-		for _, target := range []string{absFile, canonFile} {
-			if target == "" {
-				continue
-			}
-			if rel, err := filepath.Rel(base, target); err == nil && !strings.HasPrefix(rel, "..") {
-				relSlash := filepath.ToSlash(rel)
-				candidates = append(candidates, relSlash)
-				if trimmed, ok := strings.CutPrefix(relSlash, ".gorness/"); ok {
-					candidates = append(candidates, trimmed)
-				}
-			}
-		}
+	if wsRoot != "" && wsRoot != base {
+		return IsWorkspaceFileTrusted(wsRoot, absFile, raw, trustedHashes)
 	}
-
-	matched := false
-	for _, key := range candidates {
-		expected, exists := trustedHashes[key]
-		if !exists {
-			continue
-		}
-		norm := strings.TrimPrefix(strings.ToLower(strings.TrimSpace(expected)), "sha256:")
-		if norm != actualHex {
-			return false
-		}
-		matched = true
-	}
-	return matched
+	return false
 }
 
 func hasCmdSecret(ref string) bool {
@@ -563,6 +617,17 @@ func (m *Manager) loadGlobalSnapshot() (*Snapshot, error) {
 		return nil, err
 	}
 
+	var hooksCfg HooksConfig
+	if rawHooks, err := os.ReadFile(m.paths.HooksFile()); err == nil {
+		parsedHooks, hErr := parseHooksTOML(rawHooks, m.paths.HooksFile())
+		if hErr != nil {
+			return nil, &fileLoadError{File: m.paths.HooksFile(), Err: hErr}
+		}
+		hooksCfg = parsedHooks
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return nil, &fileLoadError{File: m.paths.HooksFile(), Err: err}
+	}
+
 	agents, err := loadAgentsDir(m.paths.AgentsDir())
 	if err != nil {
 		return nil, err
@@ -588,9 +653,427 @@ func (m *Manager) loadGlobalSnapshot() (*Snapshot, error) {
 		Workflows: workflows,
 		Rules:     rules,
 		MCP:       mcpCfg,
+		Hooks:     hooksCfg,
 		SkillDirs: skillDirs,
 		LoadedAt:  m.now(),
 	}, nil
+}
+
+// ValidateCandidate parses and validates an in-memory candidate configuration overlay
+// (vault-relative or vault-absolute file paths -> raw TOML/MD bytes; nil value simulates deletion)
+// without writing to disk or mutating the active snapshot.
+func (m *Manager) ValidateCandidate(overlay map[string][]byte) (*Snapshot, error) {
+	if m == nil {
+		return nil, errors.New("nil config manager")
+	}
+
+	canonRoot := filepath.Clean(m.paths.Root)
+	if c, err := CanonicalPath(m.paths.Root); err == nil && c != "" {
+		canonRoot = c
+	}
+
+	normOverlay := make(map[string][]byte, len(overlay))
+	for rawKey, content := range overlay {
+		trimmed := strings.TrimSpace(rawKey)
+		if trimmed == "" {
+			return nil, errors.New("empty overlay path")
+		}
+		var relSlash string
+		if filepath.IsAbs(trimmed) {
+			cleanKey := filepath.Clean(trimmed)
+			if c, err := CanonicalPath(trimmed); err == nil && c != "" {
+				cleanKey = c
+			}
+			var rel string
+			var rErr error
+			if IsWithinRoot(cleanKey, canonRoot) {
+				rel, rErr = filepath.Rel(canonRoot, cleanKey)
+			} else if IsWithinRoot(filepath.Clean(trimmed), filepath.Clean(m.paths.Root)) {
+				rel, rErr = filepath.Rel(filepath.Clean(m.paths.Root), filepath.Clean(trimmed))
+			} else {
+				return nil, fmt.Errorf("overlay path %q is outside vault root", rawKey)
+			}
+			if rErr != nil {
+				return nil, fmt.Errorf("resolve overlay path %q: %w", rawKey, rErr)
+			}
+			relSlash = filepath.ToSlash(rel)
+		} else {
+			cleaned := filepath.ToSlash(filepath.Clean(trimmed))
+			cleaned = strings.TrimPrefix(cleaned, "./")
+			if cleaned == "." || cleaned == ".." || strings.HasPrefix(cleaned, "../") || strings.Contains(cleaned, "/../") {
+				return nil, fmt.Errorf("invalid overlay path %q", rawKey)
+			}
+			relSlash = cleaned
+		}
+		if strings.EqualFold(filepath.Ext(relSlash), ".json") {
+			return nil, fmt.Errorf("forbidden .json file in vault overlay: %s", relSlash)
+		}
+		normOverlay[relSlash] = content
+	}
+
+	readCandidateFile := func(relSlash, diskPath string) ([]byte, bool, error) {
+		if data, overridden := normOverlay[relSlash]; overridden {
+			if data == nil {
+				return nil, false, nil
+			}
+			return data, true, nil
+		}
+		raw, err := os.ReadFile(diskPath)
+		if err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				return nil, false, nil
+			}
+			return nil, false, &fileLoadError{File: diskPath, Err: err}
+		}
+		return raw, true, nil
+	}
+
+	globalCfg := defaultGlobalConfig()
+	if raw, ok, err := readCandidateFile("config.toml", m.paths.ConfigFile()); err != nil {
+		return nil, err
+	} else if ok {
+		if err := toml.Unmarshal(raw, &globalCfg); err != nil {
+			return nil, &fileLoadError{File: m.paths.ConfigFile(), Err: err}
+		}
+	}
+
+	providers := make(map[string]ProviderConfig)
+	if raw, ok, err := readCandidateFile("providers.toml", m.paths.ProvidersFile()); err != nil {
+		return nil, err
+	} else if ok {
+		provs, pErr := parseProvidersBytes(m.paths.ProvidersFile(), raw)
+		if pErr != nil {
+			return nil, pErr
+		}
+		providers = provs
+	}
+
+	var rules RuleSet
+	if raw, ok, err := readCandidateFile("rules.toml", m.paths.RulesFile()); err != nil {
+		return nil, err
+	} else if ok {
+		if err := toml.Unmarshal(raw, &rules); err != nil {
+			return nil, &fileLoadError{File: m.paths.RulesFile(), Err: err}
+		}
+	}
+
+	mcpCfg := MCPConfig{Servers: make(map[string]MCPServerConfig)}
+	if raw, ok, err := readCandidateFile("mcp.toml", m.paths.MCPFile()); err != nil {
+		return nil, err
+	} else if ok {
+		parsedMCP, mErr := parseMCPBytes(m.paths.MCPFile(), raw)
+		if mErr != nil {
+			return nil, mErr
+		}
+		mcpCfg = parsedMCP
+	}
+
+	var hooksCfg HooksConfig
+	if raw, ok, err := readCandidateFile("hooks.toml", m.paths.HooksFile()); err != nil {
+		return nil, err
+	} else if ok {
+		parsedHooks, hErr := parseHooksTOML(raw, m.paths.HooksFile())
+		if hErr != nil {
+			return nil, &fileLoadError{File: m.paths.HooksFile(), Err: hErr}
+		}
+		hooksCfg = parsedHooks
+	}
+
+	// Collect agents/*.md from disk + overlay
+	agentFiles := make(map[string]string)
+	if entries, err := os.ReadDir(m.paths.AgentsDir()); err == nil {
+		for _, ent := range entries {
+			if !ent.IsDir() && strings.HasSuffix(ent.Name(), ".md") {
+				agentFiles["agents/"+ent.Name()] = ent.Name()
+			}
+		}
+	}
+	for rel := range normOverlay {
+		if strings.HasPrefix(rel, "agents/") && strings.HasSuffix(rel, ".md") && strings.Count(rel, "/") == 1 {
+			agentFiles[rel] = filepath.Base(rel)
+		}
+	}
+	agentKeys := make([]string, 0, len(agentFiles))
+	for rel := range agentFiles {
+		agentKeys = append(agentKeys, rel)
+	}
+	sort.Strings(agentKeys)
+	agents := make(map[string]AgentProfile, len(agentKeys))
+	for _, rel := range agentKeys {
+		name := agentFiles[rel]
+		diskPath := filepath.Join(m.paths.AgentsDir(), name)
+		raw, ok, err := readCandidateFile(rel, diskPath)
+		if err != nil {
+			return nil, err
+		}
+		if !ok {
+			continue
+		}
+		prof, pErr := parseAgentProfileBytes(diskPath, name, raw)
+		if pErr != nil {
+			return nil, pErr
+		}
+		agents[prof.ID] = prof
+	}
+
+	// Collect workflows/*.toml from disk + overlay
+	wfFiles := make(map[string]string)
+	if entries, err := os.ReadDir(m.paths.WorkflowsDir()); err == nil {
+		for _, ent := range entries {
+			if !ent.IsDir() && strings.HasSuffix(ent.Name(), ".toml") {
+				wfFiles["workflows/"+ent.Name()] = ent.Name()
+			}
+		}
+	}
+	for rel := range normOverlay {
+		if strings.HasPrefix(rel, "workflows/") && strings.HasSuffix(rel, ".toml") && strings.Count(rel, "/") == 1 {
+			wfFiles[rel] = filepath.Base(rel)
+		}
+	}
+	wfKeys := make([]string, 0, len(wfFiles))
+	for rel := range wfFiles {
+		wfKeys = append(wfKeys, rel)
+	}
+	sort.Strings(wfKeys)
+	workflows := make(map[string]WorkflowTemplate, len(wfKeys))
+	for _, rel := range wfKeys {
+		name := wfFiles[rel]
+		diskPath := filepath.Join(m.paths.WorkflowsDir(), name)
+		raw, ok, err := readCandidateFile(rel, diskPath)
+		if err != nil {
+			return nil, err
+		}
+		if !ok {
+			continue
+		}
+		wf, wErr := parseWorkflowFile(diskPath, raw)
+		if wErr != nil {
+			return nil, wErr
+		}
+		workflows[wf.ID] = wf
+	}
+
+	// Validate generic .md frontmatter or .toml syntax for any other overlay files (e.g. skills/*/SKILL.md)
+	for rel, raw := range normOverlay {
+		if raw == nil {
+			continue
+		}
+		switch rel {
+		case "config.toml", "providers.toml", "rules.toml", "mcp.toml", "hooks.toml":
+			continue
+		}
+		if (strings.HasPrefix(rel, "agents/") && strings.HasSuffix(rel, ".md") && strings.Count(rel, "/") == 1) ||
+			(strings.HasPrefix(rel, "workflows/") && strings.HasSuffix(rel, ".toml") && strings.Count(rel, "/") == 1) {
+			continue
+		}
+		ext := strings.ToLower(filepath.Ext(rel))
+		switch ext {
+		case ".toml":
+			var generic map[string]any
+			if err := toml.Unmarshal(raw, &generic); err != nil {
+				return nil, &fileLoadError{File: rel, Err: err}
+			}
+		case ".md":
+			if _, _, err := ParseFrontmatterMD(raw); err != nil {
+				return nil, &fileLoadError{File: rel, Err: err}
+			}
+		}
+	}
+
+	skillDirs := []string{
+		m.paths.SkillsDir(),
+		filepath.Join(m.userHomeDir, ".agents", "skills"),
+		filepath.Join(m.userHomeDir, ".claude", "skills"),
+	}
+	skillDirs = append(skillDirs, globalCfg.ExtraSkillDirs...)
+
+	snap := &Snapshot{
+		Paths:     m.paths,
+		Global:    globalCfg,
+		Providers: providers,
+		Agents:    agents,
+		Workflows: workflows,
+		Rules:     rules,
+		MCP:       mcpCfg,
+		Hooks:     hooksCfg,
+		SkillDirs: skillDirs,
+		LoadedAt:  m.now(),
+	}
+
+	if err := validateCandidateSemantics(snap); err != nil {
+		return nil, err
+	}
+	return snap, nil
+}
+
+func validateCandidateSemantics(snap *Snapshot) error {
+	if snap == nil {
+		return errors.New("nil candidate snapshot")
+	}
+
+	validProtocols := map[string]bool{
+		"anthropic":        true,
+		"openai-responses": true,
+		"openai-compat":    true,
+		"gemini":           true,
+	}
+	for id, prov := range snap.Providers {
+		proto := strings.ToLower(strings.TrimSpace(prov.Protocol))
+		if !validProtocols[proto] {
+			return fmt.Errorf("provider %q has unsupported protocol %q", id, prov.Protocol)
+		}
+	}
+
+	validateProviderModelRef := func(owner, provID, modelID string) error {
+		pID := strings.TrimSpace(provID)
+		mID := strings.TrimSpace(modelID)
+		if pID == "" {
+			return fmt.Errorf("%s: provider must not be empty", owner)
+		}
+		prov, ok := snap.Providers[pID]
+		if !ok {
+			return fmt.Errorf("%s: references unknown provider %q", owner, pID)
+		}
+		if mID == "" {
+			return fmt.Errorf("%s: model must not be empty", owner)
+		}
+		if len(prov.Models) > 0 {
+			if _, exists := prov.Models[mID]; !exists {
+				return fmt.Errorf("%s: provider %q does not define model %q", owner, pID, mID)
+			}
+		}
+		return nil
+	}
+
+	if len(snap.Providers) > 0 {
+		if err := validateProviderModelRef("config.toml default", snap.Global.DefaultProvider, snap.Global.DefaultModel); err != nil {
+			return err
+		}
+		for id, prof := range snap.Agents {
+			if err := validateProviderModelRef(fmt.Sprintf("agent %q", id), prof.Provider, prof.Model); err != nil {
+				return err
+			}
+			for _, fb := range prof.Fallbacks {
+				parts := strings.SplitN(strings.TrimSpace(fb), "/", 2)
+				if len(parts) != 2 || strings.TrimSpace(parts[0]) == "" || strings.TrimSpace(parts[1]) == "" {
+					return fmt.Errorf("agent %q fallback %q must use provider/model format", id, fb)
+				}
+				if err := validateProviderModelRef(fmt.Sprintf("agent %q fallback", id), parts[0], parts[1]); err != nil {
+					return err
+				}
+			}
+		}
+	}
+
+	for _, wf := range snap.Workflows {
+		if err := validateWorkflowDAG(wf, snap.Agents, snap.Providers); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func validateWorkflowDAG(wf WorkflowTemplate, agents map[string]AgentProfile, providers map[string]ProviderConfig) error {
+	for role, modelRef := range wf.RoleModels {
+		if len(agents) > 0 {
+			if _, ok := agents[role]; !ok {
+				return fmt.Errorf("workflow %q role_models references unknown agent role %q", wf.ID, role)
+			}
+		}
+		if len(providers) > 0 && strings.Contains(modelRef, "/") {
+			parts := strings.SplitN(strings.TrimSpace(modelRef), "/", 2)
+			prov, ok := providers[parts[0]]
+			if !ok {
+				return fmt.Errorf("workflow %q role_models[%q] references unknown provider %q", wf.ID, role, parts[0])
+			}
+			if len(prov.Models) > 0 {
+				if _, mOK := prov.Models[parts[1]]; !mOK {
+					return fmt.Errorf("workflow %q role_models[%q] references unknown model %q on provider %q", wf.ID, role, parts[1], parts[0])
+				}
+			}
+		}
+	}
+
+	if len(wf.Nodes) == 0 && len(wf.Edges) == 0 {
+		return nil
+	}
+
+	nodeSet := make(map[string]bool, len(wf.Nodes))
+	for _, n := range wf.Nodes {
+		nID := strings.TrimSpace(n.ID)
+		if nID == "" {
+			return fmt.Errorf("workflow %q contains a node with empty id", wf.ID)
+		}
+		if nodeSet[nID] {
+			return fmt.Errorf("workflow %q contains duplicate node id %q", wf.ID, nID)
+		}
+		nodeSet[nID] = true
+		if r := strings.TrimSpace(n.Role); r != "" && len(agents) > 0 {
+			if _, ok := agents[r]; !ok {
+				return fmt.Errorf("workflow %q node %q references unknown agent role %q", wf.ID, nID, r)
+			}
+		}
+	}
+
+	allowFeedbackEdges := wf.Topology == "review-loop" || wf.Topology == "event-pipeline"
+	adj := make(map[string][]string, len(nodeSet))
+	for _, e := range wf.Edges {
+		from := strings.TrimSpace(e.From)
+		to := strings.TrimSpace(e.To)
+		if from == "" || to == "" {
+			return fmt.Errorf("workflow %q has an edge with empty endpoint (%q -> %q)", wf.ID, e.From, e.To)
+		}
+		if !nodeSet[from] {
+			return fmt.Errorf("workflow %q edge references unknown source node %q", wf.ID, from)
+		}
+		if !nodeSet[to] {
+			return fmt.Errorf("workflow %q edge references unknown target node %q", wf.ID, to)
+		}
+		if from == to {
+			return fmt.Errorf("workflow %q contains self-loop on node %q", wf.ID, from)
+		}
+		if allowFeedbackEdges && strings.EqualFold(strings.TrimSpace(e.Kind), "feedback") {
+			continue
+		}
+		adj[from] = append(adj[from], to)
+	}
+
+	const (
+		unvisited = 0
+		visiting  = 1
+		visited   = 2
+	)
+	color := make(map[string]int, len(nodeSet))
+	var dfs func(u string) error
+	dfs = func(u string) error {
+		color[u] = visiting
+		for _, v := range adj[u] {
+			if color[v] == visiting {
+				return fmt.Errorf("workflow %q graph contains a cycle (%s -> %s)", wf.ID, u, v)
+			}
+			if color[v] == unvisited {
+				if err := dfs(v); err != nil {
+					return err
+				}
+			}
+		}
+		color[u] = visited
+		return nil
+	}
+
+	sortedNodes := make([]string, 0, len(nodeSet))
+	for id := range nodeSet {
+		sortedNodes = append(sortedNodes, id)
+	}
+	sort.Strings(sortedNodes)
+	for _, id := range sortedNodes {
+		if color[id] == unvisited {
+			if err := dfs(id); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
 }
 
 type providersDoc struct {
@@ -780,6 +1263,7 @@ func bootstrapVault(paths VaultPaths) error {
 		paths.ProvidersFile(): {0o600, defaultProvidersTOML},
 		paths.RulesFile():     {0o600, defaultRulesTOML},
 		paths.MCPFile():       {0o600, defaultMCPTOML},
+		paths.HooksFile():     {0o600, defaultHooksTOML},
 		filepath.Join(paths.MemoryDir(), "INSTRUCTIONS.md"): {0o600, defaultMemoryInstructionsMD},
 		filepath.Join(paths.MemoryDir(), "INDEX.md"):        {0o600, defaultMemoryIndexMD},
 		filepath.Join(paths.MemoryDir(), "REPORTED.md"):     {0o600, defaultMemoryReportedMD},

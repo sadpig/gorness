@@ -1659,3 +1659,144 @@ func TestCrossModelThinkingSignatureIsolationAndFallbackAnsweringModel(t *testin
 		t.Fatalf("expected StreamDone to report fallback openai/gpt-5.5, got %#v", doneEv)
 	}
 }
+
+func TestSlice1ExponentialBackoffRetryAfterAndNonRetryableOpenAI(t *testing.T) {
+	t.Parallel()
+
+	vaultRoot := filepath.Join(t.TempDir(), ".gorness")
+	mgr, err := config.NewManager(config.Options{
+		VaultRoot: vaultRoot,
+		EnvLookup: func(k string) (string, bool) { return "test-secret-" + k, true },
+	})
+	if err != nil {
+		t.Fatalf("NewManager: %v", err)
+	}
+
+	// 1. Exponential backoff (500ms * 2^attempt + jitter) + Retry-After header floor with zero real sleep via SetSleepFunc
+	var backoffCalls atomic.Int32
+	srvBackoff := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		n := backoffCalls.Add(1)
+		switch n {
+		case 1:
+			w.WriteHeader(http.StatusServiceUnavailable)
+			_, _ = w.Write([]byte(`{"error":{"message":"upstream overloaded"}}`))
+		case 2:
+			w.Header().Set("Retry-After", "4")
+			w.WriteHeader(http.StatusTooManyRequests)
+			_, _ = w.Write([]byte(`{"error":{"message":"rate limit hit"}}`))
+		default:
+			w.Header().Set("Content-Type", "text/event-stream")
+			fmt.Fprint(w, "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"BackoffOK\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n")
+		}
+	}))
+	defer srvBackoff.Close()
+
+	router := NewRouter(mgr, mgr.Secrets(), NewNativeStreamer(srvBackoff.Client()))
+	var mu sync.Mutex
+	var sleeps []time.Duration
+	router.SetSleepFunc(func(ctx context.Context, d time.Duration) error {
+		mu.Lock()
+		sleeps = append(sleeps, d)
+		mu.Unlock()
+		return ctx.Err()
+	})
+
+	routeCompat := ResolvedRoute{
+		RoleID:     "coder",
+		ProviderID: "compat",
+		ModelID:    "qwen3-coder",
+		Provider: config.ProviderConfig{
+			ID:         "compat",
+			Protocol:   "openai-compat",
+			BaseURL:    srvBackoff.URL,
+			TimeoutSec: 5,
+		},
+	}
+
+	ch, err := router.StreamWithRetry(context.Background(), routeCompat, Request{})
+	if err != nil {
+		t.Fatalf("StreamWithRetry backoff: %v", err)
+	}
+	evs := collectStreamEvents(t, ch)
+	var text strings.Builder
+	for _, ev := range evs {
+		if ev.Type == StreamTextDelta {
+			text.WriteString(ev.Text)
+		}
+	}
+	if text.String() != "BackoffOK" {
+		t.Fatalf("expected BackoffOK, got %q", text.String())
+	}
+	mu.Lock()
+	gotSleeps := append([]time.Duration(nil), sleeps...)
+	mu.Unlock()
+	if len(gotSleeps) != 2 {
+		t.Fatalf("expected 2 recorded sleep durations, got %v", gotSleeps)
+	}
+	if gotSleeps[0] < 500*time.Millisecond || gotSleeps[0] > 650*time.Millisecond {
+		t.Fatalf("attempt 0 backoff expected in [500ms, 650ms], got %v", gotSleeps[0])
+	}
+	if gotSleeps[1] < 4*time.Second || gotSleeps[1] > 30*time.Second {
+		t.Fatalf("attempt 1 backoff expected Retry-After floor >= 4s, got %v", gotSleeps[1])
+	}
+
+	// 2. OpenAI Responses SSE context_length_exceeded MUST NOT retry!
+	var respHits atomic.Int32
+	srvResponses := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		respHits.Add(1)
+		w.Header().Set("Content-Type", "text/event-stream")
+		fmt.Fprint(w, "event: response.failed\ndata: {\"type\":\"response.failed\",\"response\":{\"error\":{\"code\":\"context_length_exceeded\",\"message\":\"Prompt exceeds maximum context length\"}}}\n\n")
+	}))
+	defer srvResponses.Close()
+
+	respRouter := NewRouter(mgr, mgr.Secrets(), NewNativeStreamer(srvResponses.Client()))
+	respRouter.SetBackoff(0)
+	chResp, err := respRouter.StreamWithRetry(context.Background(), ResolvedRoute{
+		RoleID:     "coder",
+		ProviderID: "openai",
+		ModelID:    "gpt-5.5",
+		Provider: config.ProviderConfig{
+			ID:         "openai",
+			Protocol:   "openai-responses",
+			BaseURL:    srvResponses.URL,
+			TimeoutSec: 5,
+		},
+	}, Request{})
+	if err != nil {
+		t.Fatalf("StreamWithRetry openai-responses: %v", err)
+	}
+	_ = collectStreamEvents(t, chResp)
+	if got := respHits.Load(); got != 1 {
+		t.Fatalf("expected context_length_exceeded SSE to NOT retry (1 hit), got %d hits", got)
+	}
+
+	// 3. OpenAI Compat SSE invalid_request_error MUST NOT retry!
+	var compatHits atomic.Int32
+	srvCompatErr := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		compatHits.Add(1)
+		w.Header().Set("Content-Type", "text/event-stream")
+		fmt.Fprint(w, "data: {\"error\":{\"type\":\"invalid_request_error\",\"message\":\"Unsupported parameter tool_choice\"}}\n\n")
+	}))
+	defer srvCompatErr.Close()
+
+	compatRouter := NewRouter(mgr, mgr.Secrets(), NewNativeStreamer(srvCompatErr.Client()))
+	compatRouter.SetBackoff(0)
+	chCompatErr, err := compatRouter.StreamWithRetry(context.Background(), ResolvedRoute{
+		RoleID:     "coder",
+		ProviderID: "compat_err",
+		ModelID:    "qwen3-coder",
+		Provider: config.ProviderConfig{
+			ID:         "compat_err",
+			Protocol:   "openai-compat",
+			BaseURL:    srvCompatErr.URL,
+			TimeoutSec: 5,
+		},
+	}, Request{})
+	if err != nil {
+		t.Fatalf("StreamWithRetry openai-compat invalid_request_error: %v", err)
+	}
+	_ = collectStreamEvents(t, chCompatErr)
+	if got := compatHits.Load(); got != 1 {
+		t.Fatalf("expected invalid_request_error SSE to NOT retry (1 hit), got %d hits", got)
+	}
+}

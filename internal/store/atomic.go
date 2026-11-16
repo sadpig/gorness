@@ -156,8 +156,8 @@ func writeAll(f *os.File, data []byte) error {
 	return nil
 }
 
-// marshalJSONLine 禁用 HTML 转义（SetEscapeHTML(false)），确保 json.RawMessage 内的 <, >, & 字节零转义损耗落盘。
-func marshalJSONLine(v any) ([]byte, error) {
+// MarshalJSONLine encodes v as a single JSONL line with SetEscapeHTML(false) so <, >, and & bytes round-trip verbatim.
+func MarshalJSONLine(v any) ([]byte, error) {
 	var buf bytes.Buffer
 	enc := json.NewEncoder(&buf)
 	enc.SetEscapeHTML(false)
@@ -167,8 +167,13 @@ func marshalJSONLine(v any) ([]byte, error) {
 	return buf.Bytes(), nil
 }
 
-func appendJSONLine(path string, v any) error {
-	line, err := marshalJSONLine(v)
+func marshalJSONLine(v any) ([]byte, error) {
+	return MarshalJSONLine(v)
+}
+
+// AppendJSONLine appends v as an unescaped JSONL line to path with fsync durability and 0600 permissions.
+func AppendJSONLine(path string, v any) error {
+	line, err := MarshalJSONLine(v)
 	if err != nil {
 		return err
 	}
@@ -194,7 +199,12 @@ func appendJSONLine(path string, v any) error {
 	return nil
 }
 
-func validateSafeID(id string) error {
+func appendJSONLine(path string, v any) error {
+	return AppendJSONLine(path, v)
+}
+
+// ValidateSafeID rejects empty, whitespace-padded, path-separating, dot, or control-character identifiers.
+func ValidateSafeID(id string) error {
 	trimmed := strings.TrimSpace(id)
 	if trimmed == "" || trimmed != id || id == "." || id == ".." {
 		return fmt.Errorf("%w: %q", ErrInvalidID, id)
@@ -207,13 +217,25 @@ func validateSafeID(id string) error {
 	return nil
 }
 
-func randHex(numBytes int) string {
+func validateSafeID(id string) error {
+	return ValidateSafeID(id)
+}
+
+// RandomHex generates a cryptographically random lowercase hex string of length 2*numBytes.
+func RandomHex(numBytes int) string {
+	if numBytes <= 0 {
+		numBytes = 6
+	}
 	b := make([]byte, numBytes)
 	if _, err := rand.Read(b); err != nil {
 		n := fallbackNonce.Add(1)
 		return fmt.Sprintf("%012x", n)
 	}
 	return hex.EncodeToString(b)
+}
+
+func randHex(numBytes int) string {
+	return RandomHex(numBytes)
 }
 
 func isWithinOrEqualPath(path, root string) bool {

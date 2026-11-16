@@ -864,3 +864,217 @@ func TestWorkspaceRegisterRejectsVaultContainingRoot(t *testing.T) {
 		t.Fatalf("expected sibling project registration to succeed, got ws=%+v err=%v", ws, err)
 	}
 }
+
+func TestSlice1ArtifactsSnapshotGCIndexAndVaultSearch(t *testing.T) {
+	vaultRoot := filepath.Join(t.TempDir(), ".gorness")
+	paths := config.VaultPaths{Root: vaultRoot}
+
+	// 1. Exported atomic/search helpers
+	if err := ValidateSafeID("valid_id-01"); err != nil {
+		t.Fatalf("ValidateSafeID rejected valid ID: %v", err)
+	}
+	if err := ValidateSafeID("../escape"); err == nil {
+		t.Fatal("ValidateSafeID accepted path traversal")
+	}
+	if hexStr := RandomHex(8); len(hexStr) != 16 {
+		t.Fatalf("expected RandomHex(8) length 16, got %q", hexStr)
+	}
+	lineBytes, err := MarshalJSONLine(map[string]string{"msg": "hello\nworld"})
+	if err != nil || bytes.Count(lineBytes, []byte("\n")) != 1 {
+		t.Fatalf("MarshalJSONLine failed: %q err=%v", string(lineBytes), err)
+	}
+	jsonlPath := filepath.Join(paths.LogsDir(), "events.jsonl")
+	if err := AppendJSONLine(jsonlPath, map[string]int{"seq": 1}); err != nil {
+		t.Fatalf("AppendJSONLine: %v", err)
+	}
+	tokens := TokenizeQuery("RaftConsensus Quorum_Lease 42")
+	if len(tokens) < 3 {
+		t.Fatalf("expected TokenizeQuery tokens, got %v", tokens)
+	}
+
+	wsStore, err := NewWorkspaceStore(paths)
+	if err != nil {
+		t.Fatalf("NewWorkspaceStore: %v", err)
+	}
+	repoDir := filepath.Join(t.TempDir(), "kernel-repo")
+	if err := os.MkdirAll(repoDir, 0o755); err != nil {
+		t.Fatalf("mkdir repoDir: %v", err)
+	}
+	ws, err := wsStore.Register(repoDir, "KernelRepo")
+	if err != nil {
+		t.Fatalf("Register workspace: %v", err)
+	}
+
+	// 2. ArtifactStore CRUD (.html & .md, index.toml, zero .json files)
+	artStore, err := NewArtifactStore(paths)
+	if err != nil {
+		t.Fatalf("NewArtifactStore: %v", err)
+	}
+	savedHTML, err := artStore.Save(ws.ID, Artifact{
+		ID:        "flamegraph-report",
+		SessionID: "sess_demo",
+		Title:     "CPU Flamegraph Interactive View",
+		Format:    "html",
+		Content:   "<!doctype html><html><body><h1>Flamegraph</h1></body></html>",
+	})
+	if err != nil {
+		t.Fatalf("ArtifactStore.Save html: %v", err)
+	}
+	savedMD, err := artStore.Save(ws.ID, Artifact{
+		ID:      "latency-audit",
+		Title:   "Tail Latency Root Cause",
+		Format:  "md",
+		Content: "# Tail Latency\nUniqueTokenArtifactZephyr99 in p99 scheduler queue.\n",
+	})
+	if err != nil {
+		t.Fatalf("ArtifactStore.Save md: %v", err)
+	}
+	listedArts, err := artStore.List(ws.ID)
+	if err != nil || len(listedArts) != 2 {
+		t.Fatalf("ArtifactStore.List expected 2, got %+v err=%v", listedArts, err)
+	}
+	gotHTML, err := artStore.Get(ws.ID, savedHTML.ID)
+	if err != nil || !strings.Contains(gotHTML.Content, "<h1>Flamegraph</h1>") {
+		t.Fatalf("ArtifactStore.Get html failed: got=%+v err=%v", gotHTML, err)
+	}
+
+	// 3. SnapshotStore ListSessionRecords, DeleteSessionSnapshots & blob GC on SessionStore.Delete
+	snaps, err := NewSnapshotStore(paths)
+	if err != nil {
+		t.Fatalf("NewSnapshotStore: %v", err)
+	}
+	sessions, err := NewSessionStore(paths)
+	if err != nil {
+		t.Fatalf("NewSessionStore: %v", err)
+	}
+	s1, err := sessions.Create(ws.ID, "Ephemeral Session", "coder")
+	if err != nil {
+		t.Fatalf("Create s1: %v", err)
+	}
+	s2, err := sessions.Create(ws.ID, "Surviving Session", "coder")
+	if err != nil {
+		t.Fatalf("Create s2: %v", err)
+	}
+
+	uniqueFile := filepath.Join(repoDir, "unique_s1.go")
+	sharedFile := filepath.Join(repoDir, "shared_both.go")
+	if err := os.WriteFile(uniqueFile, []byte("package main // exclusive_s1_blob_payload\n"), 0o644); err != nil {
+		t.Fatalf("write uniqueFile: %v", err)
+	}
+	if err := os.WriteFile(sharedFile, []byte("package main // shared_s1_s2_blob_payload\n"), 0o644); err != nil {
+		t.Fatalf("write sharedFile: %v", err)
+	}
+
+	uniqueHash, _, err := snaps.CaptureFile(uniqueFile)
+	if err != nil {
+		t.Fatalf("CaptureFile unique: %v", err)
+	}
+	sharedHash, _, err := snaps.CaptureFile(sharedFile)
+	if err != nil {
+		t.Fatalf("CaptureFile shared: %v", err)
+	}
+	if err := snaps.RecordStepChange(FileSnapshotRecord{
+		SessionID:  s1.ID,
+		Seq:        1,
+		RelPath:    "unique_s1.go",
+		Kind:       ChangeModify,
+		BeforeHash: uniqueHash,
+	}); err != nil {
+		t.Fatalf("RecordStepChange unique s1: %v", err)
+	}
+	if err := snaps.RecordStepChange(FileSnapshotRecord{
+		SessionID:  s1.ID,
+		Seq:        2,
+		RelPath:    "shared_both.go",
+		Kind:       ChangeModify,
+		BeforeHash: sharedHash,
+	}); err != nil {
+		t.Fatalf("RecordStepChange shared s1: %v", err)
+	}
+	if err := snaps.RecordStepChange(FileSnapshotRecord{
+		SessionID:  s2.ID,
+		Seq:        1,
+		RelPath:    "shared_both.go",
+		Kind:       ChangeModify,
+		BeforeHash: sharedHash,
+	}); err != nil {
+		t.Fatalf("RecordStepChange shared s2: %v", err)
+	}
+
+	s1Recs, err := snaps.ListSessionRecords(ws.ID, s1.ID)
+	if err != nil || len(s1Recs) != 2 {
+		t.Fatalf("ListSessionRecords s1 expected 2, got %+v err=%v", s1Recs, err)
+	}
+
+	// Deleting s1 via SessionStore.Delete MUST purge s1's snapshot ledger and GC uniqueHash's blob,
+	// while keeping sharedHash's blob alive because s2 still references it!
+	if err := sessions.Delete(s1.ID); err != nil {
+		t.Fatalf("sessions.Delete(s1): %v", err)
+	}
+	afterRecs, err := snaps.ListSessionRecords(ws.ID, s1.ID)
+	if err != nil || len(afterRecs) != 0 {
+		t.Fatalf("expected 0 snapshot records after session delete, got %+v err=%v", afterRecs, err)
+	}
+	uniqueBlobPath := filepath.Join(paths.SnapshotsDir(), "blobs", uniqueHash[:2], uniqueHash)
+	sharedBlobPath := filepath.Join(paths.SnapshotsDir(), "blobs", sharedHash[:2], sharedHash)
+	if _, err := os.Stat(uniqueBlobPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("expected unreferenced blob %s to be garbage-collected, stat err=%v", uniqueBlobPath, err)
+	}
+	if _, err := os.Stat(sharedBlobPath); err != nil {
+		t.Fatalf("expected shared blob %s referenced by s2 to remain intact, stat err=%v", sharedBlobPath, err)
+	}
+
+	// 4. Vault-wide BM25 Search across sessions, memory/notes/*.md, workspaces/<wsID>/memory/progress/*.md, and artifacts/*.md
+	if _, err := sessions.Append(s2.ID, SessionEntry{
+		Role:   "user",
+		Blocks: []ContentBlock{{Type: "text", Text: "Investigate UniqueTokenSessionQuasar77 lock contention"}},
+	}); err != nil {
+		t.Fatalf("Append s2: %v", err)
+	}
+	notesDir := filepath.Join(paths.MemoryDir(), "notes")
+	if err := os.MkdirAll(notesDir, 0o700); err != nil {
+		t.Fatalf("mkdir notesDir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(notesDir, "raft-lease.md"), []byte("# Raft Lease Note\nUniqueTokenNoteNebula88 prevents split-brain reads.\n"), 0o600); err != nil {
+		t.Fatalf("write note: %v", err)
+	}
+	progDir := filepath.Join(paths.WorkspacesDir(), ws.ID, "memory", "progress")
+	if err := os.MkdirAll(progDir, 0o700); err != nil {
+		t.Fatalf("mkdir progDir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(progDir, "sprint-1.md"), []byte("# Sprint Progress\nCompleted UniqueTokenProgressPulsar66 milestone.\n"), 0o600); err != nil {
+		t.Fatalf("write progress: %v", err)
+	}
+
+	for _, tc := range []struct {
+		query string
+		desc  string
+	}{
+		{"UniqueTokenSessionQuasar77", "session transcript"},
+		{"UniqueTokenNoteNebula88", "global memory note"},
+		{"UniqueTokenProgressPulsar66", "workspace progress markdown"},
+		{"UniqueTokenArtifactZephyr99", "workspace markdown artifact"},
+	} {
+		hits, err := sessions.Search(tc.query, 10)
+		if err != nil || len(hits) == 0 {
+			t.Fatalf("Search(%q) for %s expected >=1 hit, got %+v err=%v", tc.query, tc.desc, hits, err)
+		}
+	}
+
+	if err := artStore.Delete(ws.ID, savedMD.ID); err != nil {
+		t.Fatalf("ArtifactStore.Delete: %v", err)
+	}
+
+	// Verify ZERO .json files anywhere inside vaultRoot!
+	if err := filepath.WalkDir(vaultRoot, func(p string, d os.DirEntry, wErr error) error {
+		if wErr != nil {
+			return wErr
+		}
+		if !d.IsDir() && strings.HasSuffix(strings.ToLower(d.Name()), ".json") {
+			return fmt.Errorf("forbidden .json file inside vault: %s", p)
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+}

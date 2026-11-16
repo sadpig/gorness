@@ -90,6 +90,11 @@ func (c *Compactor) Compact(ctx context.Context, sessionID string) (*CompactionR
 	}
 
 	turns := groupEntriesIntoTurns(conversational)
+	if len(turns) == 1 && len(turns[0]) >= 5 {
+		if stepGroups := splitSingleTurnIntoStepUnits(turns[0]); len(stepGroups) >= 2 {
+			turns = stepGroups
+		}
+	}
 	totalTurns := len(turns)
 	if totalTurns <= 1 {
 		return &CompactionResult{
@@ -208,50 +213,102 @@ func (c *Compactor) generateMergedSummary(
 		return buildDeterministicAnchoredFallback(priorSummary, transcript), "deterministic", 0, 0, 0, 0, nil
 	}
 
-	snap := c.cfg.Current()
+	res, uErr := executeUtilityPrompt(ctx, c.cfg, c.workspaces, c.router, meta.WorkspaceID, "utility", "", promptBuf.String())
+	if uErr != nil {
+		return "", "", 0, 0, 0, 0, uErr
+	}
+
+	out := strings.TrimSpace(res.Text)
+	if out == "" {
+		out = buildDeterministicAnchoredFallback(priorSummary, transcript)
+	}
+	return out, res.ModelID, res.InputTokens, res.OutputTokens, res.CacheReadTokens, res.CostUSD, nil
+}
+
+const defaultUtilitySystemPrompt = "You are the Housekeeping Utility agent in Gorness. Produce crisp session titles and faithful anchored summaries preserving exact file paths, decisions, and unresolved tasks."
+
+type utilityPromptResult struct {
+	Text            string
+	ModelID         string
+	InputTokens     int
+	OutputTokens    int
+	CacheReadTokens int
+	CostUSD         float64
+}
+
+func executeUtilityPrompt(
+	ctx context.Context,
+	cfg *config.Manager,
+	workspaces *store.WorkspaceStore,
+	router *llm.Router,
+	workspaceID string,
+	role string,
+	systemOverride string,
+	userPrompt string,
+) (utilityPromptResult, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if cfg == nil || router == nil {
+		return utilityPromptResult{}, errors.New("utility prompt runner requires config and router")
+	}
+	cleanRole := strings.TrimSpace(role)
+	if cleanRole == "" {
+		cleanRole = "utility"
+	}
+
+	snap := cfg.Current()
 	var wsRoleModel string
-	if c.workspaces != nil && meta.WorkspaceID != "" {
-		if ws, wErr := c.workspaces.Get(meta.WorkspaceID); wErr == nil {
-			wsRoleModel = ws.RoleModels["utility"]
-			if wsSnap, _, fErr := c.cfg.ForWorkspace(ws.RootPath, ws.TrustedHashes); fErr == nil && wsSnap != nil {
+	if workspaces != nil && strings.TrimSpace(workspaceID) != "" {
+		if ws, wErr := workspaces.Get(strings.TrimSpace(workspaceID)); wErr == nil && ws != nil {
+			wsRoleModel = ws.RoleModels[cleanRole]
+			if wsSnap, _, fErr := cfg.ForWorkspace(ws.RootPath, ws.TrustedHashes); fErr == nil && wsSnap != nil {
 				snap = wsSnap
 			}
 		}
 	}
 
-	route, rErr := c.router.Resolve("utility", wsRoleModel, "", snap)
-	if rErr != nil {
-		return "", "", 0, 0, 0, 0, rErr
+	route, err := router.Resolve(cleanRole, wsRoleModel, "", snap)
+	if err != nil {
+		return utilityPromptResult{}, err
 	}
 
-	staticSys := "You are the Housekeeping Utility agent in Gorness. Produce crisp session titles and faithful anchored summaries preserving exact file paths, decisions, and unresolved tasks."
-	if snap != nil {
-		if prof, ok := snap.Agents["utility"]; ok && strings.TrimSpace(prof.SystemPrompt) != "" {
-			staticSys = prof.SystemPrompt
+	staticSys := strings.TrimSpace(systemOverride)
+	if staticSys == "" {
+		staticSys = defaultUtilitySystemPrompt
+		if snap != nil {
+			if prof, ok := snap.Agents[cleanRole]; ok && strings.TrimSpace(prof.SystemPrompt) != "" {
+				staticSys = prof.SystemPrompt
+			}
 		}
 	}
 
-	ch, sErr := c.router.StreamWithRetry(ctx, route, llm.Request{
+	ch, err := router.StreamWithRetry(ctx, route, llm.Request{
+		Model:        route.ModelID,
+		Effort:       route.Effort,
 		StaticSystem: staticSys,
 		History: []store.SessionEntry{
 			{
 				Seq:  1,
-				ID:   "compact_req",
+				ID:   "utility_req",
 				Role: "user",
 				Blocks: []store.ContentBlock{
-					{Type: "text", Text: promptBuf.String()},
+					{Type: "text", Text: userPrompt},
 				},
 			},
 		},
 	})
-	if sErr != nil {
-		return "", "", 0, 0, 0, 0, sErr
+	if err != nil {
+		return utilityPromptResult{}, err
 	}
 
 	var (
 		textBuf     strings.Builder
-		answeringID string
 		answeringPr string
+		answeringID string
+		inTok       int
+		outTok      int
+		cacheTok    int
 	)
 	for ev := range ch {
 		switch ev.Type {
@@ -267,16 +324,12 @@ func (c *Compactor) generateMergedSummary(
 			cacheTok = ev.CacheReadTokens
 		case llm.StreamError:
 			if ev.Err != nil {
-				return "", "", 0, 0, 0, 0, ev.Err
+				return utilityPromptResult{}, ev.Err
 			}
-			return "", "", 0, 0, 0, 0, errors.New("compaction utility stream failed")
+			return utilityPromptResult{}, errors.New("utility stream failed")
 		}
 	}
 
-	out := strings.TrimSpace(textBuf.String())
-	if out == "" {
-		out = buildDeterministicAnchoredFallback(priorSummary, transcript)
-	}
 	usedModel := route.ModelID
 	usedSpec := route.Spec
 	if strings.TrimSpace(answeringID) != "" {
@@ -284,7 +337,34 @@ func (c *Compactor) generateMergedSummary(
 		usedSpec = resolveRouteSpec(route, snap, answeringPr, usedModel)
 	}
 	cost := llm.EstimateCostUSD(usedSpec, inTok, outTok, cacheTok)
-	return out, usedModel, inTok, outTok, cacheTok, cost, nil
+
+	return utilityPromptResult{
+		Text:            strings.TrimSpace(textBuf.String()),
+		ModelID:         usedModel,
+		InputTokens:     inTok,
+		OutputTokens:    outTok,
+		CacheReadTokens: cacheTok,
+		CostUSD:         cost,
+	}, nil
+}
+
+func splitSingleTurnIntoStepUnits(entries []store.SessionEntry) [][]store.SessionEntry {
+	if len(entries) < 5 {
+		return nil
+	}
+	var units [][]store.SessionEntry
+	for _, e := range entries {
+		if len(units) == 0 || e.Role == "assistant" {
+			units = append(units, []store.SessionEntry{e})
+		} else {
+			units[len(units)-1] = append(units[len(units)-1], e)
+		}
+	}
+	// Never split an assistant entry with unanswered tool_use at the end of olderTurns.
+	if len(units) < 2 {
+		return nil
+	}
+	return units
 }
 
 func isCompactionAnchorEntry(e store.SessionEntry) bool {

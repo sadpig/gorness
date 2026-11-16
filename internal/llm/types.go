@@ -8,7 +8,9 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strconv"
 	"strings"
+	"time"
 
 	"gorness.dev/gorness/internal/config"
 	"gorness.dev/gorness/internal/store"
@@ -87,6 +89,7 @@ type APIError struct {
 	StatusCode int
 	Message    string
 	Retryable  bool
+	RetryAfter time.Duration
 }
 
 func (e *APIError) Error() string {
@@ -233,12 +236,91 @@ func readHTTPError(resp *http.Response, providerID string, secrets ...string) er
 	if msg == "" {
 		msg = http.StatusText(resp.StatusCode)
 	}
+	retryable := isHTTPStatusRetryable(resp.StatusCode)
+	if retryable && isNonRetryableClientPayload(raw) {
+		retryable = false
+	}
 	return &APIError{
 		ProviderID: providerID,
 		StatusCode: resp.StatusCode,
 		Message:    config.Redact(msg, secrets),
-		Retryable:  isHTTPStatusRetryable(resp.StatusCode),
+		Retryable:  retryable,
+		RetryAfter: parseRetryAfterHeader(resp.Header.Get("Retry-After")),
 	}
+}
+
+func parseRetryAfterHeader(raw string) time.Duration {
+	s := strings.TrimSpace(raw)
+	if s == "" {
+		return 0
+	}
+	if secs, err := strconv.ParseFloat(s, 64); err == nil {
+		if secs <= 0 {
+			return 0
+		}
+		return time.Duration(secs * float64(time.Second))
+	}
+	if ts, err := http.ParseTime(s); err == nil {
+		if d := time.Until(ts); d > 0 {
+			return d
+		}
+	}
+	return 0
+}
+
+func isNonRetryableClientPayload(raw []byte) bool {
+	if len(raw) == 0 {
+		return false
+	}
+	var env struct {
+		Error struct {
+			Type    string `json:"type"`
+			Code    any    `json:"code"`
+			Message string `json:"message"`
+		} `json:"error"`
+	}
+	if json.Unmarshal(raw, &env) != nil {
+		return false
+	}
+	codeStr := ""
+	if env.Error.Code != nil {
+		codeStr = fmt.Sprint(env.Error.Code)
+	}
+	return isNonRetryableErrorClassification(env.Error.Type, codeStr, env.Error.Message)
+}
+
+func isNonRetryableErrorClassification(errType, errCode, msg string) bool {
+	lt := strings.ToLower(strings.TrimSpace(errType))
+	lc := strings.ToLower(strings.TrimSpace(errCode))
+	lm := strings.ToLower(strings.TrimSpace(msg))
+
+	for _, tok := range []string{lt, lc} {
+		switch tok {
+		case "invalid_request_error",
+			"context_length_exceeded",
+			"string_above_max_length",
+			"max_tokens_exceeded",
+			"invalid_api_key",
+			"authentication_error",
+			"permission_error",
+			"not_found_error",
+			"model_not_found",
+			"insufficient_quota",
+			"billing_hard_limit_reached",
+			"invalid_prompt",
+			"content_policy_violation",
+			"400", "401", "403", "404", "413", "422":
+			return true
+		}
+	}
+
+	if strings.Contains(lm, "context_length_exceeded") ||
+		strings.Contains(lm, "maximum context length") ||
+		strings.Contains(lm, "prompt is too long") ||
+		strings.Contains(lm, "invalid_request_error") {
+		return true
+	}
+	return false
 }
 
 func emitEvent(ctx context.Context, ch chan<- StreamEvent, ev StreamEvent) bool {

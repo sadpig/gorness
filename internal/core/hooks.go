@@ -1,15 +1,21 @@
 package core
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
+	"os/exec"
 	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
+	"gorness.dev/gorness/internal/config"
 	"gorness.dev/gorness/internal/tools"
 )
 
@@ -533,32 +539,23 @@ func (b *HookBus) IsFrozen() bool {
 }
 
 func (b *HookBus) recompileLocked() {
-	snap := &compiledHooks{}
-	if len(b.preStep) > 0 {
-		snap.preStep = make([]PreStepHook, len(b.preStep))
-		for i, e := range b.preStep {
-			snap.preStep[i] = e.fn
-		}
+	b.compiled.Store(&compiledHooks{
+		preStep:      compileHookSlice(b.preStep),
+		preToolUse:   compileHookSlice(b.preToolUse),
+		postToolUse:  compileHookSlice(b.postToolUse),
+		turnStopping: compileHookSlice(b.turnStopping),
+	})
+}
+
+func compileHookSlice[H any](entries []hookEntry[H]) []H {
+	if len(entries) == 0 {
+		return nil
 	}
-	if len(b.preToolUse) > 0 {
-		snap.preToolUse = make([]PreToolUseHook, len(b.preToolUse))
-		for i, e := range b.preToolUse {
-			snap.preToolUse[i] = e.fn
-		}
+	out := make([]H, len(entries))
+	for i, e := range entries {
+		out[i] = e.fn
 	}
-	if len(b.postToolUse) > 0 {
-		snap.postToolUse = make([]PostToolUseHook, len(b.postToolUse))
-		for i, e := range b.postToolUse {
-			snap.postToolUse[i] = e.fn
-		}
-	}
-	if len(b.turnStopping) > 0 {
-		snap.turnStopping = make([]TurnStoppingHook, len(b.turnStopping))
-		for i, e := range b.turnStopping {
-			snap.turnStopping[i] = e.fn
-		}
-	}
-	b.compiled.Store(snap)
+	return out
 }
 
 func (b *HookBus) OnPreStep(h PreStepHook) func() {
@@ -581,88 +578,35 @@ func (b *HookBus) addPreStep(pluginID string, h PreStepHook) func() {
 	if b == nil || h == nil {
 		return func() {}
 	}
-	b.mu.Lock()
-	b.nextHookID++
-	id := b.nextHookID
-	b.preStep = append(b.preStep, hookEntry[PreStepHook]{id: id, pluginID: pluginID, fn: h})
-	if b.frozen {
-		b.recompileLocked()
-	}
-	b.mu.Unlock()
-
-	var once sync.Once
-	return func() {
-		once.Do(func() {
-			b.mu.Lock()
-			b.preStep = removeHookByID(b.preStep, id)
-			if b.frozen {
-				b.recompileLocked()
-			}
-			b.mu.Unlock()
-		})
-	}
+	return addHookToSlot(b, &b.preStep, pluginID, h)
 }
 
 func (b *HookBus) addPreToolUse(pluginID string, h PreToolUseHook) func() {
 	if b == nil || h == nil {
 		return func() {}
 	}
-	b.mu.Lock()
-	b.nextHookID++
-	id := b.nextHookID
-	b.preToolUse = append(b.preToolUse, hookEntry[PreToolUseHook]{id: id, pluginID: pluginID, fn: h})
-	if b.frozen {
-		b.recompileLocked()
-	}
-	b.mu.Unlock()
-
-	var once sync.Once
-	return func() {
-		once.Do(func() {
-			b.mu.Lock()
-			b.preToolUse = removeHookByID(b.preToolUse, id)
-			if b.frozen {
-				b.recompileLocked()
-			}
-			b.mu.Unlock()
-		})
-	}
+	return addHookToSlot(b, &b.preToolUse, pluginID, h)
 }
 
 func (b *HookBus) addPostToolUse(pluginID string, h PostToolUseHook) func() {
 	if b == nil || h == nil {
 		return func() {}
 	}
-	b.mu.Lock()
-	b.nextHookID++
-	id := b.nextHookID
-	b.postToolUse = append(b.postToolUse, hookEntry[PostToolUseHook]{id: id, pluginID: pluginID, fn: h})
-	if b.frozen {
-		b.recompileLocked()
-	}
-	b.mu.Unlock()
-
-	var once sync.Once
-	return func() {
-		once.Do(func() {
-			b.mu.Lock()
-			b.postToolUse = removeHookByID(b.postToolUse, id)
-			if b.frozen {
-				b.recompileLocked()
-			}
-			b.mu.Unlock()
-		})
-	}
+	return addHookToSlot(b, &b.postToolUse, pluginID, h)
 }
 
 func (b *HookBus) addTurnStopping(pluginID string, h TurnStoppingHook) func() {
 	if b == nil || h == nil {
 		return func() {}
 	}
+	return addHookToSlot(b, &b.turnStopping, pluginID, h)
+}
+
+func addHookToSlot[H any](b *HookBus, slot *[]hookEntry[H], pluginID string, h H) func() {
 	b.mu.Lock()
 	b.nextHookID++
 	id := b.nextHookID
-	b.turnStopping = append(b.turnStopping, hookEntry[TurnStoppingHook]{id: id, pluginID: pluginID, fn: h})
+	*slot = append(*slot, hookEntry[H]{id: id, pluginID: pluginID, fn: h})
 	if b.frozen {
 		b.recompileLocked()
 	}
@@ -672,7 +616,7 @@ func (b *HookBus) addTurnStopping(pluginID string, h TurnStoppingHook) func() {
 	return func() {
 		once.Do(func() {
 			b.mu.Lock()
-			b.turnStopping = removeHookByID(b.turnStopping, id)
+			*slot = removeHookByID(*slot, id)
 			if b.frozen {
 				b.recompileLocked()
 			}
@@ -693,32 +637,30 @@ func removeHookByID[H any](in []hookEntry[H], id uint64) []hookEntry[H] {
 	return in
 }
 
+func snapshotHookSliceLocked[H any](b *HookBus, slot *[]hookEntry[H]) []H {
+	b.mu.RLock()
+	handlers := compileHookSlice(*slot)
+	b.mu.RUnlock()
+	return handlers
+}
+
+func runErrHookSlice[E any, H ~func(context.Context, E) error](ctx context.Context, handlers []H, ev E) error {
+	for i := 0; i < len(handlers); i++ {
+		if err := handlers[i](ctx, ev); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func (b *HookBus) RunPreStep(ctx context.Context, ev *PreStepEvent) error {
 	if b == nil {
 		return nil
 	}
 	if snap := b.compiled.Load(); snap != nil {
-		for i := 0; i < len(snap.preStep); i++ {
-			if err := snap.preStep[i](ctx, ev); err != nil {
-				return err
-			}
-		}
-		return nil
+		return runErrHookSlice(ctx, snap.preStep, ev)
 	}
-
-	b.mu.RLock()
-	handlers := make([]PreStepHook, len(b.preStep))
-	for i, e := range b.preStep {
-		handlers[i] = e.fn
-	}
-	b.mu.RUnlock()
-
-	for _, fn := range handlers {
-		if err := fn(ctx, ev); err != nil {
-			return err
-		}
-	}
-	return nil
+	return runErrHookSlice(ctx, snapshotHookSliceLocked(b, &b.preStep), ev)
 }
 
 func (b *HookBus) RunPreToolUse(ctx context.Context, ev *PreToolUseEvent) (GateResult, error) {
@@ -728,15 +670,7 @@ func (b *HookBus) RunPreToolUse(ctx context.Context, ev *PreToolUseEvent) (GateR
 	if snap := b.compiled.Load(); snap != nil {
 		return runPreToolSlice(ctx, snap.preToolUse, ev)
 	}
-
-	b.mu.RLock()
-	handlers := make([]PreToolUseHook, len(b.preToolUse))
-	for i, e := range b.preToolUse {
-		handlers[i] = e.fn
-	}
-	b.mu.RUnlock()
-
-	return runPreToolSlice(ctx, handlers, ev)
+	return runPreToolSlice(ctx, snapshotHookSliceLocked(b, &b.preToolUse), ev)
 }
 
 // runPreToolSlice 依次执行所有 PreToolUse 钩子：
@@ -752,29 +686,37 @@ func runPreToolSlice(ctx context.Context, handlers []PreToolUseHook, ev *PreTool
 				Reason:     err.Error(),
 			}, err
 		}
-		switch res.Action {
-		case GateDeny:
-			if res.ReasonCode == "" {
-				res.ReasonCode = "hook-deny"
-			}
-			return res, nil
-		case GateDefer:
-			if chosen.Action != GateDefer {
-				if res.ReasonCode == "" {
-					res.ReasonCode = "hook-defer"
-				}
-				chosen = res
-			}
-		case GateAsk:
-			if !chosen.RequiresAction() {
-				if res.ReasonCode == "" {
-					res.ReasonCode = "hook-ask"
-				}
-				chosen = res
-			}
+		chosen = mergePreToolGateDecision(chosen, res)
+		if chosen.Action == GateDeny {
+			return chosen, nil
 		}
 	}
 	return chosen, nil
+}
+
+func mergePreToolGateDecision(chosen, next GateResult) GateResult {
+	switch next.Action {
+	case GateDeny:
+		if next.ReasonCode == "" {
+			next.ReasonCode = "hook-deny"
+		}
+		return next
+	case GateDefer:
+		if chosen.Action != GateDeny && chosen.Action != GateDefer {
+			if next.ReasonCode == "" {
+				next.ReasonCode = "hook-defer"
+			}
+			return next
+		}
+	case GateAsk:
+		if !chosen.RequiresAction() {
+			if next.ReasonCode == "" {
+				next.ReasonCode = "hook-ask"
+			}
+			return next
+		}
+	}
+	return chosen
 }
 
 func (b *HookBus) RunPostToolUse(ctx context.Context, ev *PostToolUseEvent) error {
@@ -782,27 +724,9 @@ func (b *HookBus) RunPostToolUse(ctx context.Context, ev *PostToolUseEvent) erro
 		return nil
 	}
 	if snap := b.compiled.Load(); snap != nil {
-		for i := 0; i < len(snap.postToolUse); i++ {
-			if err := snap.postToolUse[i](ctx, ev); err != nil {
-				return err
-			}
-		}
-		return nil
+		return runErrHookSlice(ctx, snap.postToolUse, ev)
 	}
-
-	b.mu.RLock()
-	handlers := make([]PostToolUseHook, len(b.postToolUse))
-	for i, e := range b.postToolUse {
-		handlers[i] = e.fn
-	}
-	b.mu.RUnlock()
-
-	for _, fn := range handlers {
-		if err := fn(ctx, ev); err != nil {
-			return err
-		}
-	}
-	return nil
+	return runErrHookSlice(ctx, snapshotHookSliceLocked(b, &b.postToolUse), ev)
 }
 
 func (b *HookBus) RunTurnStopping(ctx context.Context, ev *TurnStoppingEvent) error {
@@ -810,25 +734,348 @@ func (b *HookBus) RunTurnStopping(ctx context.Context, ev *TurnStoppingEvent) er
 		return nil
 	}
 	if snap := b.compiled.Load(); snap != nil {
-		for i := 0; i < len(snap.turnStopping); i++ {
-			if err := snap.turnStopping[i](ctx, ev); err != nil {
-				return err
+		return runErrHookSlice(ctx, snap.turnStopping, ev)
+	}
+	return runErrHookSlice(ctx, snapshotHookSliceLocked(b, &b.turnStopping), ev)
+}
+
+// ============================================================================
+// hooks.toml Shell Command Hooks Execution
+// ============================================================================
+
+const maxHookCommandOutputBytes = 64 * 1024
+
+type hookExecResult struct {
+	stdout   string
+	stderr   string
+	exitCode int
+	timedOut bool
+}
+
+func executeHookShellCommand(
+	ctx context.Context,
+	spec config.HookCommandSpec,
+	workDir string,
+	stdinPayload any,
+) (hookExecResult, error) {
+	cmdText := strings.TrimSpace(spec.Command)
+	if cmdText == "" {
+		return hookExecResult{}, nil
+	}
+
+	timeout := 10 * time.Second
+	if spec.TimeoutSec > 0 {
+		timeout = time.Duration(spec.TimeoutSec) * time.Second
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	execCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+
+	stdinBytes, err := json.Marshal(stdinPayload)
+	if err != nil {
+		return hookExecResult{}, fmt.Errorf("marshal hook stdin json: %w", err)
+	}
+
+	shellBin := "/bin/zsh"
+	shellArgs := []string{"-f", "-c", cmdText}
+	if _, stErr := os.Stat(shellBin); stErr != nil {
+		shellBin = "/bin/sh"
+		shellArgs = []string{"-c", cmdText}
+	}
+
+	cmd := exec.Command(shellBin, shellArgs...)
+	if strings.TrimSpace(workDir) != "" {
+		if st, dErr := os.Stat(workDir); dErr == nil && st.IsDir() {
+			cmd.Dir = workDir
+		}
+	}
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	cmd.Stdin = bytes.NewReader(stdinBytes)
+
+	var stdoutBuf, stderrBuf cappedByteBuffer
+	stdoutBuf.limit = maxHookCommandOutputBytes
+	stderrBuf.limit = maxHookCommandOutputBytes
+	cmd.Stdout = &stdoutBuf
+	cmd.Stderr = &stderrBuf
+
+	if err := cmd.Start(); err != nil {
+		return hookExecResult{}, err
+	}
+
+	waitCh := make(chan error, 1)
+	go func() {
+		waitCh <- cmd.Wait()
+	}()
+
+	var waitErr error
+	var timedOut bool
+	select {
+	case waitErr = <-waitCh:
+	case <-execCtx.Done():
+		timedOut = errors.Is(execCtx.Err(), context.DeadlineExceeded)
+		if cmd.Process != nil {
+			_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+		}
+		waitErr = <-waitCh
+	}
+
+	exitCode := 0
+	if waitErr != nil {
+		var exitErr *exec.ExitError
+		if errors.As(waitErr, &exitErr) {
+			exitCode = exitErr.ExitCode()
+		} else {
+			exitCode = -1
+		}
+	}
+
+	return hookExecResult{
+		stdout:   stdoutBuf.String(),
+		stderr:   stderrBuf.String(),
+		exitCode: exitCode,
+		timedOut: timedOut,
+	}, nil
+}
+
+type cappedByteBuffer struct {
+	buf   bytes.Buffer
+	limit int
+}
+
+func (b *cappedByteBuffer) Write(p []byte) (int, error) {
+	origLen := len(p)
+	if b.limit <= 0 {
+		return origLen, nil
+	}
+	rem := b.limit - b.buf.Len()
+	if rem > 0 {
+		if len(p) > rem {
+			p = p[:rem]
+		}
+		_, _ = b.buf.Write(p)
+	}
+	return origLen, nil
+}
+
+func (b *cappedByteBuffer) String() string {
+	return b.buf.String()
+}
+
+func formatHookFeedback(stderrStr, stdoutStr, fallback string, secrets []string) string {
+	msg := strings.TrimSpace(stderrStr)
+	if msg == "" {
+		msg = strings.TrimSpace(stdoutStr)
+	}
+	if msg == "" {
+		msg = fallback
+	}
+	return config.EscapeBidi(config.Redact(msg, secrets))
+}
+
+// ExecutePreToolCommandHooks runs matching hooks.toml PreToolUse commands sequentially.
+// Exit code 2 blocks the tool call (GateDeny, ReasonCode "hook-blocked") and feeds redacted stderr back to the model.
+func ExecutePreToolCommandHooks(
+	ctx context.Context,
+	specs []config.HookCommandSpec,
+	workDir string,
+	secrets []string,
+	ev *PreToolUseEvent,
+) (GateResult, error) {
+	if len(specs) == 0 || ev == nil {
+		return GateResult{}, nil
+	}
+	var chosen GateResult
+	for _, spec := range specs {
+		if !spec.MatchesTool(ev.Call.ToolName) {
+			continue
+		}
+		if ctx != nil && ctx.Err() != nil {
+			return GateResult{}, ctx.Err()
+		}
+		payload := map[string]any{
+			"event":          "PreToolUse",
+			"hook_id":        spec.ID,
+			"run_id":         ev.RunID,
+			"workspace_id":   ev.WorkspaceID,
+			"workspace_root": workDir,
+			"session_id":     ev.SessionID,
+			"agent_role":     ev.AgentRole,
+			"step":           ev.Step,
+			"tool_call_id":   ev.Call.ToolCallID,
+			"tool_name":      ev.Call.ToolName,
+			"tool_input":     ev.Call.Args,
+		}
+		res, err := executeHookShellCommand(ctx, spec, workDir, payload)
+		if err != nil {
+			continue
+		}
+		if res.exitCode == 2 {
+			feedback := formatHookFeedback(res.stderr, res.stdout, "blocked by PreToolUse hook", secrets)
+			return GateResult{
+				Action:     GateDeny,
+				ReasonCode: "hook-blocked",
+				Reason:     feedback,
+			}, nil
+		}
+		if res.exitCode == 0 {
+			trimmedOut := strings.TrimSpace(res.stdout)
+			if strings.HasPrefix(trimmedOut, "{") {
+				var jsonDec struct {
+					Action     GateAction `json:"action"`
+					ReasonCode string     `json:"reason_code"`
+					Reason     string     `json:"reason"`
+				}
+				if json.Unmarshal([]byte(trimmedOut), &jsonDec) == nil && jsonDec.Action != "" {
+					jsonDec.Reason = config.EscapeBidi(config.Redact(strings.TrimSpace(jsonDec.Reason), secrets))
+					chosen = mergePreToolGateDecision(chosen, GateResult{
+						Action:     jsonDec.Action,
+						ReasonCode: strings.TrimSpace(jsonDec.ReasonCode),
+						Reason:     jsonDec.Reason,
+					})
+					if chosen.Action == GateDeny {
+						return chosen, nil
+					}
+				}
 			}
 		}
+	}
+	return chosen, nil
+}
+
+// ExecutePostToolCommandHooks runs matching hooks.toml PostToolUse commands sequentially.
+func ExecutePostToolCommandHooks(
+	ctx context.Context,
+	specs []config.HookCommandSpec,
+	workDir string,
+	secrets []string,
+	ev *PostToolUseEvent,
+) error {
+	if len(specs) == 0 || ev == nil {
 		return nil
 	}
-
-	b.mu.RLock()
-	handlers := make([]TurnStoppingHook, len(b.turnStopping))
-	for i, e := range b.turnStopping {
-		handlers[i] = e.fn
+	var isErr bool
+	var outPreview string
+	if ev.Result != nil {
+		isErr = ev.Result.IsError
+		outPreview = ev.Result.Output
+		if len(outPreview) > 8192 {
+			outPreview = outPreview[:8192]
+		}
 	}
-	b.mu.RUnlock()
+	for _, spec := range specs {
+		if !spec.MatchesTool(ev.Call.ToolName) {
+			continue
+		}
+		if ctx != nil && ctx.Err() != nil {
+			return ctx.Err()
+		}
+		payload := map[string]any{
+			"event":          "PostToolUse",
+			"hook_id":        spec.ID,
+			"run_id":         ev.RunID,
+			"workspace_id":   ev.WorkspaceID,
+			"workspace_root": workDir,
+			"session_id":     ev.SessionID,
+			"agent_role":     ev.AgentRole,
+			"step":           ev.Step,
+			"tool_call_id":   ev.Call.ToolCallID,
+			"tool_name":      ev.Call.ToolName,
+			"tool_input":     ev.Call.Args,
+			"tool_output":    outPreview,
+			"is_error":       isErr,
+			"duration_ms":    ev.Duration.Milliseconds(),
+		}
+		_, _ = executeHookShellCommand(ctx, spec, workDir, payload)
+	}
+	return nil
+}
 
-	for _, fn := range handlers {
-		if err := fn(ctx, ev); err != nil {
-			return err
+// ExecuteTurnStoppingCommandHooks runs hooks.toml TurnStopping commands sequentially.
+// Exit code 2 (or JSON {"veto_stop": true, "follow_up_prompt": "..."}) vetoes stopping and injects follow-up feedback.
+func ExecuteTurnStoppingCommandHooks(
+	ctx context.Context,
+	specs []config.HookCommandSpec,
+	workDir string,
+	secrets []string,
+	ev *TurnStoppingEvent,
+) error {
+	if len(specs) == 0 || ev == nil {
+		return nil
+	}
+	for _, spec := range specs {
+		if ctx != nil && ctx.Err() != nil {
+			return ctx.Err()
+		}
+		payload := map[string]any{
+			"event":          "TurnStopping",
+			"hook_id":        spec.ID,
+			"run_id":         ev.RunID,
+			"workspace_id":   ev.WorkspaceID,
+			"workspace_root": workDir,
+			"session_id":     ev.SessionID,
+			"agent_role":     ev.AgentRole,
+			"step":           ev.Step,
+			"stop_reason":    ev.StopReason,
+		}
+		res, err := executeHookShellCommand(ctx, spec, workDir, payload)
+		if err != nil {
+			continue
+		}
+		if res.exitCode == 2 {
+			ev.VetoStop = true
+			ev.FollowUpPrompt = formatHookFeedback(
+				res.stderr,
+				res.stdout,
+				"TurnStopping hook vetoed stop; verify requirements before completing.",
+				secrets,
+			)
+			return nil
+		}
+		if res.exitCode == 0 {
+			trimmedOut := strings.TrimSpace(res.stdout)
+			if strings.HasPrefix(trimmedOut, "{") {
+				var jsonStop struct {
+					VetoStop       bool   `json:"veto_stop"`
+					FollowUpPrompt string `json:"follow_up_prompt"`
+				}
+				if json.Unmarshal([]byte(trimmedOut), &jsonStop) == nil && jsonStop.VetoStop {
+					ev.VetoStop = true
+					fp := strings.TrimSpace(jsonStop.FollowUpPrompt)
+					if fp == "" {
+						fp = "TurnStopping hook vetoed stop; verify requirements before completing."
+					}
+					ev.FollowUpPrompt = config.EscapeBidi(config.Redact(fp, secrets))
+					return nil
+				}
+			}
 		}
 	}
 	return nil
+}
+
+// MountHooksConfig mounts static HooksConfig shell commands onto a Scope.
+func MountHooksConfig(sc *Scope, cfg config.HooksConfig, workDir string, secrets []string) {
+	if sc == nil || cfg.IsEmpty() {
+		return
+	}
+	if len(cfg.PreToolUse) > 0 {
+		specs := append([]config.HookCommandSpec(nil), cfg.PreToolUse...)
+		sc.OnPreToolUse(func(ctx context.Context, ev *PreToolUseEvent) (GateResult, error) {
+			return ExecutePreToolCommandHooks(ctx, specs, workDir, secrets, ev)
+		})
+	}
+	if len(cfg.PostToolUse) > 0 {
+		specs := append([]config.HookCommandSpec(nil), cfg.PostToolUse...)
+		sc.OnPostToolUse(func(ctx context.Context, ev *PostToolUseEvent) error {
+			return ExecutePostToolCommandHooks(ctx, specs, workDir, secrets, ev)
+		})
+	}
+	if len(cfg.TurnStopping) > 0 {
+		specs := append([]config.HookCommandSpec(nil), cfg.TurnStopping...)
+		sc.OnTurnStopping(func(ctx context.Context, ev *TurnStoppingEvent) error {
+			return ExecuteTurnStoppingCommandHooks(ctx, specs, workDir, secrets, ev)
+		})
+	}
 }

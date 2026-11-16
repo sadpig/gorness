@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -19,15 +20,22 @@ import (
 )
 
 const (
-	DoomLoopThreshold         = 3
-	DefaultMaxToolConcurrency = 8
-	DefaultMaxSteps           = 64
+	DoomLoopThreshold          = 3
+	DefaultMaxToolConcurrency  = 8
+	DefaultMaxSteps            = 64
+	AutoCompactionContextRatio = 0.85
 )
 
 var (
-	ErrDoomLoop         = errors.New("doom loop detected: 3 consecutive identical failing tool calls")
-	ErrMaxStepsExceeded = errors.New("agent loop exceeded maximum step limit")
+	ErrDoomLoop                = errors.New("doom loop detected: 3 consecutive identical failing tool calls")
+	ErrMaxStepsExceeded        = errors.New("agent loop exceeded maximum step limit")
+	reClosingSystemReminderTag = regexp.MustCompile(`(?i)</\s*system-reminder\b[^>]*>`)
 )
+
+func sanitizeSystemReminderContent(raw string) string {
+	clean := config.EscapeBidi(raw)
+	return reClosingSystemReminderTag.ReplaceAllString(clean, "&lt;/system-reminder&gt;")
+}
 
 // errGroup 提供零外部依赖的受限并发协程组（语义等价于 x/sync/errgroup + SetLimit），严格遵守五依赖上限铁律。
 type errGroup struct {
@@ -164,6 +172,7 @@ type agentLoopConfig struct {
 	skills    *tools.SkillCatalog
 	sessions  *store.SessionStore
 	snapshots *store.SnapshotStore
+	compactor *Compactor
 	router    *llm.Router
 	hooks     *HookBus
 	gate      *PermissionGate
@@ -363,27 +372,41 @@ func (l *AgentLoop) Run(ctx context.Context) (RunOutcome, error) {
 				return outcome, sErr
 			}
 			if injected > 0 {
+				l.maybeAutoCompact(ctx, answeringSpec, stepRes.inputTokens)
 				continue
 			}
 
+			stopEv := &TurnStoppingEvent{
+				RunID:       l.cfg.runID,
+				WorkspaceID: l.cfg.ws.ID,
+				SessionID:   l.cfg.sessionID,
+				AgentRole:   l.cfg.agentRole,
+				Step:        step,
+				StopReason:  stepRes.stopReason,
+			}
 			if l.cfg.hooks != nil {
-				stopEv := &TurnStoppingEvent{
-					RunID:       l.cfg.runID,
-					WorkspaceID: l.cfg.ws.ID,
-					SessionID:   l.cfg.sessionID,
-					AgentRole:   l.cfg.agentRole,
-					Step:        step,
-					StopReason:  stepRes.stopReason,
-				}
 				if hErr := l.cfg.hooks.RunTurnStopping(ctx, stopEv); hErr != nil {
 					outcome.Status = "failed"
 					return outcome, hErr
 				}
-				if stopEv.VetoStop && strings.TrimSpace(stopEv.FollowUpPrompt) != "" {
-					pendingSkillReminders = append(pendingSkillReminders, stopEv.FollowUpPrompt)
-					continue
+			}
+			if !stopEv.VetoStop && l.cfg.snap != nil && len(l.cfg.snap.Hooks.TurnStopping) > 0 {
+				if hErr := ExecuteTurnStoppingCommandHooks(ctx, l.cfg.snap.Hooks.TurnStopping, l.cfg.effectiveRoot, l.cfg.secrets, stopEv); hErr != nil {
+					outcome.Status = "failed"
+					return outcome, hErr
 				}
 			}
+			if stopEv.VetoStop {
+				fp := strings.TrimSpace(stopEv.FollowUpPrompt)
+				if fp == "" {
+					fp = "TurnStopping hook vetoed stop; verify requirements before completing."
+				}
+				pendingSkillReminders = append(pendingSkillReminders, sanitizeSystemReminderContent(fp))
+				l.maybeAutoCompact(ctx, answeringSpec, stepRes.inputTokens)
+				continue
+			}
+
+			l.maybeAutoCompact(ctx, answeringSpec, stepRes.inputTokens)
 
 			outcome.Status = "completed"
 			outcome.StopReason = stepRes.stopReason
@@ -435,6 +458,9 @@ func (l *AgentLoop) Run(ctx context.Context) (RunOutcome, error) {
 			l.emit(EventDoomLoop, *execBatch.doom)
 			return outcome, ErrDoomLoop
 		}
+
+		// 当输入上下文达到模型 ContextWindow 的 85% 及以上时，在步边界自动执行锚定增量压缩
+		l.maybeAutoCompact(ctx, answeringSpec, stepRes.inputTokens)
 	}
 
 	outcome.Status = "failed"
@@ -618,16 +644,26 @@ func (l *AgentLoop) executeStepTools(
 		}
 
 		// 检查是否可以组建连续并发安全只读批次
+		var (
+			cachedPreHook    GateResult
+			cachedPreHookErr error
+			hasCachedPreHook bool
+		)
 		if l.isConcurrentReadCandidate(resolved[idx]) {
 			var parallelBatch []ToolInvocation
 			for idx < len(resolved) && l.isConcurrentReadCandidate(resolved[idx]) {
 				inv := resolved[idx]
 				hookDec, hErr := l.runPreToolHooks(ctx, step, inv)
 				if hErr != nil {
+					cachedPreHook = hookDec
+					cachedPreHookErr = hErr
+					hasCachedPreHook = true
 					break
 				}
 				gateRes := l.evaluateGate(inv, hookDec)
 				if gateRes.Action != GateAllow {
+					cachedPreHook = hookDec
+					hasCachedPreHook = true
 					break
 				}
 				parallelBatch = append(parallelBatch, inv)
@@ -671,7 +707,7 @@ func (l *AgentLoop) executeStepTools(
 		inv := resolved[idx]
 		idx++
 
-		blk, touched, deferred, fatalErr := l.runSerialTool(ctx, step, stepSeq, inv)
+		blk, touched, deferred, fatalErr := l.runSerialTool(ctx, step, stepSeq, inv, cachedPreHook, cachedPreHookErr, hasCachedPreHook)
 		if fatalErr != nil {
 			return out, fatalErr
 		}
@@ -783,20 +819,7 @@ func (l *AgentLoop) runParallelReadBatch(
 		if res.TouchedPath != "" {
 			touched = append(touched, res.TouchedPath)
 		}
-		if l.cfg.hooks != nil {
-			postEv := &PostToolUseEvent{
-				RunID:       l.cfg.runID,
-				WorkspaceID: l.cfg.ws.ID,
-				SessionID:   l.cfg.sessionID,
-				AgentRole:   l.cfg.agentRole,
-				Step:        step,
-				Call:        inv,
-				Result:      &res,
-				Duration:    sr.duration,
-				Err:         sr.execErr,
-			}
-			_ = l.cfg.hooks.RunPostToolUse(ctx, postEv)
-		}
+		l.runPostToolHooks(ctx, step, inv, &res, sr.duration, sr.execErr)
 		blocks[i] = store.ContentBlock{
 			Type:       "tool_result",
 			ToolCallID: inv.ToolCallID,
@@ -814,10 +837,21 @@ func (l *AgentLoop) runSerialTool(
 	step int,
 	stepSeq uint64,
 	inv ToolInvocation,
+	cachedHookDec GateResult,
+	cachedHookErr error,
+	hasCachedHook bool,
 ) (store.ContentBlock, string, *DeferredToolPayload, error) {
 	// 1. 先执行 PreToolUse 钩子与首轮 PermissionGate 拒绝检查（Step 1 Hard-Floor / ACL / Step 2 Plan / Step 3 Unattended Tampered / Step 4 Hook Deny）：
 	// 任何应被拒绝的调用立即返回 Permission denied，严禁提前读取磁盘文件或泄露 old_string 是否匹配！
-	hookDec, hErr := l.runPreToolHooks(ctx, step, inv)
+	var (
+		hookDec GateResult
+		hErr    error
+	)
+	if hasCachedHook {
+		hookDec, hErr = cachedHookDec, cachedHookErr
+	} else {
+		hookDec, hErr = l.runPreToolHooks(ctx, step, inv)
+	}
 	if hErr != nil && !hookDec.RequiresAction() {
 		hookDec = GateResult{
 			Action:     GateDeny,
@@ -997,20 +1031,7 @@ func (l *AgentLoop) runSerialTool(
 		}
 	}
 
-	if l.cfg.hooks != nil {
-		postEv := &PostToolUseEvent{
-			RunID:       l.cfg.runID,
-			WorkspaceID: l.cfg.ws.ID,
-			SessionID:   l.cfg.sessionID,
-			AgentRole:   l.cfg.agentRole,
-			Step:        step,
-			Call:        inv,
-			Result:      &res,
-			Duration:    l.cfg.now().Sub(started),
-			Err:         execErr,
-		}
-		_ = l.cfg.hooks.RunPostToolUse(ctx, postEv)
-	}
+	l.runPostToolHooks(ctx, step, inv, &res, l.cfg.now().Sub(started), execErr)
 
 	return store.ContentBlock{
 		Type:       "tool_result",
@@ -1050,7 +1071,9 @@ func (l *AgentLoop) tryStageForGate(inv ToolInvocation) (*tools.StagedEdit, erro
 }
 
 func (l *AgentLoop) runPreToolHooks(ctx context.Context, step int, inv ToolInvocation) (GateResult, error) {
-	if l.cfg.hooks == nil {
+	hasBus := l.cfg.hooks != nil
+	hasCmdHooks := l.cfg.snap != nil && len(l.cfg.snap.Hooks.PreToolUse) > 0
+	if !hasBus && !hasCmdHooks {
 		return GateResult{}, nil
 	}
 	ev := &PreToolUseEvent{
@@ -1061,7 +1084,67 @@ func (l *AgentLoop) runPreToolHooks(ctx context.Context, step int, inv ToolInvoc
 		Step:        step,
 		Call:        inv,
 	}
-	return l.cfg.hooks.RunPreToolUse(ctx, ev)
+	var chosen GateResult
+	if hasBus {
+		busDec, err := l.cfg.hooks.RunPreToolUse(ctx, ev)
+		if err != nil {
+			return busDec, err
+		}
+		chosen = mergePreToolGateDecision(chosen, busDec)
+		if chosen.Action == GateDeny {
+			return chosen, nil
+		}
+	}
+	if hasCmdHooks {
+		cmdDec, err := ExecutePreToolCommandHooks(ctx, l.cfg.snap.Hooks.PreToolUse, l.cfg.effectiveRoot, l.cfg.secrets, ev)
+		if err != nil {
+			return cmdDec, err
+		}
+		chosen = mergePreToolGateDecision(chosen, cmdDec)
+	}
+	return chosen, nil
+}
+
+func (l *AgentLoop) runPostToolHooks(ctx context.Context, step int, inv ToolInvocation, res *tools.ToolResult, dur time.Duration, execErr error) {
+	hasBus := l.cfg.hooks != nil
+	hasCmdHooks := l.cfg.snap != nil && len(l.cfg.snap.Hooks.PostToolUse) > 0
+	if !hasBus && !hasCmdHooks {
+		return
+	}
+	postEv := &PostToolUseEvent{
+		RunID:       l.cfg.runID,
+		WorkspaceID: l.cfg.ws.ID,
+		SessionID:   l.cfg.sessionID,
+		AgentRole:   l.cfg.agentRole,
+		Step:        step,
+		Call:        inv,
+		Result:      res,
+		Duration:    dur,
+		Err:         execErr,
+	}
+	if hasBus {
+		_ = l.cfg.hooks.RunPostToolUse(ctx, postEv)
+	}
+	if hasCmdHooks {
+		_ = ExecutePostToolCommandHooks(ctx, l.cfg.snap.Hooks.PostToolUse, l.cfg.effectiveRoot, l.cfg.secrets, postEv)
+	}
+}
+
+func (l *AgentLoop) maybeAutoCompact(ctx context.Context, spec config.ModelSpec, inputTokens int) {
+	if l.cfg.compactor == nil || spec.ContextWindow <= 0 || inputTokens <= 0 {
+		return
+	}
+	threshold := int(float64(spec.ContextWindow) * AutoCompactionContextRatio)
+	if threshold < 1 {
+		threshold = 1
+	}
+	if inputTokens < threshold {
+		return
+	}
+	res, err := l.cfg.compactor.Compact(ctx, l.cfg.sessionID)
+	if err == nil && res != nil && !res.Skipped {
+		l.emit(EventCompacted, res)
+	}
 }
 
 func (l *AgentLoop) evaluateGate(inv ToolInvocation, hookDec GateResult) GateResult {
@@ -1298,6 +1381,7 @@ func (l *AgentLoop) makeToolCallContext(seq uint64, allowOutside bool, selectedH
 		sbMode = tools.SandboxReadOnly
 	}
 	return tools.CallContext{
+		WorkspaceID:           l.cfg.ws.ID,
 		WorkspaceRoot:         l.cfg.effectiveRoot,
 		VaultRoot:             l.cfg.snap.Paths.Root,
 		SessionID:             l.cfg.sessionID,
@@ -1370,13 +1454,14 @@ func (l *AgentLoop) flushQueuedSteersCount() (int, error) {
 		if trimmed == "" {
 			continue
 		}
-		wrapped := "<system-reminder>\nSteer: " + trimmed + "\n</system-reminder>"
+		safeSteer := sanitizeSystemReminderContent(trimmed)
+		wrapped := "<system-reminder>\nSteer: " + safeSteer + "\n</system-reminder>"
 		blocks = append(blocks, store.ContentBlock{
 			Type: "text",
 			Text: wrapped,
 		})
 		injected++
-		l.emit(EventSteerInjected, SteerInjectedPayload{Message: trimmed})
+		l.emit(EventSteerInjected, SteerInjectedPayload{Message: safeSteer})
 	}
 	if len(blocks) == 0 {
 		return 0, nil
@@ -1402,7 +1487,9 @@ func (l *AgentLoop) collectPathSkillReminders(touchedPaths []string) []string {
 			continue
 		}
 		l.activatedSkills[sk.Name] = true
-		reminders = append(reminders, fmt.Sprintf("Auto-activated skill %q for path match:\n%s", sk.Name, sk.Body))
+		safeName := sanitizeSystemReminderContent(sk.Name)
+		safeBody := sanitizeSystemReminderContent(sk.Body)
+		reminders = append(reminders, fmt.Sprintf("Auto-activated skill %q for path match:\n%s", safeName, safeBody))
 	}
 	return reminders
 }

@@ -209,6 +209,74 @@ func (s *GrantStore) ListGrants(wsID string) ([]GrantRecord, error) {
 	return s.readGrantsFile(strings.TrimSpace(wsID))
 }
 
+func (s *GrantStore) RevokeGrant(wsID, fingerprint string) error {
+	if s == nil {
+		return nil
+	}
+	cleanWS := strings.TrimSpace(wsID)
+	cleanFP := strings.TrimSpace(fingerprint)
+	if cleanWS == "" || cleanFP == "" || strings.TrimSpace(s.paths.Root) == "" {
+		return nil
+	}
+
+	err := store.WithFlock(s.grantsLockPath(cleanWS), true, func() error {
+		existing, rErr := s.readGrantsFile(cleanWS)
+		if rErr != nil {
+			return rErr
+		}
+		if len(existing) == 0 {
+			return nil
+		}
+		remaining := make([]GrantRecord, 0, len(existing))
+		for _, rec := range existing {
+			if rec.Fingerprint != cleanFP {
+				remaining = append(remaining, rec)
+			}
+		}
+		encoded, mErr := toml.Marshal(grantsDoc{Grants: remaining})
+		if mErr != nil {
+			return fmt.Errorf("marshal grants.toml: %w", mErr)
+		}
+		return store.AtomicWriteFile(s.grantsFilePath(cleanWS), encoded, 0o600)
+	})
+	if err != nil {
+		return err
+	}
+
+	s.mu.Lock()
+	if wsMap, ok := s.cache[cleanWS]; ok {
+		delete(wsMap, cleanFP)
+	}
+	s.mu.Unlock()
+	return nil
+}
+
+func (s *GrantStore) ClearGrants(wsID string) error {
+	if s == nil {
+		return nil
+	}
+	cleanWS := strings.TrimSpace(wsID)
+	if cleanWS == "" || strings.TrimSpace(s.paths.Root) == "" {
+		return nil
+	}
+
+	err := store.WithFlock(s.grantsLockPath(cleanWS), true, func() error {
+		p := s.grantsFilePath(cleanWS)
+		if rmErr := os.Remove(p); rmErr != nil && !errors.Is(rmErr, os.ErrNotExist) {
+			return rmErr
+		}
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+
+	s.mu.Lock()
+	delete(s.cache, cleanWS)
+	s.mu.Unlock()
+	return nil
+}
+
 func (s *GrantStore) readGrantsFile(wsID string) ([]GrantRecord, error) {
 	raw, err := os.ReadFile(s.grantsFilePath(wsID))
 	if err != nil {
@@ -283,11 +351,12 @@ func NormalizePermMode(raw string) string {
 	}
 }
 
-// DetectTamperedProjectConfig 检测工作区是否存在未经 SHA-256 白名单授信的项目级安全敏感配置（如 .gorness/mcp.toml、.mcp.json 等）。
+// DetectTamperedProjectConfig 检测工作区是否存在未经 SHA-256 白名单授信的项目级安全敏感配置（如 .gorness/mcp.toml、.mcp.json、.gorness/hooks.toml 等）。
 func DetectTamperedProjectConfig(wsRoot string, trustedHashes map[string]string, untrustedWarnings []string) bool {
 	for _, w := range untrustedWarnings {
 		lw := strings.ToLower(w)
 		if strings.Contains(lw, "untrusted workspace") ||
+			strings.Contains(lw, "skipped untrusted") ||
 			strings.Contains(lw, "ignored untrusted") ||
 			strings.Contains(lw, "rejected unsafe") ||
 			strings.Contains(lw, "rejected cmd:") {
@@ -297,83 +366,14 @@ func DetectTamperedProjectConfig(wsRoot string, trustedHashes map[string]string,
 	if strings.TrimSpace(wsRoot) == "" {
 		return false
 	}
-	canonWs := wsRoot
-	if resolved, err := filepath.EvalSymlinks(wsRoot); err == nil {
-		canonWs = filepath.Clean(resolved)
-	} else {
-		canonWs = filepath.Clean(wsRoot)
-	}
-
-	for _, relCand := range []string{
-		filepath.Join(".gorness", "mcp.toml"),
-		".mcp.json",
-		filepath.Join(".gorness", "hooks.toml"),
-	} {
-		full := filepath.Join(wsRoot, relCand)
-		st, err := os.Lstat(full)
-		if err != nil {
-			continue
-		}
-		if st.Mode()&os.ModeSymlink != 0 {
-			return true
-		}
-		if !st.Mode().IsRegular() {
-			continue
-		}
-		raw, rErr := os.ReadFile(full)
-		if rErr != nil {
-			return true
-		}
-		if !matchTrustedHash(wsRoot, canonWs, full, raw, trustedHashes) {
-			return true
-		}
-	}
-	return false
-}
-
-func matchTrustedHash(wsRoot, canonWs, absFile string, raw []byte, trustedHashes map[string]string) bool {
-	if len(trustedHashes) == 0 {
-		return false
-	}
-	sum := sha256.Sum256(raw)
-	actualHex := hex.EncodeToString(sum[:])
-
-	candidates := []string{absFile}
-	if canonFile, err := filepath.EvalSymlinks(absFile); err == nil && canonFile != absFile {
-		candidates = append(candidates, canonFile)
-	}
-	for _, base := range []string{wsRoot, canonWs} {
-		if base == "" {
-			continue
-		}
-		if rel, err := filepath.Rel(base, absFile); err == nil && !strings.HasPrefix(rel, "..") {
-			relSlash := filepath.ToSlash(rel)
-			candidates = append(candidates, relSlash)
-			if trimmed, ok := strings.CutPrefix(relSlash, ".gorness/"); ok {
-				candidates = append(candidates, trimmed)
-			}
-		}
-	}
-
-	matched := false
-	for _, key := range candidates {
-		expected, ok := trustedHashes[key]
-		if !ok {
-			continue
-		}
-		norm := strings.TrimPrefix(strings.ToLower(strings.TrimSpace(expected)), "sha256:")
-		if norm != actualHex {
-			return false
-		}
-		matched = true
-	}
-	return matched
+	_, ok := config.VerifyWorkspaceTrust(wsRoot, trustedHashes)
+	return !ok
 }
 
 var (
 	reRmRootCmd = regexp.MustCompile(`(?i)(^|[;&|()\s])(sudo\s+)?(/(usr/)?s?bin/)?rm\s+([^\n;|&]*\s+)?(-[a-z]*r[a-z]*f|-[a-z]*f[a-z]*r|-r\s+-f|-f\s+-r|--no-preserve-root)([^\n;|&]*\s+)?(/|/\*|~|~/\*|\$HOME|\$\{HOME\})(\s|$|[;&|)])`)
 	reForkBomb  = regexp.MustCompile(`:\s*\(\s*\)\s*\{.*:\s*\|\s*:.*&`)
-	reAutoCfgSh = regexp.MustCompile(`(?i)(^|[\s"'/])(\.gorness(/|$)|\.mcp\.json\b|mcp\.toml\b|\.zshrc\b|\.zshenv\b|\.zprofile\b|\.zlogin\b|\.bashrc\b|\.bash_profile\b|\.profile\b|\.git/hooks/|\.git/config\b)`)
+	reAutoCfgSh = regexp.MustCompile(`(?i)(^|[\s"'/])(\.gorness(/|$)|\.mcp\.json\b|mcp\.toml\b|\.zshrc\b|\.zshenv\b|\.zprofile\b|\.zlogin\b|\.bashrc\b|\.bash_profile\b|\.profile\b|\.git/hooks/|\.git/config\b|\.github/workflows(/|$))`)
 )
 
 // PermissionGate 严格按不可绕过的固定九步顺序裁决每一次工具调用：
@@ -598,22 +598,7 @@ func extractTargetInfo(ctx EvalContext, pg *tools.PathGuard, call ToolInvocation
 }
 
 func expandUserHome(rawPath, injectedHome string) string {
-	trimmed := strings.TrimSpace(rawPath)
-	slash := strings.ReplaceAll(trimmed, "\\", "/")
-	home := strings.TrimSpace(injectedHome)
-	if home == "" {
-		home, _ = os.UserHomeDir()
-	}
-	if home == "" {
-		return trimmed
-	}
-	if slash == "~" {
-		return home
-	}
-	if strings.HasPrefix(slash, "~/") {
-		return strings.TrimRight(home, "/") + "/" + slash[2:]
-	}
-	return trimmed
+	return config.ExpandHome(rawPath, injectedHome)
 }
 
 func isDirectVaultSecretRef(rawPath, expandedPath, vaultRoot, userHome, wsRoot string) bool {
@@ -1258,11 +1243,11 @@ func canonicalOrClean(p string) string {
 	if trimmed == "" {
 		return ""
 	}
+	if canon, err := config.CanonicalPath(trimmed); err == nil && canon != "" {
+		return canon
+	}
 	if abs, err := filepath.Abs(trimmed); err == nil {
 		trimmed = abs
-	}
-	if resolved, err := filepath.EvalSymlinks(trimmed); err == nil {
-		return filepath.Clean(resolved)
 	}
 	return filepath.Clean(trimmed)
 }
@@ -1275,21 +1260,9 @@ func joinIfNonEmpty(base, child string) string {
 }
 
 func isPathInsideOrEqual(target, root string) bool {
-	if target == "" || root == "" {
-		return false
-	}
-	if target == root {
-		return true
-	}
-	if root == string(filepath.Separator) {
-		return strings.HasPrefix(target, root)
-	}
-	return strings.HasPrefix(target, root+string(filepath.Separator))
+	return config.IsWithinRoot(target, root)
 }
 
 func isPathStrictlyInside(target, root string) bool {
-	if target == root {
-		return false
-	}
-	return isPathInsideOrEqual(target, root)
+	return config.IsStrictlyWithinRoot(target, root)
 }

@@ -425,17 +425,29 @@ func consumeOpenAIResponsesSSE(ctx context.Context, body io.Reader, req Request,
 		case "response.failed", "error":
 			var failPayload struct {
 				Error struct {
-					Code    string `json:"code"`
+					Type    string `json:"type"`
+					Code    any    `json:"code"`
 					Message string `json:"message"`
 				} `json:"error"`
 				Response struct {
 					Error struct {
-						Code    string `json:"code"`
+						Type    string `json:"type"`
+						Code    any    `json:"code"`
 						Message string `json:"message"`
 					} `json:"error"`
 				} `json:"response"`
 			}
 			_ = json.Unmarshal([]byte(data), &failPayload)
+			errType := failPayload.Error.Type
+			if errType == "" {
+				errType = failPayload.Response.Error.Type
+			}
+			errCode := ""
+			if failPayload.Error.Code != nil {
+				errCode = fmt.Sprint(failPayload.Error.Code)
+			} else if failPayload.Response.Error.Code != nil {
+				errCode = fmt.Sprint(failPayload.Response.Error.Code)
+			}
 			msg := failPayload.Error.Message
 			if msg == "" {
 				msg = failPayload.Response.Error.Message
@@ -447,8 +459,8 @@ func consumeOpenAIResponsesSSE(ctx context.Context, body io.Reader, req Request,
 				Type: StreamError,
 				Err: &APIError{
 					ProviderID: req.Provider.ID,
-					Message:    config.Redact(msg, []string{req.APIKey}),
-					Retryable:  true,
+					Message:    config.Redact(msg, requestSecrets(req)),
+					Retryable:  !isNonRetryableErrorClassification(errType, errCode, msg),
 				},
 			})
 			return
@@ -811,6 +823,7 @@ func consumeOpenAICompatSSE(ctx context.Context, body io.Reader, req Request, ou
 			Error *struct {
 				Message string `json:"message"`
 				Type    string `json:"type"`
+				Code    any    `json:"code"`
 			} `json:"error"`
 			Choices []struct {
 				Index        int                `json:"index"`
@@ -843,13 +856,24 @@ func consumeOpenAICompatSSE(ctx context.Context, body io.Reader, req Request, ou
 			return
 		}
 
-		if chunk.Error != nil && chunk.Error.Message != "" {
+		if chunk.Error != nil && (chunk.Error.Message != "" || chunk.Error.Type != "" || chunk.Error.Code != nil) {
+			codeStr := ""
+			if chunk.Error.Code != nil {
+				codeStr = fmt.Sprint(chunk.Error.Code)
+			}
+			msg := chunk.Error.Message
+			if msg == "" {
+				msg = chunk.Error.Type
+			}
+			if msg == "" {
+				msg = codeStr
+			}
 			emitEvent(ctx, out, StreamEvent{
 				Type: StreamError,
 				Err: &APIError{
 					ProviderID: req.Provider.ID,
-					Message:    config.Redact(chunk.Error.Message, []string{req.APIKey}),
-					Retryable:  true,
+					Message:    config.Redact(msg, requestSecrets(req)),
+					Retryable:  !isNonRetryableErrorClassification(chunk.Error.Type, codeStr, msg),
 				},
 			})
 			return

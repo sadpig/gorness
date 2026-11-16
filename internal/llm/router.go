@@ -5,9 +5,11 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math/rand/v2"
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"gorness.dev/gorness/internal/config"
@@ -17,7 +19,8 @@ const (
 	defaultProviderTimeout = 120 * time.Second
 	maxRetriesPerRoute     = 2
 	timeoutScaleFactor     = 1.5
-	defaultRetryBackoff    = 15 * time.Millisecond
+	defaultRetryBackoff    = 500 * time.Millisecond
+	maxRetryBackoff        = 30 * time.Second
 )
 
 type ResolvedRoute struct {
@@ -34,10 +37,14 @@ type ResolvedRoute struct {
 
 // Router 负责异构 Agent 角色的四级优先级路由、受控凭据解析、1.5x 超时退避重试、中途断流步重置与跨模型平滑回退。
 type Router struct {
-	cfg       *config.Manager
-	secrets   config.SecretResolver
-	transport Streamer
-	backoff   func(retryIdx int) time.Duration
+	cfg         *config.Manager
+	secrets     config.SecretResolver
+	transport   Streamer
+	mu          sync.RWMutex
+	baseBackoff time.Duration
+	zeroBackoff bool
+	backoff     func(retryIdx int) time.Duration
+	sleepFn     func(ctx context.Context, d time.Duration) error
 }
 
 func NewRouter(cfg *config.Manager, secrets config.SecretResolver, transport Streamer) *Router {
@@ -48,13 +55,49 @@ func NewRouter(cfg *config.Manager, secrets config.SecretResolver, transport Str
 		transport = NewNativeStreamer(nil)
 	}
 	return &Router{
-		cfg:       cfg,
-		secrets:   secrets,
-		transport: transport,
-		backoff: func(retryIdx int) time.Duration {
-			return time.Duration(retryIdx+1) * defaultRetryBackoff
-		},
+		cfg:         cfg,
+		secrets:     secrets,
+		transport:   transport,
+		baseBackoff: defaultRetryBackoff,
 	}
+}
+
+// SetBackoff 覆写指数退避基准时长（传入 <= 0 可在单测中关闭真实等待）。
+func (r *Router) SetBackoff(base time.Duration) {
+	if r == nil {
+		return
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.backoff = nil
+	if base <= 0 {
+		r.baseBackoff = 0
+		r.zeroBackoff = true
+		return
+	}
+	r.baseBackoff = base
+	r.zeroBackoff = false
+}
+
+// SetBackoffFunc 注入自定义每次重试退避时长计算函数（供确定性测试覆写）。
+func (r *Router) SetBackoffFunc(fn func(attempt int) time.Duration) {
+	if r == nil {
+		return
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.backoff = fn
+	r.zeroBackoff = false
+}
+
+// SetSleepFunc 注入自定义休眠函数（供单元测试拦截验证退避时长并实现零耗时执行）。
+func (r *Router) SetSleepFunc(fn func(ctx context.Context, d time.Duration) error) {
+	if r == nil {
+		return
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.sleepFn = fn
 }
 
 // Resolve 按严格优先级解析目标模型与回退链：
@@ -431,7 +474,7 @@ func (r *Router) StreamWithRetry(ctx context.Context, route ResolvedRoute, req R
 					}) {
 						return
 					}
-					if !r.sleepBackoff(ctx, retryIdx) {
+					if !r.sleepBackoff(ctx, retryIdx, attemptErr) {
 						return
 					}
 					continue
@@ -627,12 +670,61 @@ func (r *Router) scrubWithSecrets(err error, extraSecrets ...string) error {
 	return sanitizeError(err, all...)
 }
 
-func (r *Router) sleepBackoff(ctx context.Context, retryIdx int) bool {
-	if r == nil || r.backoff == nil {
+func (r *Router) sleepBackoff(ctx context.Context, retryIdx int, attemptErr error) bool {
+	if r == nil {
 		return ctx.Err() == nil
 	}
-	d := r.backoff(retryIdx)
+	r.mu.RLock()
+	base := r.baseBackoff
+	zeroOverride := r.zeroBackoff
+	customBackoff := r.backoff
+	sleepFn := r.sleepFn
+	r.mu.RUnlock()
+
+	if zeroOverride && customBackoff == nil && sleepFn == nil {
+		return ctx.Err() == nil
+	}
+
+	var d time.Duration
+	if customBackoff != nil {
+		d = customBackoff(retryIdx)
+	} else if base > 0 {
+		shift := retryIdx
+		if shift < 0 {
+			shift = 0
+		} else if shift > 6 {
+			shift = 6
+		}
+		exp := base * (1 << shift)
+		jitterCap := int64(exp / 4)
+		var jitter time.Duration
+		if jitterCap > 0 {
+			jitter = time.Duration(rand.Int64N(jitterCap + 1))
+		}
+		d = exp + jitter
+		if d > maxRetryBackoff {
+			d = maxRetryBackoff
+		}
+	}
+
+	var apiErr *APIError
+	if errors.As(attemptErr, &apiErr) && apiErr.RetryAfter > 0 {
+		ra := apiErr.RetryAfter
+		if ra > maxRetryBackoff {
+			ra = maxRetryBackoff
+		}
+		if ra > d {
+			d = ra
+		}
+	}
+
 	if d <= 0 {
+		return ctx.Err() == nil
+	}
+	if sleepFn != nil {
+		if err := sleepFn(ctx, d); err != nil {
+			return false
+		}
 		return ctx.Err() == nil
 	}
 	timer := time.NewTimer(d)

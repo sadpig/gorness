@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"html"
+	"os"
+	"path/filepath"
 	"runtime"
 	"sort"
 	"strings"
@@ -16,9 +18,11 @@ import (
 )
 
 type SearchHit struct {
+	Kind        string    `json:"kind,omitempty"`
 	SessionID   string    `json:"session_id"`
 	WorkspaceID string    `json:"workspace_id"`
 	Title       string    `json:"title"`
+	Path        string    `json:"path,omitempty"`
 	EntryID     string    `json:"entry_id,omitempty"`
 	EntrySeq    uint64    `json:"entry_seq,omitempty"`
 	Snippet     string    `json:"snippet"`
@@ -26,7 +30,59 @@ type SearchHit struct {
 	UpdatedAt   time.Time `json:"updated_at"`
 }
 
-// Search 并发流式扫描全项目活跃会话分支，融合中英文分词、代码标识符精确匹配与标题加权排序。
+var bm25Stopwords = map[string]bool{
+	"the": true, "and": true, "for": true, "with": true, "from": true,
+	"into": true, "that": true, "this": true, "tool": true, "please": true,
+	"use": true, "run": true, "get": true, "how": true, "what": true,
+}
+
+var bm25Synonyms = map[string][]string{
+	"kubernetes": {"k8s"},
+	"k8s":        {"kubernetes"},
+	"postgres":   {"postgresql", "sql", "db"},
+	"postgresql": {"postgres", "sql", "db"},
+	"database":   {"db", "sql", "postgres"},
+	"db":         {"database", "sql", "postgres"},
+}
+
+// TokenizeQuery splits English/code identifiers (camelCase, snake_case, digits), extracts CJK bigrams/unigrams,
+// filters common stopwords, and expands domain synonyms for unified BM25 and full-text search.
+func TokenizeQuery(query string) []string {
+	if strings.TrimSpace(query) == "" {
+		return nil
+	}
+	rawTokens := extractQuerySubTokens(query)
+	seen := make(map[string]struct{}, len(rawTokens)*2)
+	out := make([]string, 0, len(rawTokens))
+	add := func(tok string) {
+		if tok == "" || bm25Stopwords[tok] {
+			return
+		}
+		if _, ok := seen[tok]; ok {
+			return
+		}
+		seen[tok] = struct{}{}
+		out = append(out, tok)
+	}
+	for _, tok := range rawTokens {
+		add(tok)
+		for _, syn := range bm25Synonyms[tok] {
+			add(syn)
+		}
+	}
+	return out
+}
+
+type markdownSearchDoc struct {
+	kind        string
+	id          string
+	workspaceID string
+	path        string
+	defaultName string
+}
+
+// Search 并发流式扫描全项目活跃会话分支以及全局/工作区指针记忆（memory/notes/*.md、progress/*.md、artifacts/*.md），
+// 融合中英文分词、代码标识符精确匹配与标题加权排序。
 func (s *SessionStore) Search(query string, limit int) ([]SearchHit, error) {
 	trimmed := strings.TrimSpace(query)
 	if trimmed == "" {
@@ -43,50 +99,59 @@ func (s *SessionStore) Search(query string, limit int) ([]SearchHit, error) {
 	}
 	s.mu.RUnlock()
 
-	if len(metas) == 0 {
+	mdDocs := s.discoverSearchableMarkdownDocs()
+	if len(metas) == 0 && len(mdDocs) == 0 {
 		return []SearchHit{}, nil
 	}
 
 	lowerQ := strings.ToLower(trimmed)
 	clauses := strings.Fields(lowerQ)
-	subTokens := extractQuerySubTokens(trimmed)
-
-	workerCount := runtime.NumCPU()
-	if workerCount < 2 {
-		workerCount = 2
-	}
-	if workerCount > 8 {
-		workerCount = 8
-	}
-	if workerCount > len(metas) {
-		workerCount = len(metas)
-	}
-
-	jobs := make(chan *SessionMeta, len(metas))
-	for _, m := range metas {
-		jobs <- m
-	}
-	close(jobs)
+	subTokens := TokenizeQuery(trimmed)
 
 	var hitsMu sync.Mutex
 	hits := make([]SearchHit, 0)
 
-	var wg sync.WaitGroup
-	for i := 0; i < workerCount; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			for meta := range jobs {
-				hit, ok := s.scoreSessionForQuery(meta, trimmed, lowerQ, clauses, subTokens)
-				if ok {
-					hitsMu.Lock()
-					hits = append(hits, hit)
-					hitsMu.Unlock()
+	if len(metas) > 0 {
+		workerCount := runtime.NumCPU()
+		if workerCount < 2 {
+			workerCount = 2
+		}
+		if workerCount > 8 {
+			workerCount = 8
+		}
+		if workerCount > len(metas) {
+			workerCount = len(metas)
+		}
+
+		jobs := make(chan *SessionMeta, len(metas))
+		for _, m := range metas {
+			jobs <- m
+		}
+		close(jobs)
+
+		var wg sync.WaitGroup
+		for i := 0; i < workerCount; i++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				for meta := range jobs {
+					hit, ok := s.scoreSessionForQuery(meta, trimmed, lowerQ, clauses, subTokens)
+					if ok {
+						hitsMu.Lock()
+						hits = append(hits, hit)
+						hitsMu.Unlock()
+					}
 				}
-			}
-		}()
+			}()
+		}
+		wg.Wait()
 	}
-	wg.Wait()
+
+	for _, doc := range mdDocs {
+		if hit, ok := scoreMarkdownDocForQuery(doc, lowerQ, clauses, subTokens); ok {
+			hits = append(hits, hit)
+		}
+	}
 
 	sort.Slice(hits, func(i, j int) bool {
 		if hits[i].Score != hits[j].Score {
@@ -95,13 +160,156 @@ func (s *SessionStore) Search(query string, limit int) ([]SearchHit, error) {
 		if !hits[i].UpdatedAt.Equal(hits[j].UpdatedAt) {
 			return hits[i].UpdatedAt.After(hits[j].UpdatedAt)
 		}
-		return hits[i].SessionID < hits[j].SessionID
+		if hits[i].SessionID != hits[j].SessionID {
+			return hits[i].SessionID < hits[j].SessionID
+		}
+		return hits[i].Path < hits[j].Path
 	})
 
 	if len(hits) > limit {
 		hits = hits[:limit]
 	}
 	return hits, nil
+}
+
+func (s *SessionStore) discoverSearchableMarkdownDocs() []markdownSearchDoc {
+	var docs []markdownSearchDoc
+	collectDir := func(dir, kind, wsID string) {
+		entries, err := os.ReadDir(dir)
+		if err != nil {
+			return
+		}
+		for _, ent := range entries {
+			if ent.IsDir() || !strings.HasSuffix(strings.ToLower(ent.Name()), ".md") {
+				continue
+			}
+			stem := strings.TrimSuffix(ent.Name(), filepath.Ext(ent.Name()))
+			docs = append(docs, markdownSearchDoc{
+				kind:        kind,
+				id:          kind + ":" + stem,
+				workspaceID: wsID,
+				path:        filepath.Join(dir, ent.Name()),
+				defaultName: stem,
+			})
+		}
+	}
+
+	collectDir(filepath.Join(s.paths.MemoryDir(), "notes"), "memory_note", "")
+
+	if wsEntries, err := os.ReadDir(s.paths.WorkspacesDir()); err == nil {
+		for _, ent := range wsEntries {
+			if !ent.IsDir() || ValidateSafeID(ent.Name()) != nil {
+				continue
+			}
+			wsID := ent.Name()
+			wsBase := filepath.Join(s.paths.WorkspacesDir(), wsID)
+			collectDir(filepath.Join(wsBase, "memory", "progress"), "progress", wsID)
+			collectDir(filepath.Join(wsBase, "artifacts"), "artifact", wsID)
+		}
+	}
+	return docs
+}
+
+func scoreMarkdownDocForQuery(
+	doc markdownSearchDoc,
+	lowerQ string,
+	clauses []string,
+	subTokens []string,
+) (SearchHit, bool) {
+	info, err := os.Lstat(doc.path)
+	if err != nil || !info.Mode().IsRegular() {
+		return SearchHit{}, false
+	}
+	raw, err := os.ReadFile(doc.path)
+	if err != nil {
+		return SearchHit{}, false
+	}
+	text := string(raw)
+	title := extractMarkdownTitle(text, doc.defaultName)
+	titleLower := strings.ToLower(title)
+	bodyLower := strings.ToLower(text)
+
+	clauseMatched := make([]bool, len(clauses))
+	var score float64
+	if titleLower == lowerQ {
+		score += 200
+	} else if strings.Contains(titleLower, lowerQ) {
+		score += 130
+	}
+	for idx, c := range clauses {
+		if strings.Contains(titleLower, c) {
+			clauseMatched[idx] = true
+			score += 40
+		}
+		if containsIdentifierBoundary(title, c) {
+			score += 12
+		}
+		if strings.Contains(bodyLower, c) {
+			clauseMatched[idx] = true
+			score += 18
+		}
+		if containsIdentifierBoundary(text, c) {
+			score += 12
+		}
+	}
+	if strings.Contains(bodyLower, lowerQ) {
+		score += 36
+	}
+	for _, tok := range subTokens {
+		if strings.Contains(titleLower, tok) {
+			score += 5
+		}
+		if strings.Contains(bodyLower, tok) {
+			score += 2
+		}
+	}
+
+	for _, ok := range clauseMatched {
+		if !ok {
+			return SearchHit{}, false
+		}
+	}
+	if score <= 0 {
+		return SearchHit{}, false
+	}
+
+	needle := lowerQ
+	if !strings.Contains(bodyLower, needle) && len(clauses) > 0 {
+		needle = clauses[0]
+	}
+	snippet := config.EscapeBidi(extractRuneSafeSnippet(text, needle, 160))
+
+	return SearchHit{
+		Kind:        doc.kind,
+		SessionID:   doc.id,
+		WorkspaceID: doc.workspaceID,
+		Title:       config.EscapeBidi(title),
+		Path:        doc.path,
+		Snippet:     snippet,
+		Score:       score,
+		UpdatedAt:   info.ModTime().UTC(),
+	}, true
+}
+
+func extractMarkdownTitle(raw, fallback string) string {
+	meta, body, err := config.ParseFrontmatterMD([]byte(raw))
+	if err == nil {
+		if t, ok := meta["title"].(string); ok && strings.TrimSpace(t) != "" {
+			return strings.TrimSpace(t)
+		}
+	} else {
+		body = raw
+	}
+	for _, line := range strings.Split(body, "\n") {
+		trimmed := strings.TrimSpace(line)
+		if strings.HasPrefix(trimmed, "#") {
+			h := strings.TrimSpace(strings.TrimLeft(trimmed, "#"))
+			if h != "" {
+				return h
+			}
+		}
+	}
+	return fallback
 }
 
 func (s *SessionStore) scoreSessionForQuery(

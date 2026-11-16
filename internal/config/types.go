@@ -5,6 +5,9 @@ import (
 	"time"
 )
 
+// Version is the canonical single-authority Gorness product version.
+const Version = "1.0.0"
+
 // VaultPaths 定义 ~/.gorness/ 零数据库透明文件仓的标准目录与文件定位契约。
 type VaultPaths struct {
 	Root string `json:"root"`
@@ -14,6 +17,7 @@ func (v VaultPaths) ConfigFile() string    { return filepath.Join(v.Root, "confi
 func (v VaultPaths) ProvidersFile() string { return filepath.Join(v.Root, "providers.toml") }
 func (v VaultPaths) RulesFile() string     { return filepath.Join(v.Root, "rules.toml") }
 func (v VaultPaths) MCPFile() string       { return filepath.Join(v.Root, "mcp.toml") }
+func (v VaultPaths) HooksFile() string     { return filepath.Join(v.Root, "hooks.toml") }
 func (v VaultPaths) AgentsDir() string     { return filepath.Join(v.Root, "agents") }
 func (v VaultPaths) WorkflowsDir() string  { return filepath.Join(v.Root, "workflows") }
 func (v VaultPaths) SkillsDir() string     { return filepath.Join(v.Root, "skills") }
@@ -31,6 +35,8 @@ type GlobalConfig struct {
 	Port               int      `toml:"port" json:"port"`
 	Theme              string   `toml:"theme" json:"theme"`
 	Language           string   `toml:"language" json:"language"`
+	UITheme            string   `toml:"ui_theme,omitempty" json:"ui_theme,omitempty"`
+	UILang             string   `toml:"ui_lang,omitempty" json:"ui_lang,omitempty"`
 	DefaultProvider    string   `toml:"default_provider" json:"default_provider"`
 	DefaultModel       string   `toml:"default_model" json:"default_model"`
 	DefaultEffort      string   `toml:"default_effort" json:"default_effort"`
@@ -159,6 +165,7 @@ type Snapshot struct {
 	Workflows         map[string]WorkflowTemplate `json:"workflows"`
 	Rules             RuleSet                     `json:"rules"`
 	MCP               MCPConfig                   `json:"mcp"`
+	Hooks             HooksConfig                 `json:"hooks"`
 	SkillDirs         []string                    `json:"skill_dirs"`
 	UntrustedWarnings []string                    `json:"untrusted_warnings,omitempty"`
 	LoadedAt          time.Time                   `json:"loaded_at"`
@@ -257,6 +264,7 @@ func (s *Snapshot) Clone() *Snapshot {
 		cp.MCP.Servers[k] = srvCopy
 	}
 
+	cp.Hooks = s.Hooks.Clone()
 	cp.SkillDirs = cloneSlice(s.SkillDirs)
 	cp.UntrustedWarnings = cloneSlice(s.UntrustedWarnings)
 	return &cp

@@ -496,18 +496,61 @@ func (s *SessionStore) List(wsID string, includeArchived bool) []*SessionMeta {
 }
 
 func (s *SessionStore) GetMeta(id string) (*SessionMeta, error) {
-	s.mu.RLock()
-	m, ok := s.metas[id]
-	var cp *SessionMeta
-	if ok {
-		cp = cloneSessionMeta(m)
-	}
-	s.mu.RUnlock()
-
+	cp, ok := s.locateSession(id)
 	if !ok {
 		return nil, fmt.Errorf("%w: %s", ErrSessionNotFound, id)
 	}
 	return cp, nil
+}
+
+// locateSession returns an O(1) cloned SessionMeta from the in-memory index, falling back to a single
+// on-disk stat/recovery pass when another local process (e.g. CLI/ACP) created a session concurrently.
+func (s *SessionStore) locateSession(id string) (*SessionMeta, bool) {
+	if ValidateSafeID(id) != nil {
+		return nil, false
+	}
+	s.mu.RLock()
+	m, ok := s.metas[id]
+	if ok {
+		cp := cloneSessionMeta(m)
+		s.mu.RUnlock()
+		return cp, true
+	}
+	s.mu.RUnlock()
+
+	wsEntries, err := os.ReadDir(s.paths.WorkspacesDir())
+	if err != nil {
+		return nil, false
+	}
+	for _, ent := range wsEntries {
+		if !ent.IsDir() || ValidateSafeID(ent.Name()) != nil {
+			continue
+		}
+		wsID := ent.Name()
+		metaPath := s.sessionMetaPath(wsID, id)
+		if raw, rErr := os.ReadFile(metaPath); rErr == nil {
+			var diskMeta SessionMeta
+			if toml.Unmarshal(raw, &diskMeta) == nil {
+				if diskMeta.ID == "" {
+					diskMeta.ID = id
+				}
+				diskMeta.WorkspaceID = wsID
+				s.mu.Lock()
+				s.metas[id] = &diskMeta
+				s.mu.Unlock()
+				return cloneSessionMeta(&diskMeta), true
+			}
+		}
+		if _, stErr := os.Stat(s.sessionJSONLPath(wsID, id)); stErr == nil {
+			if rebuilt, recErr := s.reconstructMetaFromJSONL(wsID, id); recErr == nil && rebuilt != nil {
+				s.mu.Lock()
+				s.metas[id] = rebuilt
+				s.mu.Unlock()
+				return cloneSessionMeta(rebuilt), true
+			}
+		}
+	}
+	return nil, false
 }
 
 func (s *SessionStore) Append(sessionID string, entry SessionEntry) (*SessionEntry, error) {
@@ -963,7 +1006,6 @@ func (s *SessionStore) Delete(sessionID string) error {
 		}
 		jsonlPath := s.sessionJSONLPath(meta.WorkspaceID, sessionID)
 		metaPath := s.sessionMetaPath(meta.WorkspaceID, sessionID)
-		snapLedger := filepath.Join(s.paths.SnapshotsDir(), "ledgers", sessionID+".jsonl")
 
 		if err := os.Remove(metaPath); err != nil && !errors.Is(err, os.ErrNotExist) {
 			return fmt.Errorf("remove session meta %s: %w", metaPath, err)
@@ -971,7 +1013,8 @@ func (s *SessionStore) Delete(sessionID string) error {
 		if err := os.Remove(jsonlPath); err != nil && !errors.Is(err, os.ErrNotExist) {
 			return fmt.Errorf("remove session jsonl %s: %w", jsonlPath, err)
 		}
-		_ = os.Remove(snapLedger)
+		snaps := &SnapshotStore{paths: s.paths}
+		_ = snaps.DeleteSessionSnapshots(meta.WorkspaceID, sessionID)
 
 		s.mu.Lock()
 		delete(s.metas, sessionID)

@@ -66,7 +66,7 @@ func (c *SkillCatalog) Discover(snap *config.Snapshot, wsRoot string) *SkillCata
 	}
 
 	wsInWorktree := canonWs != "" && canonVault != "" &&
-		isStrictlyWithinPath(canonWs, filepath.Join(canonVault, "runtime", "worktrees"))
+		config.IsStrictlyWithinRoot(canonWs, filepath.Join(canonVault, "runtime", "worktrees"))
 
 	type dirSpec struct {
 		dir         string
@@ -83,17 +83,17 @@ func (c *SkillCatalog) Discover(snap *config.Snapshot, wsRoot string) *SkillCata
 		} else {
 			absD = filepath.Clean(absD)
 		}
-		if rawWsAbs != "" && isWithinOrEqualPath(absD, rawWsAbs) {
+		if rawWsAbs != "" && config.IsWithinRoot(absD, rawWsAbs) {
 			return true
 		}
 		if canonWs != "" {
-			if isWithinOrEqualPath(absD, canonWs) {
+			if config.IsWithinRoot(absD, canonWs) {
 				return true
 			}
 			// 逐级检查祖先目录规范路径（兼容 macOS /var 与 /private/var 混用，同时即使末级 skills 是越界软链仍归为项目级目录予以拦截）。
 			for anc := absD; anc != string(filepath.Separator) && anc != "."; anc = filepath.Dir(anc) {
-				if resolvedAnc, eErr := filepath.EvalSymlinks(anc); eErr == nil {
-					if filepath.Clean(resolvedAnc) == canonWs {
+				if resolvedAnc, eErr := config.CanonicalPath(anc); eErr == nil {
+					if resolvedAnc == canonWs {
 						return true
 					}
 				}
@@ -144,7 +144,7 @@ func (c *SkillCatalog) Discover(snap *config.Snapshot, wsRoot string) *SkillCata
 		if spec.isWorkspace && canonWs == "" {
 			continue
 		}
-		canonDir, ok := resolveSafeSkillRoot(spec.dir, spec.isWorkspace, canonWs, canonVault, canonHomeVault, wsInWorktree)
+		canonDir, ok := resolveSafeSkillDir(spec.dir, spec.isWorkspace, canonWs, canonVault, canonHomeVault, wsInWorktree)
 		if !ok {
 			continue
 		}
@@ -155,7 +155,7 @@ func (c *SkillCatalog) Discover(snap *config.Snapshot, wsRoot string) *SkillCata
 		names := make([]string, 0, len(entries))
 		for _, ent := range entries {
 			name := ent.Name()
-			if strings.HasPrefix(name, ".") || name == "_candidates" {
+			if strings.HasPrefix(name, ".") || name == "_candidates" || config.IsIgnoredWalkDir(name) {
 				continue
 			}
 			names = append(names, name)
@@ -164,7 +164,7 @@ func (c *SkillCatalog) Discover(snap *config.Snapshot, wsRoot string) *SkillCata
 
 		for _, entryName := range names {
 			subLex := filepath.Join(canonDir, entryName)
-			canonSub, subOK := resolveSafeSkillEntryDir(subLex, spec.isWorkspace, canonWs, canonVault, canonHomeVault, wsInWorktree)
+			canonSub, subOK := resolveSafeSkillDir(subLex, spec.isWorkspace, canonWs, canonVault, canonHomeVault, wsInWorktree)
 			if !subOK {
 				continue
 			}
@@ -311,7 +311,7 @@ func (c *SkillCatalog) XMLSummary() string {
 	return b.String()
 }
 
-func resolveSafeSkillRoot(
+func resolveSafeSkillDir(
 	dir string,
 	isWorkspace bool,
 	canonWs, canonVault, canonHomeVault string,
@@ -320,55 +320,22 @@ func resolveSafeSkillRoot(
 	if _, err := os.Lstat(dir); err != nil {
 		return "", false
 	}
-	resolved, err := filepath.EvalSymlinks(dir)
+	resolved, err := config.CanonicalPath(dir)
 	if err != nil {
 		return "", false
 	}
-	resolved = filepath.Clean(resolved)
 	st, err := os.Stat(resolved)
 	if err != nil || !st.IsDir() {
 		return "", false
 	}
 	if isWorkspace {
-		if !isStrictlyWithinPath(resolved, canonWs) {
+		if !config.IsStrictlyWithinRoot(resolved, canonWs) {
 			return "", false
 		}
-		if canonVault != "" && isWithinOrEqualPath(resolved, canonVault) && !wsInWorktree {
+		if canonVault != "" && config.IsWithinRoot(resolved, canonVault) && !wsInWorktree {
 			return "", false
 		}
-		if canonHomeVault != "" && isWithinOrEqualPath(resolved, canonHomeVault) && !isStrictlyWithinPath(resolved, canonWs) {
-			return "", false
-		}
-	}
-	return resolved, true
-}
-
-func resolveSafeSkillEntryDir(
-	subPath string,
-	isWorkspace bool,
-	canonWs, canonVault, canonHomeVault string,
-	wsInWorktree bool,
-) (string, bool) {
-	if _, err := os.Lstat(subPath); err != nil {
-		return "", false
-	}
-	resolved, err := filepath.EvalSymlinks(subPath)
-	if err != nil {
-		return "", false
-	}
-	resolved = filepath.Clean(resolved)
-	st, err := os.Stat(resolved)
-	if err != nil || !st.IsDir() {
-		return "", false
-	}
-	if isWorkspace {
-		if !isStrictlyWithinPath(resolved, canonWs) {
-			return "", false
-		}
-		if canonVault != "" && isWithinOrEqualPath(resolved, canonVault) && !wsInWorktree {
-			return "", false
-		}
-		if canonHomeVault != "" && isWithinOrEqualPath(resolved, canonHomeVault) && !isStrictlyWithinPath(resolved, canonWs) {
+		if canonHomeVault != "" && config.IsWithinRoot(resolved, canonHomeVault) && !config.IsStrictlyWithinRoot(resolved, canonWs) {
 			return "", false
 		}
 	}
@@ -384,24 +351,23 @@ func resolveSafeSkillFile(
 	if _, err := os.Lstat(filePath); err != nil {
 		return "", false
 	}
-	resolved, err := filepath.EvalSymlinks(filePath)
+	resolved, err := config.CanonicalPath(filePath)
 	if err != nil {
 		return "", false
 	}
-	resolved = filepath.Clean(resolved)
 	st, err := os.Stat(resolved)
 	if err != nil || !st.Mode().IsRegular() {
 		return "", false
 	}
 
 	if isWorkspace {
-		if !isStrictlyWithinPath(resolved, canonWs) {
+		if !config.IsStrictlyWithinRoot(resolved, canonWs) {
 			return "", false
 		}
-		if canonVault != "" && isWithinOrEqualPath(resolved, canonVault) && !wsInWorktree {
+		if canonVault != "" && config.IsWithinRoot(resolved, canonVault) && !wsInWorktree {
 			return "", false
 		}
-		if canonHomeVault != "" && isWithinOrEqualPath(resolved, canonHomeVault) && !isStrictlyWithinPath(resolved, canonWs) {
+		if canonHomeVault != "" && config.IsWithinRoot(resolved, canonHomeVault) && !config.IsStrictlyWithinRoot(resolved, canonWs) {
 			return "", false
 		}
 		return resolved, true
@@ -410,7 +376,7 @@ func resolveSafeSkillFile(
 	// 用户级技能目录同样禁止通过软链直接指向 Vault 顶层机密 TOML 文件。
 	if canonVault != "" {
 		skillsSub := filepath.Join(canonVault, "skills")
-		if isWithinOrEqualPath(resolved, canonVault) && !isStrictlyWithinPath(resolved, skillsSub) {
+		if config.IsWithinRoot(resolved, canonVault) && !config.IsStrictlyWithinRoot(resolved, skillsSub) {
 			return "", false
 		}
 	}

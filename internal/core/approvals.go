@@ -1,8 +1,6 @@
 package core
 
 import (
-	"crypto/rand"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -12,6 +10,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"gorness.dev/gorness/internal/store"
 	"gorness.dev/gorness/internal/tools"
 )
 
@@ -311,9 +310,5 @@ func clonePendingApproval(in PendingApproval) PendingApproval {
 }
 
 func randomShortHex(nBytes int) string {
-	buf := make([]byte, nBytes)
-	if _, err := rand.Read(buf); err != nil {
-		return fmt.Sprintf("%08x", approvalSeq.Add(1))
-	}
-	return hex.EncodeToString(buf)
+	return store.RandomHex(nBytes)
 }

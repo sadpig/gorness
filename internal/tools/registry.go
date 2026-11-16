@@ -16,7 +16,6 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
-	"unicode"
 	"unicode/utf8"
 
 	"gorness.dev/gorness/internal/config"
@@ -28,13 +27,16 @@ const (
 	BM25DeferThreshold       = 12
 	MaxInlineToolOutputBytes = 32 * 1024
 	defaultCommandTimeoutSec = 120
+	maxShellSnapFileBytes    = 2 * 1024 * 1024
+	maxShellSnapTotalBudget  = 32 * 1024 * 1024
 )
 
 var (
 	ErrToolNotFound = errors.New("tool not found")
 
-	reClosingUntrustedTag = regexp.MustCompile(`(?i)</\s*untrusted_content\b[^>]*>`)
-	globalOverflowLogsDir atomic.Pointer[string]
+	reClosingUntrustedTag    = regexp.MustCompile(`(?i)</\s*untrusted_content\b[^>]*>`)
+	reClosingSkillContentTag = regexp.MustCompile(`(?i)</\s*skill_content\b[^>]*>`)
+	globalOverflowLogsDir    atomic.Pointer[string]
 )
 
 // SetOverflowLogsDir 配置 WrapUntrustedContent 超长截断溢出的默认落盘目录（例如 ~/.gorness/runtime/logs）。
@@ -127,6 +129,7 @@ func logsDirFromVault(vaultRoot string) string {
 }
 
 type CallContext struct {
+	WorkspaceID           string
 	WorkspaceRoot         string
 	VaultRoot             string
 	SessionID             string
@@ -139,6 +142,7 @@ type CallContext struct {
 	ActivatedTools        map[string]bool
 	ActivatedSkills       map[string]bool
 	Snapshots             *store.SnapshotStore
+	Artifacts             *store.ArtifactStore
 	PathGuard             *PathGuard
 	Secrets               []string
 }
@@ -169,27 +173,104 @@ type Tool struct {
 	Handler         ToolHandler
 }
 
+// ReadHashTracker 跨轮次追踪会话已读文件 SHA-256 摘要，支持在 /rewind 或外部变更时精准失效。
+type ReadHashTracker struct {
+	mu     sync.RWMutex
+	hashes map[string]string // key: sessionID + "\x00" + canonAbsPath
+}
+
+func NewReadHashTracker() *ReadHashTracker {
+	return &ReadHashTracker{
+		hashes: make(map[string]string),
+	}
+}
+
+func (t *ReadHashTracker) Record(sessionID, absPath, sha256Hex string) {
+	if t == nil || strings.TrimSpace(absPath) == "" || strings.TrimSpace(sha256Hex) == "" {
+		return
+	}
+	canon := canonicalizeExistingOrClean(absPath)
+	key := strings.TrimSpace(sessionID) + "\x00" + canon
+	t.mu.Lock()
+	t.hashes[key] = strings.ToLower(strings.TrimSpace(sha256Hex))
+	t.mu.Unlock()
+}
+
+func (t *ReadHashTracker) Last(sessionID, absPath string) string {
+	if t == nil || strings.TrimSpace(absPath) == "" {
+		return ""
+	}
+	canon := canonicalizeExistingOrClean(absPath)
+	key := strings.TrimSpace(sessionID) + "\x00" + canon
+	t.mu.RLock()
+	h := t.hashes[key]
+	if h == "" && sessionID != "" {
+		h = t.hashes["\x00"+canon]
+	}
+	t.mu.RUnlock()
+	return h
+}
+
+func (t *ReadHashTracker) InvalidateSession(sessionID string) {
+	if t == nil {
+		return
+	}
+	prefix := strings.TrimSpace(sessionID) + "\x00"
+	t.mu.Lock()
+	for k := range t.hashes {
+		if strings.HasPrefix(k, prefix) {
+			delete(t.hashes, k)
+		}
+	}
+	t.mu.Unlock()
+}
+
+func (t *ReadHashTracker) InvalidatePath(sessionID, absPath string) {
+	if t == nil || strings.TrimSpace(absPath) == "" {
+		return
+	}
+	canon := canonicalizeExistingOrClean(absPath)
+	key := strings.TrimSpace(sessionID) + "\x00" + canon
+	t.mu.Lock()
+	delete(t.hashes, key)
+	t.mu.Unlock()
+}
+
+func (t *ReadHashTracker) Clear() {
+	if t == nil {
+		return
+	}
+	t.mu.Lock()
+	clear(t.hashes)
+	t.mu.Unlock()
+}
+
 type RegistryOptions struct {
+	WorkspaceID   string
 	WorkspaceRoot string
 	VaultPaths    config.VaultPaths
 	Snapshots     *store.SnapshotStore
+	Artifacts     *store.ArtifactStore
 	PathGuard     *PathGuard
 	Seatbelt      *SeatbeltRunner
 	Skills        *SkillCatalog
+	ReadHashes    *ReadHashTracker
 }
 
-// Registry 聚合 5 大核心内置工具、动态 activate_skill、MCP 外部工具与超过 12 个工具时的自动 BM25 search_tools 延迟加载。
+// Registry 聚合核心内置工具、动态 activate_skill、MCP 外部工具与超过 12 个工具时的自动 BM25 search_tools 延迟加载。
 type Registry struct {
+	wsID       string
 	wsRoot     string
 	vaultPaths config.VaultPaths
 	snapshots  *store.SnapshotStore
+	artifacts  *store.ArtifactStore
 	pathGuard  *PathGuard
 	seatbelt   *SeatbeltRunner
+	readHashes *ReadHashTracker
 
-	mu         sync.RWMutex
-	tools      map[string]Tool
-	skills     *SkillCatalog
-	readHashes map[string]string // key: sessionID + "\x00" + canonAbsPath
+	mu     sync.RWMutex
+	tools  map[string]Tool
+	skills *SkillCatalog
 }
 
 func NewRegistry(opts RegistryOptions) (*Registry, error) {
@@ -208,16 +289,26 @@ func NewRegistry(opts RegistryOptions) (*Registry, error) {
 	if strings.TrimSpace(opts.VaultPaths.Root) != "" {
 		SetOverflowLogsDir(opts.VaultPaths.LogsDir())
 	}
+	rh := opts.ReadHashes
+	if rh == nil {
+		rh = NewReadHashTracker()
+	}
+	art := opts.Artifacts
+	if art == nil && strings.TrimSpace(opts.VaultPaths.Root) != "" {
+		art, _ = store.NewArtifactStore(opts.VaultPaths)
+	}
 
 	r := &Registry{
+		wsID:       opts.WorkspaceID,
 		wsRoot:     opts.WorkspaceRoot,
 		vaultPaths: opts.VaultPaths,
 		snapshots:  opts.Snapshots,
+		artifacts:  art,
 		pathGuard:  pg,
 		seatbelt:   sb,
+		readHashes: rh,
 		tools:      make(map[string]Tool),
 		skills:     opts.Skills,
-		readHashes: make(map[string]string),
 	}
 
 	for _, coreTool := range []Tool{
@@ -226,6 +317,7 @@ func NewRegistry(opts RegistryOptions) (*Registry, error) {
 		r.makeWriteFileTool(),
 		r.makeRunCommandTool(),
 		r.makeSearchCodeTool(),
+		r.makePublishArtifactTool(),
 	} {
 		r.tools[coreTool.Name] = coreTool
 	}
@@ -377,29 +469,24 @@ func (r *Registry) Execute(ctx context.Context, name string, call CallContext, r
 }
 
 func (r *Registry) RecordReadHash(sessionID, absPath, sha256Hex string) {
-	if r == nil || strings.TrimSpace(absPath) == "" || strings.TrimSpace(sha256Hex) == "" {
+	if r == nil || r.readHashes == nil {
 		return
 	}
-	canon := canonicalizeExistingOrClean(absPath)
-	key := strings.TrimSpace(sessionID) + "\x00" + canon
-	r.mu.Lock()
-	r.readHashes[key] = strings.ToLower(strings.TrimSpace(sha256Hex))
-	r.mu.Unlock()
+	r.readHashes.Record(sessionID, absPath, sha256Hex)
 }
 
 func (r *Registry) LastReadHash(sessionID, absPath string) string {
-	if r == nil || strings.TrimSpace(absPath) == "" {
+	if r == nil || r.readHashes == nil {
 		return ""
 	}
-	canon := canonicalizeExistingOrClean(absPath)
-	key := strings.TrimSpace(sessionID) + "\x00" + canon
-	r.mu.RLock()
-	h := r.readHashes[key]
-	if h == "" && sessionID != "" {
-		h = r.readHashes["\x00"+canon]
+	return r.readHashes.Last(sessionID, absPath)
+}
+
+func (r *Registry) InvalidateSessionReadHashes(sessionID string) {
+	if r == nil || r.readHashes == nil {
+		return
 	}
-	r.mu.RUnlock()
-	return h
+	r.readHashes.InvalidateSession(sessionID)
 }
 
 func (r *Registry) resolvePathGuard(call CallContext) (*PathGuard, error) {
@@ -506,6 +593,16 @@ func (r *Registry) handleRunCommand(ctx context.Context, call CallContext, rawIn
 		gitStatusDir = wsRoot
 	}
 
+	snaps := call.Snapshots
+	if snaps == nil {
+		snaps = r.snapshots
+	}
+	shouldSnapshotShell := mode != SandboxReadOnly && inWS && wsRoot != "" && snaps != nil && strings.TrimSpace(call.SessionID) != ""
+	var shellBefore map[string]shellFilePreState
+	if shouldSnapshotShell {
+		shellBefore = captureWorkspaceShellPreState(wsRoot)
+	}
+
 	gitBefore := quickGitStatus(gitStatusDir)
 	res, err := r.seatbelt.runWithParams(runCtx, seatbeltRunParams{
 		CmdStr:         in.Command,
@@ -515,6 +612,9 @@ func (r *Registry) handleRunCommand(ctx context.Context, call CallContext, rawIn
 		Mode:           mode,
 		AllowedDomains: call.AllowedDomains,
 	})
+	if shouldSnapshotShell {
+		recordShellWorkspaceDiff(wsRoot, shellBefore, snaps, call.SessionID, call.Seq)
+	}
 	gitAfter := quickGitStatus(gitStatusDir)
 	if gitBefore != gitAfter && gitAfter != "" {
 		res.GitChanges = gitAfter
@@ -574,6 +674,194 @@ func quickGitStatus(dir string) string {
 	return strings.TrimSpace(string(out))
 }
 
+type shellFilePreState struct {
+	size    int64
+	modNano int64
+	sha256  string
+	bytes   []byte
+}
+
+func captureWorkspaceShellPreState(wsRoot string) map[string]shellFilePreState {
+	out := make(map[string]shellFilePreState)
+	var totalBytes int64
+	var walk func(dir string)
+	walk = func(dir string) {
+		if totalBytes >= maxShellSnapTotalBudget {
+			return
+		}
+		entries, err := os.ReadDir(dir)
+		if err != nil {
+			return
+		}
+		for _, ent := range entries {
+			name := ent.Name()
+			if config.IsIgnoredWalkDir(name) || name == ".gorness" {
+				continue
+			}
+			full := filepath.Join(dir, name)
+			lst, lErr := os.Lstat(full)
+			if lErr != nil || lst.Mode()&os.ModeSymlink != 0 {
+				continue
+			}
+			if lst.IsDir() {
+				walk(full)
+				continue
+			}
+			if !lst.Mode().IsRegular() || lst.Size() > maxShellSnapFileBytes {
+				continue
+			}
+			if totalBytes+lst.Size() > maxShellSnapTotalBudget {
+				continue
+			}
+			raw, rErr := os.ReadFile(full)
+			if rErr != nil {
+				continue
+			}
+			rel, relErr := filepath.Rel(wsRoot, full)
+			if relErr != nil {
+				continue
+			}
+			relSlash := filepath.ToSlash(rel)
+			if relSlash == "" || relSlash == "." || strings.HasPrefix(relSlash, "..") {
+				continue
+			}
+			totalBytes += int64(len(raw))
+			out[relSlash] = shellFilePreState{
+				size:    lst.Size(),
+				modNano: lst.ModTime().UnixNano(),
+				sha256:  sha256HexBytes(raw),
+				bytes:   raw,
+			}
+		}
+	}
+	walk(wsRoot)
+	return out
+}
+
+func recordShellWorkspaceDiff(
+	wsRoot string,
+	before map[string]shellFilePreState,
+	snaps *store.SnapshotStore,
+	sessionID string,
+	seq uint64,
+) {
+	if snaps == nil || strings.TrimSpace(sessionID) == "" || wsRoot == "" {
+		return
+	}
+	seenAfter := make(map[string]bool, len(before))
+	var records []store.FileSnapshotRecord
+
+	var walk func(dir string)
+	walk = func(dir string) {
+		entries, err := os.ReadDir(dir)
+		if err != nil {
+			return
+		}
+		for _, ent := range entries {
+			name := ent.Name()
+			if config.IsIgnoredWalkDir(name) || name == ".gorness" {
+				continue
+			}
+			full := filepath.Join(dir, name)
+			lst, lErr := os.Lstat(full)
+			if lErr != nil || lst.Mode()&os.ModeSymlink != 0 {
+				continue
+			}
+			if lst.IsDir() {
+				walk(full)
+				continue
+			}
+			if !lst.Mode().IsRegular() || lst.Size() > maxShellSnapFileBytes {
+				continue
+			}
+			rel, relErr := filepath.Rel(wsRoot, full)
+			if relErr != nil {
+				continue
+			}
+			relSlash := filepath.ToSlash(rel)
+			if relSlash == "" || relSlash == "." || strings.HasPrefix(relSlash, "..") {
+				continue
+			}
+			seenAfter[relSlash] = true
+
+			pre, existed := before[relSlash]
+			if existed && lst.Size() == pre.size && lst.ModTime().UnixNano() == pre.modNano {
+				continue
+			}
+
+			afterBytes, rErr := os.ReadFile(full)
+			if rErr != nil {
+				continue
+			}
+			if !existed {
+				afterHash, pErr := snaps.PutBlob(afterBytes)
+				if pErr != nil {
+					continue
+				}
+				records = append(records, store.FileSnapshotRecord{
+					Seq:       seq,
+					SessionID: sessionID,
+					RelPath:   relSlash,
+					Kind:      store.ChangeCreate,
+					AfterHash: afterHash,
+				})
+				continue
+			}
+
+			afterSHA := sha256HexBytes(afterBytes)
+			if afterSHA == pre.sha256 {
+				continue
+			}
+			beforeHash, bErr := snaps.PutBlob(pre.bytes)
+			if bErr != nil {
+				continue
+			}
+			afterHash, aErr := snaps.PutBlob(afterBytes)
+			if aErr != nil {
+				continue
+			}
+			records = append(records, store.FileSnapshotRecord{
+				Seq:        seq,
+				SessionID:  sessionID,
+				RelPath:    relSlash,
+				Kind:       store.ChangeModify,
+				BeforeHash: beforeHash,
+				AfterHash:  afterHash,
+			})
+		}
+	}
+	walk(wsRoot)
+
+	for relSlash, pre := range before {
+		if seenAfter[relSlash] {
+			continue
+		}
+		// Only record delete if the file truly no longer exists on disk (as opposed to growing > maxShellSnapFileBytes).
+		absPath := filepath.Join(wsRoot, filepath.FromSlash(relSlash))
+		if _, stErr := os.Lstat(absPath); !errors.Is(stErr, os.ErrNotExist) {
+			continue
+		}
+		beforeHash, bErr := snaps.PutBlob(pre.bytes)
+		if bErr != nil {
+			continue
+		}
+		records = append(records, store.FileSnapshotRecord{
+			Seq:        seq,
+			SessionID:  sessionID,
+			RelPath:    relSlash,
+			Kind:       store.ChangeDelete,
+			BeforeHash: beforeHash,
+		})
+	}
+
+	sort.Slice(records, func(i, j int) bool {
+		return records[i].RelPath < records[j].RelPath
+	})
+	for _, rec := range records {
+		_ = snaps.RecordStepChange(rec)
+	}
+}
+
 // ============================================================================
 // Dynamic Built-in: activate_skill
 // ============================================================================
@@ -609,8 +897,10 @@ func (r *Registry) makeActivateSkillTool() Tool {
 			if call.ActivatedSkills != nil {
 				call.ActivatedSkills[sk.Name] = true
 			}
+			safeBody := config.EscapeBidi(sk.Body)
+			safeBody = reClosingSkillContentTag.ReplaceAllString(safeBody, "&lt;/skill_content&gt;")
 			formatted := fmt.Sprintf("<skill_content name=%q scope=%q>\n%s\n</skill_content>",
-				config.EscapeBidi(sk.Name), sk.Scope, config.EscapeBidi(sk.Body))
+				escapeXMLText(config.EscapeBidi(sk.Name)), escapeXMLText(config.EscapeBidi(sk.Scope)), safeBody)
 			return ToolResult{
 				Output:    formatted,
 				Activated: []string{sk.Name},
@@ -778,69 +1068,22 @@ func (r *Registry) SearchBM25(query string, limit int) []llm.ToolSchema {
 }
 
 func tokenizeBM25(text string) []string {
-	runes := []rune(text)
-	var tokens []string
-	var ident []rune
-
-	flush := func() {
-		if len(ident) == 0 {
-			return
-		}
-		w := strings.ToLower(string(ident))
-		ident = ident[:0]
-		if !isBM25Stopword(w) {
-			tokens = append(tokens, w)
+	raw := store.TokenizeQuery(text)
+	if len(raw) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(raw))
+	for _, tok := range raw {
+		if !isBM25SchemaStopword(tok) {
+			out = append(out, tok)
 		}
 	}
-
-	for i, r := range runes {
-		switch {
-		case unicode.Is(unicode.Han, r):
-			flush()
-			tokens = append(tokens, string(r))
-			if i+1 < len(runes) && unicode.Is(unicode.Han, runes[i+1]) {
-				tokens = append(tokens, string(runes[i:i+2]))
-			}
-		case unicode.IsLetter(r) || unicode.IsDigit(r):
-			if len(ident) > 0 && unicode.IsUpper(r) && i > 0 && unicode.IsLower(runes[i-1]) {
-				flush()
-			}
-			ident = append(ident, r)
-		default:
-			flush()
-		}
-	}
-	flush()
-
-	// 同义词微扩展：帮助自然语言查询如 "kubernetes" <-> "k8s"、"database"/"sql" <-> "postgres" 精准互认。
-	expanded := make([]string, 0, len(tokens)+2)
-	seen := make(map[string]struct{}, len(tokens)+2)
-	add := func(tok string) {
-		if tok == "" {
-			return
-		}
-		if _, ok := seen[tok]; !ok {
-			seen[tok] = struct{}{}
-			expanded = append(expanded, tok)
-		}
-	}
-	for _, tok := range tokens {
-		add(tok)
-		switch tok {
-		case "kubernetes":
-			add("k8s")
-		case "k8s":
-			add("kubernetes")
-		case "postgresql":
-			add("postgres")
-		}
-	}
-	return expanded
+	return out
 }
 
-func isBM25Stopword(w string) bool {
+func isBM25SchemaStopword(w string) bool {
 	switch w {
-	case "a", "an", "the", "and", "or", "to", "of", "in", "on", "for", "with", "by", "object", "string", "type", "properties":
+	case "object", "string", "type", "properties":
 		return true
 	default:
 		return false
@@ -849,7 +1092,7 @@ func isBM25Stopword(w string) bool {
 
 func isCoreBuiltinTool(name string) bool {
 	switch name {
-	case "read_file", "edit_file", "write_file", "run_command", "search_code", "activate_skill":
+	case "read_file", "edit_file", "write_file", "run_command", "search_code", "publish_artifact", "activate_skill", "spawn_subagent":
 		return true
 	default:
 		return false

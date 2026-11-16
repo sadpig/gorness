@@ -2,9 +2,12 @@ package core
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
@@ -17,27 +20,40 @@ import (
 	"gorness.dev/gorness/internal/tools"
 )
 
+type EventType = string
+type PluginTool = tools.Tool
+
 const (
-	EventRunStarted       = "run_started"
-	EventStepStarted      = "step_started"
-	EventStepReset        = "step_reset"
-	EventRetry            = "retry"
-	EventThinkingDelta    = "thinking_delta"
-	EventTextDelta        = "text_delta"
-	EventSteerInjected    = "steer_injected"
-	EventToolCall         = "tool_call"
-	EventToolResult       = "tool_result"
-	EventApprovalRequired = "approval_required"
-	EventApprovalResolved = "approval_resolved"
-	EventToolDeferred     = "tool_deferred"
-	EventDoomLoop         = "doom_loop"
-	EventTitleUpdated     = "title_updated"
-	EventCompacted        = "compacted"
-	EventRunCompleted     = "run_completed"
-	EventRunFailed        = "run_failed"
-	EventRunCancelled     = "run_cancelled"
+	EventRunStarted        = "run_started"
+	EventStepStarted       = "step_started"
+	EventStepReset         = "step_reset"
+	EventRetry             = "retry"
+	EventThinkingDelta     = "thinking_delta"
+	EventTextDelta         = "text_delta"
+	EventSteerInjected     = "steer_injected"
+	EventToolCall          = "tool_call"
+	EventToolResult        = "tool_result"
+	EventApprovalRequired  = "approval_required"
+	EventApprovalResolved  = "approval_resolved"
+	EventToolDeferred      = "tool_deferred"
+	EventDoomLoop          = "doom_loop"
+	EventTitleUpdated      = "title_updated"
+	EventCompacted         = "compacted"
+	EventSubagentStarted   = "subagent_started"
+	EventSubagentCompleted = "subagent_completed"
+	EventRunCompleted      = "run_completed"
+	EventRunFailed         = "run_failed"
+	EventRunCancelled      = "run_cancelled"
+
+	EventConfigReloaded   = "config_reloaded"
+	EventConfigDiagnostic = "config_diagnostic"
+	EventSessionUpdated   = "session_updated"
+	EventAlwaysOnUpdated  = "alwayson_updated"
+	EventFleetUpdated     = "fleet_updated"
 
 	defaultSessionTitle = "New Session"
+	maxRunReplayEvents  = 4096
+	maxRecentRunReplays = 64
 )
 
 var (
@@ -139,11 +155,32 @@ type RunRequest struct {
 	WorktreePath    string          `json:"worktree_path,omitempty"`
 	ExtraWriteDirs  []string        `json:"extra_write_dirs,omitempty"`
 	AllowedTools    []string        `json:"allowed_tools,omitempty"`
+	ExtraTools      []PluginTool    `json:"-"`
 	Unattended      bool            `json:"unattended,omitempty"`
 	MaxSteps        int             `json:"max_steps,omitempty"`
 	StaticReminders []string        `json:"static_reminders,omitempty"`
 	DynamicContext  []string        `json:"dynamic_context,omitempty"`
 	ResumeApproval  *DeferredResume `json:"resume_approval,omitempty"`
+}
+
+type RunLogRecord struct {
+	RunID           string    `json:"run_id"`
+	WorkspaceID     string    `json:"workspace_id"`
+	SessionID       string    `json:"session_id"`
+	AgentRole       string    `json:"agent_role"`
+	ProviderID      string    `json:"provider_id"`
+	ModelID         string    `json:"model_id"`
+	Status          string    `json:"status"`
+	Steps           int       `json:"steps"`
+	InputTokens     int       `json:"input_tokens"`
+	OutputTokens    int       `json:"output_tokens"`
+	CacheReadTokens int       `json:"cache_read_tokens,omitempty"`
+	CostUSD         float64   `json:"cost_usd"`
+	StartedAt       time.Time `json:"started_at"`
+	CompletedAt     time.Time `json:"completed_at"`
+	DurationMs      int64     `json:"duration_ms"`
+	PromptPreview   string    `json:"prompt_preview,omitempty"`
+	Error           string    `json:"error,omitempty"`
 }
 
 type ActiveRunSummary struct {
@@ -165,6 +202,7 @@ type EngineOptions struct {
 	Workspaces *store.WorkspaceStore
 	Sessions   *store.SessionStore
 	Snapshots  *store.SnapshotStore
+	Artifacts  *store.ArtifactStore
 	Router     *llm.Router
 	Hooks      *HookBus
 	Seatbelt   *tools.SeatbeltRunner
@@ -176,8 +214,93 @@ type activeRunState struct {
 	summary ActiveRunSummary
 	cancel  context.CancelFunc
 
-	mu     sync.Mutex
-	steers []string
+	mu       sync.Mutex
+	steers   []string
+	history  []RunEvent
+	subs     map[uint64]chan RunEvent
+	subSeq   uint64
+	finished bool
+}
+
+func (r *activeRunState) recordAndFanout(ctx context.Context, ev RunEvent) {
+	r.mu.Lock()
+	if len(r.history) < maxRunReplayEvents {
+		r.history = append(r.history, ev)
+	} else {
+		// Evict oldest delta event if present so lifecycle milestones remain intact.
+		evicted := false
+		for i, prev := range r.history {
+			if prev.Type == EventTextDelta || prev.Type == EventThinkingDelta {
+				copy(r.history[i:], r.history[i+1:])
+				r.history[len(r.history)-1] = ev
+				evicted = true
+				break
+			}
+		}
+		if !evicted {
+			copy(r.history, r.history[1:])
+			r.history[len(r.history)-1] = ev
+		}
+	}
+	if !r.finished && len(r.subs) > 0 {
+		for _, subCh := range r.subs {
+			select {
+			case subCh <- ev:
+			default:
+				if ev.Type != EventTextDelta && ev.Type != EventThinkingDelta && ctx.Err() == nil {
+					select {
+					case subCh <- ev:
+					default:
+					}
+				}
+			}
+		}
+	}
+	r.mu.Unlock()
+}
+
+func (r *activeRunState) finishAndSnapshot() []RunEvent {
+	r.mu.Lock()
+	r.finished = true
+	hist := append([]RunEvent(nil), r.history...)
+	for id, ch := range r.subs {
+		delete(r.subs, id)
+		close(ch)
+	}
+	r.mu.Unlock()
+	return hist
+}
+
+func (r *activeRunState) subscribe() ([]RunEvent, <-chan RunEvent, func()) {
+	r.mu.Lock()
+	replay := append([]RunEvent(nil), r.history...)
+	if r.finished {
+		r.mu.Unlock()
+		closedCh := make(chan RunEvent)
+		close(closedCh)
+		return replay, closedCh, func() {}
+	}
+	if r.subs == nil {
+		r.subs = make(map[uint64]chan RunEvent)
+	}
+	ch := make(chan RunEvent, 256)
+	r.subSeq++
+	subID := r.subSeq
+	r.subs[subID] = ch
+	r.mu.Unlock()
+
+	var once sync.Once
+	unsub := func() {
+		once.Do(func() {
+			r.mu.Lock()
+			if existing, ok := r.subs[subID]; ok {
+				delete(r.subs, subID)
+				close(existing)
+			}
+			r.mu.Unlock()
+		})
+	}
+	return replay, ch, unsub
 }
 
 func (r *activeRunState) enqueueSteer(msg string) {
@@ -218,12 +341,21 @@ func (r *activeRunState) snapshot() ActiveRunSummary {
 	return cp
 }
 
+type pooledMCP struct {
+	key         string
+	fingerprint string
+	mgr         *tools.MCPManager
+	refs        int
+	evicted     bool
+}
+
 // Engine 统一调度跨项目并发运行、单会话非阻塞文件锁互斥（TryFlock）、500ms 审批经纪人、步边界 Steer、锚定压缩与首轮异步自动命名。
 type Engine struct {
 	cfg        *config.Manager
 	workspaces *store.WorkspaceStore
 	sessions   *store.SessionStore
 	snapshots  *store.SnapshotStore
+	artifacts  *store.ArtifactStore
 	router     *llm.Router
 	hooks      *HookBus
 	grants     *GrantStore
@@ -231,6 +363,7 @@ type Engine struct {
 	broker     *ApprovalBroker
 	compactor  *Compactor
 	seatbelt   *tools.SeatbeltRunner
+	readHashes *tools.ReadHashTracker
 	userHome   string
 	now        func() time.Time
 
@@ -238,13 +371,25 @@ type Engine struct {
 	eventSeq  atomic.Uint64
 	runNonce  atomic.Uint64
 
-	runsMu sync.RWMutex
-	runs   map[string]*activeRunState
-	closed bool
+	runsMu      sync.RWMutex
+	runs        map[string]*activeRunState
+	recentRuns  map[string][]RunEvent
+	recentOrder []string
+	closed      bool
 
 	subsMu sync.RWMutex
 	subs   map[uint64]chan RunEvent
 	subSeq uint64
+
+	pluginMu    sync.RWMutex
+	pluginTools []PluginTool
+
+	sessionHeadsMu sync.Mutex
+	sessionHeads   map[string]string
+
+	mcpMu       sync.Mutex
+	mcpPool     map[string]*pooledMCP
+	reloadUnsub func()
 
 	bgCtx    context.Context
 	bgCancel context.CancelFunc
@@ -289,6 +434,15 @@ func NewEngine(opts EngineOptions) (*Engine, error) {
 		}
 	}
 
+	artStore := opts.Artifacts
+	if artStore == nil {
+		var err error
+		artStore, err = store.NewArtifactStore(paths)
+		if err != nil {
+			return nil, err
+		}
+	}
+
 	router := opts.Router
 	if router == nil {
 		router = llm.NewRouter(opts.Config, opts.Config.Secrets(), nil)
@@ -320,37 +474,210 @@ func NewEngine(opts EngineOptions) (*Engine, error) {
 
 	bgCtx, bgCancel := context.WithCancel(context.Background())
 
-	return &Engine{
-		cfg:        opts.Config,
-		workspaces: wsStore,
-		sessions:   sessStore,
-		snapshots:  snapStore,
-		router:     router,
-		hooks:      hooks,
-		grants:     grants,
-		gate:       gate,
-		broker:     broker,
-		compactor:  compactor,
-		seatbelt:   sb,
-		userHome:   opts.UserHome,
-		now:        nowFn,
-		workerSem:  make(chan struct{}, maxConc),
-		runs:       make(map[string]*activeRunState),
-		subs:       make(map[uint64]chan RunEvent),
-		bgCtx:      bgCtx,
-		bgCancel:   bgCancel,
-	}, nil
+	eng := &Engine{
+		cfg:          opts.Config,
+		workspaces:   wsStore,
+		sessions:     sessStore,
+		snapshots:    snapStore,
+		artifacts:    artStore,
+		router:       router,
+		hooks:        hooks,
+		grants:       grants,
+		gate:         gate,
+		broker:       broker,
+		compactor:    compactor,
+		seatbelt:     sb,
+		readHashes:   tools.NewReadHashTracker(),
+		userHome:     opts.UserHome,
+		now:          nowFn,
+		workerSem:    make(chan struct{}, maxConc),
+		runs:         make(map[string]*activeRunState),
+		recentRuns:   make(map[string][]RunEvent),
+		subs:         make(map[uint64]chan RunEvent),
+		sessionHeads: make(map[string]string),
+		mcpPool:      make(map[string]*pooledMCP),
+		bgCtx:        bgCtx,
+		bgCancel:     bgCancel,
+	}
+
+	eng.reloadUnsub = opts.Config.OnReload(func(snap *config.Snapshot) {
+		eng.evictAllMCP()
+		eng.PublishSystemEvent(EventConfigReloaded, map[string]any{
+			"timestamp": eng.now().UTC(),
+		})
+	})
+
+	return eng, nil
 }
 
-func (e *Engine) Config() *config.Manager           { return e.cfg }
-func (e *Engine) Workspaces() *store.WorkspaceStore { return e.workspaces }
-func (e *Engine) Sessions() *store.SessionStore     { return e.sessions }
-func (e *Engine) Snapshots() *store.SnapshotStore   { return e.snapshots }
-func (e *Engine) Router() *llm.Router               { return e.router }
-func (e *Engine) Hooks() *HookBus                   { return e.hooks }
-func (e *Engine) Gate() *PermissionGate             { return e.gate }
-func (e *Engine) Grants() *GrantStore               { return e.grants }
-func (e *Engine) Broker() *ApprovalBroker           { return e.broker }
+func (e *Engine) Config() *config.Manager            { return e.cfg }
+func (e *Engine) Workspaces() *store.WorkspaceStore  { return e.workspaces }
+func (e *Engine) Sessions() *store.SessionStore      { return e.sessions }
+func (e *Engine) Snapshots() *store.SnapshotStore    { return e.snapshots }
+func (e *Engine) Artifacts() *store.ArtifactStore    { return e.artifacts }
+func (e *Engine) Router() *llm.Router                { return e.router }
+func (e *Engine) Hooks() *HookBus                    { return e.hooks }
+func (e *Engine) Gate() *PermissionGate              { return e.gate }
+func (e *Engine) Grants() *GrantStore                { return e.grants }
+func (e *Engine) Broker() *ApprovalBroker            { return e.broker }
+func (e *Engine) ReadHashes() *tools.ReadHashTracker { return e.readHashes }
+
+// RegisterPluginTools 动态注册全局常驻插件工具（供 Always-On MemoryStore / Fleet 等子系统在 Engine 初始化后挂载）。
+func (e *Engine) RegisterPluginTools(defs ...PluginTool) {
+	if e == nil || len(defs) == 0 {
+		return
+	}
+	e.pluginMu.Lock()
+	defer e.pluginMu.Unlock()
+	for _, d := range defs {
+		name := strings.TrimSpace(d.Name)
+		if name == "" {
+			continue
+		}
+		d.Name = name
+		replaced := false
+		for i := range e.pluginTools {
+			if e.pluginTools[i].Name == name {
+				e.pluginTools[i] = d
+				replaced = true
+				break
+			}
+		}
+		if !replaced {
+			e.pluginTools = append(e.pluginTools, d)
+		}
+	}
+}
+
+func (e *Engine) UnregisterPluginTools(names ...string) {
+	if e == nil || len(names) == 0 {
+		return
+	}
+	drop := make(map[string]bool, len(names))
+	for _, n := range names {
+		if trimmed := strings.TrimSpace(n); trimmed != "" {
+			drop[trimmed] = true
+		}
+	}
+	if len(drop) == 0 {
+		return
+	}
+	e.pluginMu.Lock()
+	filtered := e.pluginTools[:0]
+	for _, pt := range e.pluginTools {
+		if !drop[pt.Name] {
+			filtered = append(filtered, pt)
+		}
+	}
+	e.pluginTools = filtered
+	e.pluginMu.Unlock()
+}
+
+func (e *Engine) snapshotPluginTools() []PluginTool {
+	e.pluginMu.RLock()
+	out := make([]PluginTool, len(e.pluginTools))
+	copy(out, e.pluginTools)
+	e.pluginMu.RUnlock()
+	return out
+}
+
+// SubscribeRun 重放指定运行的历史事件缓冲并返回实时事件订阅流（支持页面刷新重连与多终端并发旁听）。
+func (e *Engine) SubscribeRun(runID string) ([]RunEvent, <-chan RunEvent, func(), error) {
+	target := strings.TrimSpace(runID)
+	if target == "" {
+		return nil, nil, nil, fmt.Errorf("%w: empty run_id", ErrRunNotFound)
+	}
+
+	e.runsMu.RLock()
+	st, active := e.runs[target]
+	if !active {
+		if recent, ok := e.recentRuns[target]; ok {
+			replay := append([]RunEvent(nil), recent...)
+			e.runsMu.RUnlock()
+			closedCh := make(chan RunEvent)
+			close(closedCh)
+			return replay, closedCh, func() {}, nil
+		}
+		e.runsMu.RUnlock()
+		return nil, nil, nil, fmt.Errorf("%w: %s", ErrRunNotFound, target)
+	}
+	e.runsMu.RUnlock()
+
+	replay, ch, unsub := st.subscribe()
+	return replay, ch, unsub, nil
+}
+
+// PublishSystemEvent 向全局事件总线广播系统状态事件（如 config_reloaded, config_diagnostic, session_updated, alwayson_updated, fleet_updated）。
+func (e *Engine) PublishSystemEvent(evType EventType, payload any) {
+	if e == nil {
+		return
+	}
+	cleanType := strings.TrimSpace(evType)
+	if cleanType == "" {
+		return
+	}
+	ev := RunEvent{
+		Seq:       e.eventSeq.Add(1),
+		Type:      cleanType,
+		Payload:   payload,
+		Timestamp: e.now().UTC(),
+	}
+	e.broadcastGlobal(ev)
+}
+
+// RunUtilityPrompt 使用指定角色（默认 utility）执行无工具单轮轻量提示词并返回精炼文本结果（供 Compactor、AutoTitler、Dreamer 等共享）。
+func (e *Engine) RunUtilityPrompt(ctx context.Context, role, system, user string) (string, error) {
+	if e == nil {
+		return "", ErrEngineClosed
+	}
+	res, err := executeUtilityPrompt(ctx, e.cfg, e.workspaces, e.router, "", role, system, user)
+	if err != nil {
+		return "", err
+	}
+	return res.Text, nil
+}
+
+// TrustWorkspace 计算工作区 .gorness/ 与 .mcp.json 的当前 SHA-256 指纹集合并写入 config.toml 授信记录。
+func (e *Engine) TrustWorkspace(wsID string) (map[string]string, error) {
+	if e == nil {
+		return nil, ErrEngineClosed
+	}
+	ws, err := e.workspaces.Get(strings.TrimSpace(wsID))
+	if err != nil {
+		return nil, err
+	}
+	hashes, err := config.ComputeWorkspaceTrustHashes(ws.RootPath)
+	if err != nil {
+		return nil, err
+	}
+	copied := make(map[string]string, len(hashes))
+	for k, v := range hashes {
+		copied[k] = v
+	}
+	if _, err := e.workspaces.Update(ws.ID, func(w *store.Workspace) {
+		w.TrustedHashes = copied
+	}); err != nil {
+		return nil, err
+	}
+	e.evictWorkspaceMCP(ws.ID)
+	out := make(map[string]string, len(copied))
+	for k, v := range copied {
+		out[k] = v
+	}
+	return out, nil
+}
+
+// InvalidateSessionReadHashes 显式清空指定会话跨轮次累积的已读文件哈希缓存（例如在 /rewind 回滚后调用）。
+func (e *Engine) InvalidateSessionReadHashes(sessionID string) {
+	if e == nil || e.readHashes == nil {
+		return
+	}
+	trimmed := strings.TrimSpace(sessionID)
+	e.readHashes.InvalidateSession(trimmed)
+	e.sessionHeadsMu.Lock()
+	delete(e.sessionHeads, trimmed)
+	e.sessionHeadsMu.Unlock()
+}
 
 // SubscribeGlobal 订阅全项目实时运行事件广播流（供 Workbench 侧栏与全局监控台消费）。
 func (e *Engine) SubscribeGlobal() (<-chan RunEvent, func()) {
@@ -426,6 +753,9 @@ func (e *Engine) StartRun(ctx context.Context, req RunRequest) (string, <-chan R
 	if !locked {
 		return "", nil, fmt.Errorf("%w: %s", ErrSessionBusy, meta.ID)
 	}
+
+	// 若会话头指针自上次运行结束后发生了外部回滚（如 /rewind 或分支切换），立即失效跨轮次 readHashes 防止陈旧哈希绕过预读检查
+	e.syncSessionReadHashesBeforeRun(meta)
 
 	// 计算有效工作树根目录（支持 Fleet 隔离 Worktree 覆盖，会话记录仍留在原 Workspace 下）
 	effectiveRoot := ws.RootPath
@@ -505,21 +835,32 @@ func (e *Engine) StartRun(ctx context.Context, req RunRequest) (string, <-chan R
 
 	skillCat := tools.DiscoverSkills(wsSnap, effectiveRoot)
 	reg, err := tools.NewRegistry(tools.RegistryOptions{
+		WorkspaceID:   ws.ID,
 		WorkspaceRoot: effectiveRoot,
 		VaultPaths:    wsSnap.Paths,
 		Snapshots:     e.snapshots,
+		Artifacts:     e.artifacts,
 		PathGuard:     pg,
 		Seatbelt:      e.seatbelt,
 		Skills:        skillCat,
+		ReadHashes:    e.readHashes,
 	})
 	if err != nil {
 		unlockSession()
 		return "", nil, err
 	}
 
-	// 将微内核 HookBus 上动态注册的插件工具同步注入本次运行的工具表
+	// 将微内核 HookBus、Engine 常驻插件工具与本次运行专属附加工具同步注入工具表
 	if e.hooks != nil {
 		for _, pt := range e.hooks.PluginTools() {
+			reg.Register(pt)
+		}
+	}
+	for _, pt := range e.snapshotPluginTools() {
+		reg.Register(pt)
+	}
+	for _, pt := range req.ExtraTools {
+		if strings.TrimSpace(pt.Name) != "" {
 			reg.Register(pt)
 		}
 	}
@@ -543,6 +884,7 @@ func (e *Engine) StartRun(ctx context.Context, req RunRequest) (string, <-chan R
 			StartedAt:    now,
 		},
 		cancel: runCancel,
+		subs:   make(map[uint64]chan RunEvent),
 	}
 
 	e.runsMu.Lock()
@@ -558,15 +900,19 @@ func (e *Engine) StartRun(ctx context.Context, req RunRequest) (string, <-chan R
 	stream := make(chan RunEvent, 256)
 	knownSecrets := e.collectKnownSecrets()
 	allowedToolsCopy := cloneOptionalStrings(req.AllowedTools)
+	extraWriteDirsCopy := append([]string(nil), req.ExtraWriteDirs...)
 
 	e.bgWG.Add(1)
 	go func() {
 		defer e.bgWG.Done()
 		defer close(stream)
 		defer func() {
+			e.recordSessionHeadAfterRun(meta.ID)
+			finalHistory := state.finishAndSnapshot()
 			e.broker.CancelRun(runID)
 			e.runsMu.Lock()
 			delete(e.runs, runID)
+			e.storeRecentRunReplayLocked(runID, finalHistory)
 			e.runsMu.Unlock()
 			runCancel()
 			unlockSession()
@@ -584,8 +930,60 @@ func (e *Engine) StartRun(ctx context.Context, req RunRequest) (string, <-chan R
 				Payload:     payload,
 				Timestamp:   e.now().UTC(),
 			}
+			state.recordAndFanout(runCtx, ev)
 			sendRunEvent(runCtx, stream, ev)
 			e.broadcastGlobal(ev)
+		}
+
+		// 为非子代理角色挂载有界 spawn_subagent 工具（explorer/verifier/debugger/utility 禁止递归派生子代理）
+		if !isSubagentOrUtilityRole(agentRole) {
+			if _, exists := reg.Get("spawn_subagent"); !exists {
+				reg.Register(e.makeSpawnSubagentTool(subagentParentContext{
+					parentRunID:          runID,
+					ws:                   ws,
+					parentSessionID:      meta.ID,
+					effectiveRoot:        effectiveRoot,
+					wsSnap:               wsSnap,
+					configTampered:       configTampered,
+					parentReadOnly:       profilePtr != nil && profilePtr.ReadOnly,
+					parentPermMode:       permMode,
+					parentSandbox:        sandboxMode,
+					parentUnattended:     req.Unattended,
+					parentAllowedTools:   allowedToolsCopy,
+					parentExtraWriteDirs: extraWriteDirsCopy,
+					pathGuard:            pg,
+					skills:               skillCat,
+					secrets:              knownSecrets,
+					emit:                 emit,
+				}))
+			}
+		}
+
+		writeSummaryLog := func(status string, outcome RunOutcome, errMsg string) {
+			completedAt := e.now().UTC()
+			dur := completedAt.Sub(now).Milliseconds()
+			if dur < 0 {
+				dur = 0
+			}
+			e.appendRunLog(RunLogRecord{
+				RunID:           runID,
+				WorkspaceID:     ws.ID,
+				SessionID:       meta.ID,
+				AgentRole:       agentRole,
+				ProviderID:      route.ProviderID,
+				ModelID:         route.ModelID,
+				Status:          status,
+				Steps:           outcome.Steps,
+				InputTokens:     outcome.InputTokens,
+				OutputTokens:    outcome.OutputTokens,
+				CacheReadTokens: outcome.CacheReadTokens,
+				CostUSD:         outcome.CostUSD,
+				StartedAt:       now,
+				CompletedAt:     completedAt,
+				DurationMs:      dur,
+				PromptPreview:   req.Prompt,
+				Error:           errMsg,
+			}, knownSecrets)
 		}
 
 		// 获取全局并发工作槽位（若在排队等待时被取消则立即退出）
@@ -611,17 +1009,20 @@ func (e *Engine) StartRun(ctx context.Context, req RunRequest) (string, <-chan R
 		defer releaseSlot()
 
 		if !acquireSlot() {
+			writeSummaryLog("cancelled", RunOutcome{Status: "cancelled"}, "cancelled while awaiting worker slot")
 			emit(EventRunCancelled, map[string]any{"reason": "cancelled while awaiting worker slot"})
 			return
 		}
 
-	// 按需连接已授信的 MCP 服务器并在运行结束时回收子进程组（单个服务器失败不阻断其余健康服务器的工具挂载）
-		var mcpMgr *tools.MCPManager
+		// 复用或按需连接已授信的温热 MCPManager 池（配置变更或引擎关闭时统一回收，单个服务器失败不阻断其余健康服务器的工具挂载）
 		if len(wsSnap.MCP.Servers) > 0 {
-			mcpMgr = tools.NewMCPManager(e.cfg.Secrets(), wsSnap.Paths.MCPFile(), effectiveRoot)
-			defer func() { _ = mcpMgr.Close() }()
-			_ = mcpMgr.ConnectAll(runCtx, wsSnap.MCP)
-			mcpMgr.RegisterInto(reg)
+			mcpMgr, releaseMCP := e.acquireMCPManager(runCtx, ws.ID, effectiveRoot, wsSnap.Paths.MCPFile(), wsSnap.MCP)
+			if releaseMCP != nil {
+				defer releaseMCP()
+			}
+			if mcpMgr != nil {
+				mcpMgr.RegisterInto(reg)
+			}
 		}
 
 		emit(EventRunStarted, map[string]any{
@@ -653,7 +1054,7 @@ func (e *Engine) StartRun(ctx context.Context, req RunRequest) (string, <-chan R
 			maxSteps:           maxSteps,
 			maxToolConcurrency: wsSnap.Global.MaxToolConcurrency,
 			allowedTools:       allowedToolsCopy,
-			extraWriteDirs:     append([]string(nil), req.ExtraWriteDirs...),
+			extraWriteDirs:     extraWriteDirsCopy,
 			staticReminders:    append([]string(nil), req.StaticReminders...),
 			initialDynamic:     append([]string(nil), req.DynamicContext...),
 			resumeApproval:     cloneDeferredResume(req.ResumeApproval),
@@ -664,6 +1065,7 @@ func (e *Engine) StartRun(ctx context.Context, req RunRequest) (string, <-chan R
 			sessions:           e.sessions,
 			snapshots:          e.snapshots,
 			router:             e.router,
+			compactor:          e.compactor,
 			hooks:              e.hooks,
 			gate:               e.gate,
 			broker:             e.broker,
@@ -686,10 +1088,12 @@ func (e *Engine) StartRun(ctx context.Context, req RunRequest) (string, <-chan R
 
 		switch {
 		case outcome.Status == "deferred":
+			writeSummaryLog("deferred", outcome, "")
 			emit(EventRunCompleted, outcome)
 			return
 
 		case errors.Is(runErr, ErrDoomLoop):
+			writeSummaryLog("doom_loop", outcome, ErrDoomLoop.Error())
 			emit(EventRunFailed, RunErrorPayload{
 				Code:    "doom_loop",
 				Message: ErrDoomLoop.Error(),
@@ -697,19 +1101,23 @@ func (e *Engine) StartRun(ctx context.Context, req RunRequest) (string, <-chan R
 			return
 
 		case errors.Is(runErr, context.Canceled) || errors.Is(runErr, context.DeadlineExceeded) || runCtx.Err() != nil:
+			writeSummaryLog("cancelled", outcome, "run cancelled")
 			emit(EventRunCancelled, map[string]any{
 				"steps": outcome.Steps,
 			})
 			return
 
 		case runErr != nil:
+			redactedErr := config.Redact(runErr.Error(), knownSecrets)
+			writeSummaryLog("failed", outcome, redactedErr)
 			emit(EventRunFailed, RunErrorPayload{
 				Code:    "run_error",
-				Message: config.Redact(runErr.Error(), knownSecrets),
+				Message: redactedErr,
 			})
 			return
 		}
 
+		writeSummaryLog("completed", outcome, "")
 		emit(EventRunCompleted, outcome)
 
 		// 首轮对话顺利完成后，异步调度轻量 utility 角色为仍处于默认标题的会话生成精炼标题
@@ -786,6 +1194,7 @@ func (e *Engine) CompactSession(ctx context.Context, sessionID string) error {
 	if err != nil {
 		return err
 	}
+	e.recordSessionHeadAfterRun(meta.ID)
 
 	e.broadcastGlobal(RunEvent{
 		Seq:         e.eventSeq.Add(1),
@@ -823,11 +1232,17 @@ func (e *Engine) Close() error {
 	}
 	e.runsMu.Unlock()
 
+	if e.reloadUnsub != nil {
+		e.reloadUnsub()
+	}
+
 	for _, c := range cancels {
 		c()
 	}
 	e.bgCancel()
 	e.bgWG.Wait()
+
+	e.evictAllMCP()
 
 	e.subsMu.Lock()
 	for id, ch := range e.subs {
@@ -850,25 +1265,9 @@ func (e *Engine) spawnAutoTitler(ws *store.Workspace, sessionID, userPrompt, ass
 		ctx, cancel := context.WithTimeout(e.bgCtx, 8*time.Second)
 		defer cancel()
 
-		snap := e.cfg.Current()
-		var wsRoleModel string
+		wsID := ""
 		if ws != nil {
-			wsRoleModel = ws.RoleModels["utility"]
-			if wsSnap, _, err := e.cfg.ForWorkspace(ws.RootPath, ws.TrustedHashes); err == nil && wsSnap != nil {
-				snap = wsSnap
-			}
-		}
-
-		route, err := e.router.Resolve("utility", wsRoleModel, "", snap)
-		if err != nil {
-			return
-		}
-
-		staticSys := "You are the Housekeeping Utility agent in Gorness. Produce crisp session titles and faithful anchored summaries preserving exact file paths, decisions, and unresolved tasks."
-		if snap != nil {
-			if prof, ok := snap.Agents["utility"]; ok && strings.TrimSpace(prof.SystemPrompt) != "" {
-				staticSys = prof.SystemPrompt
-			}
+			wsID = ws.ID
 		}
 
 		replyPreview := assistantReply
@@ -877,34 +1276,12 @@ func (e *Engine) spawnAutoTitler(ws *store.Workspace, sessionID, userPrompt, ass
 		}
 		prompt := fmt.Sprintf("Generate a concise 3-6 word session title (no quotes, no trailing punctuation) for:\nUser: %s\nAssistant: %s", userPrompt, replyPreview)
 
-		ch, err := e.router.StreamWithRetry(ctx, route, llm.Request{
-			StaticSystem: staticSys,
-			History: []store.SessionEntry{
-				{
-					Seq:    1,
-					ID:     "title_req",
-					Role:   "user",
-					Blocks: []store.ContentBlock{{Type: "text", Text: prompt}},
-				},
-			},
-		})
+		res, err := executeUtilityPrompt(ctx, e.cfg, e.workspaces, e.router, wsID, "utility", "", prompt)
 		if err != nil {
 			return
 		}
 
-		var buf strings.Builder
-		for ev := range ch {
-			switch ev.Type {
-			case llm.StreamStepReset:
-				buf.Reset()
-			case llm.StreamTextDelta:
-				buf.WriteString(ev.Text)
-			case llm.StreamError:
-				return
-			}
-		}
-
-		title := sanitizeGeneratedTitle(buf.String())
+		title := sanitizeGeneratedTitle(res.Text)
 		if title == "" {
 			return
 		}
@@ -917,17 +1294,13 @@ func (e *Engine) spawnAutoTitler(ws *store.Workspace, sessionID, userPrompt, ass
 			}
 		})
 		if err == nil && applied {
-			wsID := ""
-			if ws != nil {
-				wsID = ws.ID
-			}
 			e.broadcastGlobal(RunEvent{
 				Seq:         e.eventSeq.Add(1),
 				Type:        EventTitleUpdated,
 				WorkspaceID: wsID,
 				SessionID:   sessionID,
 				AgentRole:   "utility",
-				ModelID:     route.ModelID,
+				ModelID:     res.ModelID,
 				Payload: TitleUpdatedPayload{
 					SessionID: sessionID,
 					Title:     title,
@@ -936,6 +1309,240 @@ func (e *Engine) spawnAutoTitler(ws *store.Workspace, sessionID, userPrompt, ass
 			})
 		}
 	}()
+}
+
+func (e *Engine) syncSessionReadHashesBeforeRun(meta *store.SessionMeta) {
+	if e == nil || e.readHashes == nil || meta == nil {
+		return
+	}
+	curHead := fmt.Sprintf("%s:%d", meta.HeadEntryID, meta.HeadSeq)
+	e.sessionHeadsMu.Lock()
+	prevHead, recorded := e.sessionHeads[meta.ID]
+	e.sessionHeadsMu.Unlock()
+	if recorded && prevHead != curHead {
+		e.readHashes.InvalidateSession(meta.ID)
+	}
+}
+
+func (e *Engine) recordSessionHeadAfterRun(sessionID string) {
+	if e == nil || e.sessions == nil {
+		return
+	}
+	curMeta, err := e.sessions.GetMeta(sessionID)
+	if err != nil || curMeta == nil {
+		return
+	}
+	curHead := fmt.Sprintf("%s:%d", curMeta.HeadEntryID, curMeta.HeadSeq)
+	e.sessionHeadsMu.Lock()
+	e.sessionHeads[sessionID] = curHead
+	e.sessionHeadsMu.Unlock()
+}
+
+func (e *Engine) storeRecentRunReplayLocked(runID string, history []RunEvent) {
+	if len(history) == 0 {
+		return
+	}
+	if _, exists := e.recentRuns[runID]; !exists {
+		e.recentOrder = append(e.recentOrder, runID)
+	}
+	e.recentRuns[runID] = history
+	for len(e.recentOrder) > maxRecentRunReplays {
+		oldest := e.recentOrder[0]
+		e.recentOrder = e.recentOrder[1:]
+		delete(e.recentRuns, oldest)
+	}
+}
+
+func computeMCPFingerprint(mcpCfg config.MCPConfig) string {
+	raw, _ := json.Marshal(mcpCfg)
+	sum := sha256.Sum256(raw)
+	return hex.EncodeToString(sum[:])
+}
+
+func (e *Engine) acquireMCPManager(
+	ctx context.Context,
+	wsID, effectiveRoot, globalMCPFile string,
+	mcpCfg config.MCPConfig,
+) (*tools.MCPManager, func()) {
+	canonRoot, cErr := config.CanonicalPath(effectiveRoot)
+	if cErr != nil || canonRoot == "" {
+		canonRoot = filepath.Clean(effectiveRoot)
+	}
+	poolKey := wsID + "\x00" + canonRoot
+	fp := computeMCPFingerprint(mcpCfg)
+
+	var staleMgr *tools.MCPManager
+	e.mcpMu.Lock()
+	if existing, ok := e.mcpPool[poolKey]; ok && existing != nil {
+		if !existing.evicted && existing.fingerprint == fp && existing.mgr != nil && existing.mgr.IsHealthy() {
+			existing.refs++
+			e.mcpMu.Unlock()
+			return existing.mgr, func() { e.releasePooledMCP(existing) }
+		}
+		existing.evicted = true
+		delete(e.mcpPool, poolKey)
+		if existing.refs <= 0 {
+			staleMgr = existing.mgr
+		}
+	}
+	e.mcpMu.Unlock()
+
+	if staleMgr != nil {
+		_ = staleMgr.Close()
+	}
+
+	mgr := tools.NewMCPManager(e.cfg.Secrets(), globalMCPFile, effectiveRoot)
+	connErr := mgr.ConnectAll(ctx, mcpCfg)
+	if ctx.Err() != nil {
+		_ = mgr.Close()
+		return nil, nil
+	}
+	// 若存在部分或全部服务器握手失败，仅在当次运行挂载已成功的工具并在运行结束时立即释放，避免缓存半残连接。
+	if connErr != nil {
+		return mgr, func() { _ = mgr.Close() }
+	}
+
+	e.runsMu.RLock()
+	isClosed := e.closed
+	e.runsMu.RUnlock()
+	if isClosed {
+		return mgr, func() { _ = mgr.Close() }
+	}
+
+	entry := &pooledMCP{
+		key:         poolKey,
+		fingerprint: fp,
+		mgr:         mgr,
+		refs:        1,
+	}
+	var racePrev *tools.MCPManager
+	e.mcpMu.Lock()
+	if prev, ok := e.mcpPool[poolKey]; ok && prev != nil {
+		prev.evicted = true
+		if prev.refs <= 0 {
+			racePrev = prev.mgr
+		}
+	}
+	e.mcpPool[poolKey] = entry
+	e.mcpMu.Unlock()
+	if racePrev != nil {
+		_ = racePrev.Close()
+	}
+
+	return mgr, func() { e.releasePooledMCP(entry) }
+}
+
+func (e *Engine) releasePooledMCP(entry *pooledMCP) {
+	if entry == nil {
+		return
+	}
+	var toClose *tools.MCPManager
+	e.mcpMu.Lock()
+	entry.refs--
+	if entry.refs <= 0 {
+		unhealthy := entry.mgr == nil || !entry.mgr.IsHealthy()
+		if entry.evicted || unhealthy {
+			if !entry.evicted {
+				entry.evicted = true
+				if cur, ok := e.mcpPool[entry.key]; ok && cur == entry {
+					delete(e.mcpPool, entry.key)
+				}
+			}
+			toClose = entry.mgr
+		}
+	}
+	e.mcpMu.Unlock()
+	if toClose != nil {
+		_ = toClose.Close()
+	}
+}
+
+func (e *Engine) evictAllMCP() {
+	if e == nil {
+		return
+	}
+	var toClose []*tools.MCPManager
+	e.mcpMu.Lock()
+	for k, entry := range e.mcpPool {
+		delete(e.mcpPool, k)
+		if entry != nil {
+			entry.evicted = true
+			if entry.refs <= 0 && entry.mgr != nil {
+				toClose = append(toClose, entry.mgr)
+			}
+		}
+	}
+	e.mcpMu.Unlock()
+	for _, m := range toClose {
+		_ = m.Close()
+	}
+}
+
+func (e *Engine) evictWorkspaceMCP(wsID string) {
+	if e == nil || strings.TrimSpace(wsID) == "" {
+		return
+	}
+	prefix := strings.TrimSpace(wsID) + "\x00"
+	var toClose []*tools.MCPManager
+	e.mcpMu.Lock()
+	for k, entry := range e.mcpPool {
+		if strings.HasPrefix(k, prefix) {
+			delete(e.mcpPool, k)
+			if entry != nil {
+				entry.evicted = true
+				if entry.refs <= 0 && entry.mgr != nil {
+					toClose = append(toClose, entry.mgr)
+				}
+			}
+		}
+	}
+	e.mcpMu.Unlock()
+	for _, m := range toClose {
+		_ = m.Close()
+	}
+}
+
+func (e *Engine) appendRunLog(rec RunLogRecord, knownSecrets []string) {
+	if e == nil || e.cfg == nil {
+		return
+	}
+	paths := e.cfg.Paths()
+	if strings.TrimSpace(paths.Root) == "" {
+		return
+	}
+	if rec.PromptPreview != "" {
+		cleaned := config.EscapeBidi(config.Redact(strings.TrimSpace(rec.PromptPreview), knownSecrets))
+		cleaned = strings.ReplaceAll(cleaned, "\r\n", " ")
+		cleaned = strings.ReplaceAll(cleaned, "\n", " ")
+		runes := []rune(cleaned)
+		if len(runes) > 240 {
+			cleaned = string(runes[:240]) + "..."
+		}
+		rec.PromptPreview = cleaned
+	}
+	if rec.Error != "" {
+		cleaned := config.EscapeBidi(config.Redact(strings.TrimSpace(rec.Error), knownSecrets))
+		runes := []rune(cleaned)
+		if len(runes) > 512 {
+			cleaned = string(runes[:512]) + "..."
+		}
+		rec.Error = cleaned
+	}
+
+	logPath := filepath.Join(paths.LogsDir(), "runs.jsonl")
+	lockPath := logPath + ".lock"
+	_ = store.WithFlock(lockPath, true, func() error {
+		return store.AppendJSONLine(logPath, rec)
+	})
+}
+
+func isSubagentOrUtilityRole(role string) bool {
+	switch strings.ToLower(strings.TrimSpace(role)) {
+	case "explorer", "verifier", "debugger", "utility":
+		return true
+	default:
+		return false
+	}
 }
 
 func sanitizeGeneratedTitle(raw string) string {

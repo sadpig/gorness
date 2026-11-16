@@ -100,6 +100,7 @@ func (m *Manager) Watch(ctx context.Context, onChange func(*Snapshot, *ReloadDia
 					continue
 				}
 				m.current.Store(newSnap)
+				m.notifyReload(newSnap)
 				if onChange != nil {
 					onChange(newSnap, nil)
 				}

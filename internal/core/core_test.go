@@ -2653,3 +2653,603 @@ url = %q
 		}
 	})
 }
+
+func TestSlice1CoreHooksTrustReadHashesMCPPoolCompactionSubagentAndSubscriptions(t *testing.T) {
+	var (
+		turnStoppingCalls atomic.Int32
+		subagentHit       atomic.Int32
+		liveStreamGate    = make(chan struct{})
+	)
+
+	streamer := llm.StreamerFunc(func(ctx context.Context, req llm.Request) (<-chan llm.StreamEvent, error) {
+		ch := make(chan llm.StreamEvent, 16)
+		var allText, lastText string
+		for i, ent := range req.History {
+			for _, b := range ent.Blocks {
+				if b.Text != "" {
+					allText += b.Text + "\n"
+					if i == len(req.History)-1 {
+						lastText += b.Text + "\n"
+					}
+				}
+			}
+		}
+
+		go func() {
+			defer close(ch)
+
+			// Utility prompts (RunUtilityPrompt, Compactor, AutoTitler)
+			if strings.Contains(req.StaticSystem, "Housekeeping Utility") || strings.Contains(lastText, "<turns_to_compact>") {
+				ch <- llm.StreamEvent{Type: llm.StreamTextDelta, Text: "## Goal & Intent\nAnchored auto-compaction summary.\n## Key Decisions & Context\nKept 30% recent turns."}
+				ch <- llm.StreamEvent{Type: llm.StreamDone, StopReason: "end_turn", ModelID: req.Model, InputTokens: 20, OutputTokens: 15}
+				return
+			}
+
+			switch {
+			case strings.Contains(allText, "HOOK_PRE_BLOCK"):
+				if strings.Contains(lastText, "blocked by policy stderr") {
+					ch <- llm.StreamEvent{Type: llm.StreamTextDelta, Text: "Observed pre-hook block feedback."}
+					ch <- llm.StreamEvent{Type: llm.StreamDone, StopReason: "end_turn", ModelID: req.Model, InputTokens: 50, OutputTokens: 10}
+					return
+				}
+				ch <- llm.StreamEvent{
+					Type:       llm.StreamToolCall,
+					ToolCallID: "tc_hook_block",
+					ToolName:   "write_file",
+					ToolInput:  json.RawMessage(`{"path":"blocked.txt","content":"nope"}`),
+				}
+				ch <- llm.StreamEvent{Type: llm.StreamDone, StopReason: "tool_use", ModelID: req.Model, InputTokens: 40, OutputTokens: 12}
+
+			case strings.Contains(allText, "HOOK_POST_AND_STOP"):
+				if strings.Contains(allText, "Verify hook marker before stopping") {
+					ch <- llm.StreamEvent{Type: llm.StreamTextDelta, Text: "Verified after turn_stopping veto."}
+					ch <- llm.StreamEvent{Type: llm.StreamDone, StopReason: "end_turn", ModelID: req.Model, InputTokens: 60, OutputTokens: 12}
+					return
+				}
+				if strings.Contains(lastText, "<untrusted_content") || strings.Contains(lastText, "allowed.txt") {
+					turnStoppingCalls.Add(1)
+					ch <- llm.StreamEvent{Type: llm.StreamTextDelta, Text: "Initial completion attempt."}
+					ch <- llm.StreamEvent{Type: llm.StreamDone, StopReason: "end_turn", ModelID: req.Model, InputTokens: 55, OutputTokens: 10}
+					return
+				}
+				ch <- llm.StreamEvent{
+					Type:       llm.StreamToolCall,
+					ToolCallID: "tc_hook_post",
+					ToolName:   "write_file",
+					ToolInput:  json.RawMessage(`{"path":"allowed.txt","content":"ok\n"}`),
+				}
+				ch <- llm.StreamEvent{Type: llm.StreamDone, StopReason: "tool_use", ModelID: req.Model, InputTokens: 45, OutputTokens: 12}
+
+			case strings.Contains(lastText, "READHASH_EDIT_ONLY"):
+				ch <- llm.StreamEvent{
+					Type:       llm.StreamToolCall,
+					ToolCallID: "tc_rh_edit",
+					ToolName:   "edit_file",
+					ToolInput:  json.RawMessage(`{"path":"target.txt","old_string":"alpha-v1","new_string":"alpha-v2"}`),
+				}
+				ch <- llm.StreamEvent{Type: llm.StreamDone, StopReason: "tool_use", ModelID: req.Model, InputTokens: 30, OutputTokens: 12}
+
+			case strings.Contains(allText, "READHASH_EDIT_ONLY"):
+				ch <- llm.StreamEvent{Type: llm.StreamTextDelta, Text: "Edit attempt finished."}
+				ch <- llm.StreamEvent{Type: llm.StreamDone, StopReason: "end_turn", ModelID: req.Model, InputTokens: 35, OutputTokens: 8}
+
+			case strings.Contains(allText, "READHASH_TURN1_READ"):
+				if strings.Contains(lastText, "alpha-v1") {
+					ch <- llm.StreamEvent{Type: llm.StreamTextDelta, Text: "Read target.txt."}
+					ch <- llm.StreamEvent{Type: llm.StreamDone, StopReason: "end_turn", ModelID: req.Model, InputTokens: 30, OutputTokens: 8}
+					return
+				}
+				ch <- llm.StreamEvent{
+					Type:       llm.StreamToolCall,
+					ToolCallID: "tc_rh_read",
+					ToolName:   "read_file",
+					ToolInput:  json.RawMessage(`{"path":"target.txt"}`),
+				}
+				ch <- llm.StreamEvent{Type: llm.StreamDone, StopReason: "tool_use", ModelID: req.Model, InputTokens: 25, OutputTokens: 10}
+
+			case strings.Contains(allText, "AUTO_COMPACT_TRIGGER"):
+				if strings.Contains(lastText, "compaction-probe-ok") {
+					ch <- llm.StreamEvent{Type: llm.StreamTextDelta, Text: "Completed after auto-compaction."}
+					ch <- llm.StreamEvent{Type: llm.StreamDone, StopReason: "end_turn", ModelID: req.Model, InputTokens: 4000, OutputTokens: 20}
+					return
+				}
+				// Return InputTokens = 180,000 (>= 85% of 200,000 ContextWindow) so maybeAutoCompact fires right before next step!
+				ch <- llm.StreamEvent{
+					Type:       llm.StreamToolCall,
+					ToolCallID: "tc_ac_1",
+					ToolName:   "dyn_probe",
+					ToolInput:  json.RawMessage(`{}`),
+				}
+				ch <- llm.StreamEvent{Type: llm.StreamDone, StopReason: "tool_use", ModelID: req.Model, InputTokens: 180000, OutputTokens: 25}
+
+			case strings.Contains(allText, "SUBAGENT_SCAN_TASK") && !strings.Contains(allText, "PARENT_DELEGATE_SUBAGENT"):
+				subagentHit.Add(1)
+				for _, sc := range req.Tools {
+					if sc.Name == "spawn_subagent" || sc.Name == "write_file" || sc.Name == "edit_file" {
+						ch <- llm.StreamEvent{Type: llm.StreamTextDelta, Text: "VIOLATION: forbidden tool exposed to explorer: " + sc.Name}
+						ch <- llm.StreamEvent{Type: llm.StreamDone, StopReason: "end_turn", ModelID: req.Model, InputTokens: 10, OutputTokens: 10}
+						return
+					}
+				}
+				if strings.Contains(lastText, "alpha") {
+					ch <- llm.StreamEvent{Type: llm.StreamTextDelta, Text: "Explorer distilled report: target.txt line 1 confirmed."}
+					ch <- llm.StreamEvent{Type: llm.StreamDone, StopReason: "end_turn", ModelID: req.Model, InputTokens: 28, OutputTokens: 14}
+					return
+				}
+				ch <- llm.StreamEvent{
+					Type:       llm.StreamToolCall,
+					ToolCallID: "sub_tc_1",
+					ToolName:   "read_file",
+					ToolInput:  json.RawMessage(`{"path":"target.txt"}`),
+				}
+				ch <- llm.StreamEvent{Type: llm.StreamDone, StopReason: "tool_use", ModelID: req.Model, InputTokens: 20, OutputTokens: 10}
+
+			case strings.Contains(allText, "PARENT_DELEGATE_SUBAGENT"):
+				if strings.Contains(lastText, "[subagent:explorer") {
+					ch <- llm.StreamEvent{Type: llm.StreamTextDelta, Text: "Parent integrated explorer report."}
+					ch <- llm.StreamEvent{Type: llm.StreamDone, StopReason: "end_turn", ModelID: req.Model, InputTokens: 45, OutputTokens: 12}
+					return
+				}
+				ch <- llm.StreamEvent{
+					Type:       llm.StreamToolCall,
+					ToolCallID: "parent_sub_1",
+					ToolName:   "spawn_subagent",
+					ToolInput:  json.RawMessage(`{"agent_role":"explorer","prompt":"SUBAGENT_SCAN_TASK","paths":["target.txt"],"max_steps":99}`),
+				}
+				ch <- llm.StreamEvent{Type: llm.StreamDone, StopReason: "tool_use", ModelID: req.Model, InputTokens: 35, OutputTokens: 15}
+
+			case strings.Contains(allText, "SUBSCRIBE_LIVE_RUN"):
+				ch <- llm.StreamEvent{Type: llm.StreamTextDelta, Text: "chunk-before-attach "}
+				<-liveStreamGate
+				ch <- llm.StreamEvent{Type: llm.StreamTextDelta, Text: "chunk-after-attach"}
+				ch <- llm.StreamEvent{Type: llm.StreamDone, StopReason: "end_turn", ModelID: req.Model, InputTokens: 20, OutputTokens: 10}
+
+			default:
+				ch <- llm.StreamEvent{Type: llm.StreamTextDelta, Text: "ok"}
+				ch <- llm.StreamEvent{Type: llm.StreamDone, StopReason: "end_turn", ModelID: req.Model, InputTokens: 15, OutputTokens: 5}
+			}
+		}()
+		return ch, nil
+	})
+
+	clock := newFakeClock(time.Date(2026, 11, 16, 12, 0, 0, 0, time.UTC))
+	eng, cfgMgr, vaultRoot, _ := setupTestEngine(t, clock, streamer)
+	ctx := context.Background()
+
+	wsDir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(wsDir, ".gorness"), 0o755); err != nil {
+		t.Fatalf("mkdir ws .gorness: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(wsDir, "target.txt"), []byte("alpha-v1\n"), 0o644); err != nil {
+		t.Fatalf("write target.txt: %v", err)
+	}
+
+	// 1. Untrusted workspace hooks.toml skipped until TrustWorkspace(ws.ID) is called; GrantStore CRUD
+	postMarker := filepath.Join(t.TempDir(), "post_hook_ran.marker")
+	stopMarker := filepath.Join(t.TempDir(), "stop_hook_vetoed_once.marker")
+	wsHooks := fmt.Sprintf(`
+[[pre_tool_use]]
+tool = "write_file"
+command = "cat | grep -q 'blocked.txt' && { echo 'blocked by policy stderr sk-ant-test-key' >&2; exit 2; } || exit 0"
+
+[[post_tool_use]]
+tool = "write_file"
+command = "printf 'ran' > '%s'"
+
+[[turn_stopping]]
+command = "if [ -f '%s' ] && [ ! -f '%s' ]; then touch '%s'; echo 'Verify hook marker before stopping' >&2; exit 2; fi; exit 0"
+`, postMarker, postMarker, stopMarker, stopMarker)
+	if err := os.WriteFile(filepath.Join(wsDir, ".gorness", "hooks.toml"), []byte(wsHooks), 0o600); err != nil {
+		t.Fatalf("write ws hooks.toml: %v", err)
+	}
+
+	ws, err := eng.Workspaces().Register(wsDir, "Slice1CoreRepo")
+	if err != nil {
+		t.Fatalf("Register ws: %v", err)
+	}
+
+	// GrantStore CRUD check
+	if err := eng.Grants().SaveGrant(ws.ID, "fp_1", "run_command", "go test"); err != nil {
+		t.Fatalf("SaveGrant fp_1: %v", err)
+	}
+	if err := eng.Grants().SaveGrant(ws.ID, "fp_2", "write_file", "docs"); err != nil {
+		t.Fatalf("SaveGrant fp_2: %v", err)
+	}
+	grantsList, err := eng.Grants().ListGrants(ws.ID)
+	if err != nil || len(grantsList) != 2 {
+		t.Fatalf("ListGrants expected 2, got %+v err=%v", grantsList, err)
+	}
+	if err := eng.Grants().RevokeGrant(ws.ID, "fp_1"); err != nil || eng.Grants().HasGrant(ws.ID, "fp_1") {
+		t.Fatalf("RevokeGrant fp_1 failed: err=%v", err)
+	}
+	if err := eng.Grants().ClearGrants(ws.ID); err != nil || eng.Grants().HasGrant(ws.ID, "fp_2") {
+		t.Fatalf("ClearGrants failed: err=%v", err)
+	}
+
+	// TrustWorkspace -> enables workspace hooks.toml!
+	trustedHashes, err := eng.TrustWorkspace(ws.ID)
+	if err != nil || len(trustedHashes) == 0 {
+		t.Fatalf("TrustWorkspace failed: hashes=%v err=%v", trustedHashes, err)
+	}
+
+	// PreToolUse exit 2 blocks write_file("blocked.txt") with redacted stderr feedback!
+	_, preEvs, err := eng.StartRun(ctx, RunRequest{
+		WorkspaceID: ws.ID,
+		Prompt:      "HOOK_PRE_BLOCK with secret sk-ant-test-key",
+		PermMode:    PermModeAuto,
+	})
+	if err != nil {
+		t.Fatalf("StartRun HOOK_PRE_BLOCK: %v", err)
+	}
+	var sawHookBlocked bool
+	for _, ev := range drainRunEvents(preEvs) {
+		if ev.Type == EventToolResult {
+			if tr, ok := ev.Payload.(ToolResultPayload); ok && tr.IsError && strings.Contains(tr.Output, "blocked by policy stderr [REDACTED]") {
+				sawHookBlocked = true
+			}
+		}
+	}
+	if !sawHookBlocked {
+		t.Fatal("expected PreToolUse exit 2 to block write_file with redacted stderr feedback")
+	}
+	if _, err := os.Stat(filepath.Join(wsDir, "blocked.txt")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatal("blocked.txt must NOT exist on disk when PreToolUse exited 2")
+	}
+
+	// PostToolUse + TurnStopping veto once then complete cleanly!
+	_, postEvs, err := eng.StartRun(ctx, RunRequest{
+		WorkspaceID: ws.ID,
+		Prompt:      "HOOK_POST_AND_STOP",
+		PermMode:    PermModeAuto,
+	})
+	if err != nil {
+		t.Fatalf("StartRun HOOK_POST_AND_STOP: %v", err)
+	}
+	postDone := drainRunEvents(postEvs)
+	if _, err := os.Stat(postMarker); err != nil {
+		t.Fatalf("expected PostToolUse marker created, stat err=%v", err)
+	}
+	if _, err := os.Stat(stopMarker); err != nil {
+		t.Fatalf("expected TurnStopping marker created, stat err=%v", err)
+	}
+	var postOutcome RunOutcome
+	for _, ev := range postDone {
+		if ev.Type == EventRunCompleted {
+			if out, ok := ev.Payload.(RunOutcome); ok {
+				postOutcome = out
+			}
+		}
+	}
+	if !strings.Contains(postOutcome.FinalText, "Verified after turn_stopping veto.") {
+		t.Fatalf("expected TurnStopping veto follow-up loop, got outcome=%+v", postOutcome)
+	}
+
+	// 2. Cross-turn readHashes stale-modification protection & rewind invalidation
+	rhSess, err := eng.Sessions().Create(ws.ID, "ReadHash Session", "coder")
+	if err != nil {
+		t.Fatalf("Create rhSess: %v", err)
+	}
+	_, rhEv1, err := eng.StartRun(ctx, RunRequest{
+		WorkspaceID: ws.ID,
+		SessionID:   rhSess.ID,
+		Prompt:      "READHASH_TURN1_READ",
+		PermMode:    PermModeAuto,
+	})
+	if err != nil {
+		t.Fatalf("Turn 1 read: %v", err)
+	}
+	_ = drainRunEvents(rhEv1)
+
+	// Half A: External edit on disk between Turn 1 and Turn 2 MUST trigger ErrStalePrecondition in Turn 2
+	// because Engine persisted Turn 1's readHash across turns!
+	if err := os.WriteFile(filepath.Join(wsDir, "target.txt"), []byte("alpha-v1\nexternal-human-edit\n"), 0o644); err != nil {
+		t.Fatalf("external edit target.txt: %v", err)
+	}
+	_, rhEvStale, err := eng.StartRun(ctx, RunRequest{
+		WorkspaceID: ws.ID,
+		SessionID:   rhSess.ID,
+		Prompt:      "READHASH_EDIT_ONLY",
+		PermMode:    PermModeAuto,
+	})
+	if err != nil {
+		t.Fatalf("Turn 2 stale edit check: %v", err)
+	}
+	var sawStalePrecondition bool
+	for _, ev := range drainRunEvents(rhEvStale) {
+		if ev.Type == EventToolResult {
+			if tr, ok := ev.Payload.(ToolResultPayload); ok && tr.IsError && strings.Contains(strings.ToLower(tr.Output), "stale") {
+				sawStalePrecondition = true
+			}
+		}
+	}
+	if !sawStalePrecondition {
+		t.Fatal("expected cross-turn external file modification to be blocked by ErrStalePrecondition")
+	}
+
+	// Restore target.txt to alpha-v1 -> Turn 2b edit succeeds and updates readHashes to H(alpha-v2)!
+	if err := os.WriteFile(filepath.Join(wsDir, "target.txt"), []byte("alpha-v1\n"), 0o644); err != nil {
+		t.Fatalf("reset target.txt: %v", err)
+	}
+	_, rhEv2, err := eng.StartRun(ctx, RunRequest{
+		WorkspaceID: ws.ID,
+		SessionID:   rhSess.ID,
+		Prompt:      "READHASH_EDIT_ONLY",
+		PermMode:    PermModeAuto,
+	})
+	if err != nil {
+		t.Fatalf("Turn 2b edit: %v", err)
+	}
+	_ = drainRunEvents(rhEv2)
+	if raw, err := os.ReadFile(filepath.Join(wsDir, "target.txt")); err != nil || !strings.Contains(string(raw), "alpha-v2") {
+		t.Fatalf("expected cross-turn edit_file to succeed and write alpha-v2, got %q err=%v", string(raw), err)
+	}
+
+	// Half B: Rewind rhSess back to seq 0 (restoring target.txt to alpha-v1) -> invalidates stale H(alpha-v2) in readHashes
+	// so post-rewind Turn 3 edit against restored alpha-v1 succeeds instead of failing stale precondition!
+	if _, _, err := eng.Sessions().Rewind(rhSess.ID, 0, true, eng.Snapshots(), wsDir); err != nil {
+		t.Fatalf("Sessions().Rewind: %v", err)
+	}
+	_, rhEv3, err := eng.StartRun(ctx, RunRequest{
+		WorkspaceID: ws.ID,
+		SessionID:   rhSess.ID,
+		Prompt:      "READHASH_EDIT_ONLY",
+		PermMode:    PermModeAuto,
+	})
+	if err != nil {
+		t.Fatalf("Turn 3 post-rewind edit: %v", err)
+	}
+	_ = drainRunEvents(rhEv3)
+	if raw, err := os.ReadFile(filepath.Join(wsDir, "target.txt")); err != nil || !strings.Contains(string(raw), "alpha-v2") {
+		t.Fatalf("expected post-rewind edit_file to succeed after readHashes invalidation, got %q err=%v", string(raw), err)
+	}
+
+	// 3. Warm MCPManager pool across runs + eviction & EventConfigReloaded on cfgMgr.Reload()
+	var mcpInitHits atomic.Int32
+	mcpSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var rpc struct {
+			ID     any    `json:"id"`
+			Method string `json:"method"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&rpc)
+		if rpc.Method == "notifications/initialized" {
+			w.WriteHeader(http.StatusAccepted)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		switch rpc.Method {
+		case "initialize":
+			mcpInitHits.Add(1)
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"jsonrpc": "2.0",
+				"id":      rpc.ID,
+				"result":  map[string]any{"protocolVersion": "2024-11-05", "capabilities": map[string]any{}},
+			})
+		case "tools/list":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"jsonrpc": "2.0",
+				"id":      rpc.ID,
+				"result":  map[string]any{"tools": []map[string]any{{"name": "warm_ping", "description": "Warm pooled ping"}}},
+			})
+		}
+	}))
+	defer mcpSrv.Close()
+
+	globalSub, unsubGlobal := eng.SubscribeGlobal()
+	defer unsubGlobal()
+
+	mcpTOML := fmt.Sprintf("[servers.warm]\ntransport = \"http\"\nurl = %q\n", mcpSrv.URL)
+	if err := os.WriteFile(cfgMgr.Paths().MCPFile(), []byte(mcpTOML), 0o600); err != nil {
+		t.Fatalf("write mcp.toml: %v", err)
+	}
+	if _, err := cfgMgr.Reload(); err != nil {
+		t.Fatalf("Reload mcp.toml: %v", err)
+	}
+
+	for i := 0; i < 2; i++ {
+		_, sCh, err := eng.StartRun(ctx, RunRequest{WorkspaceID: ws.ID, Prompt: "warm mcp check"})
+		if err != nil {
+			t.Fatalf("warm mcp run %d: %v", i, err)
+		}
+		_ = drainRunEvents(sCh)
+	}
+	if got := mcpInitHits.Load(); got != 1 {
+		t.Fatalf("expected warm MCPManager pool to handshake once across 2 runs, got %d handshakes", got)
+	}
+
+	// Reload evicts warm MCP pool -> next run reconnects (handshake #2)
+	if _, err := cfgMgr.Reload(); err != nil {
+		t.Fatalf("second Reload: %v", err)
+	}
+	_, sChAfterReload, err := eng.StartRun(ctx, RunRequest{WorkspaceID: ws.ID, Prompt: "warm mcp after reload"})
+	if err != nil {
+		t.Fatalf("post-reload mcp run: %v", err)
+	}
+	_ = drainRunEvents(sChAfterReload)
+	if got := mcpInitHits.Load(); got != 2 {
+		t.Fatalf("expected MCP handshake #2 after config reload eviction, got %d", got)
+	}
+
+	// 4. RegisterPluginTools, RunUtilityPrompt, Auto-Compaction (>=85% ContextWindow), and spawn_subagent
+	eng.RegisterPluginTools(PluginTool{
+		Name:            "dyn_probe",
+		Description:     "Dynamic plugin tool for compaction probe",
+		InputSchema:     json.RawMessage(`{"type":"object"}`),
+		ReadOnly:        true,
+		ConcurrencySafe: true,
+		Handler: func(_ context.Context, _ tools.CallContext, _ json.RawMessage) (tools.ToolResult, error) {
+			return tools.ToolResult{Output: "compaction-probe-ok"}, nil
+		},
+	})
+	defer eng.UnregisterPluginTools("dyn_probe")
+
+	utilReply, err := eng.RunUtilityPrompt(ctx, "utility", "", "Produce summary")
+	if err != nil || !strings.Contains(utilReply, "Anchored auto-compaction summary") {
+		t.Fatalf("RunUtilityPrompt failed: reply=%q err=%v", utilReply, err)
+	}
+
+	compSess, err := eng.Sessions().Create(ws.ID, "Auto Compaction Session", "coder")
+	if err != nil {
+		t.Fatalf("Create compSess: %v", err)
+	}
+	for i := 1; i <= 4; i++ {
+		_, _ = eng.Sessions().Append(compSess.ID, store.SessionEntry{
+			Role:   "user",
+			Blocks: []store.ContentBlock{{Type: "text", Text: fmt.Sprintf("Historical turn %d", i)}},
+		})
+		_, _ = eng.Sessions().Append(compSess.ID, store.SessionEntry{
+			Role:   "assistant",
+			Blocks: []store.ContentBlock{{Type: "text", Text: fmt.Sprintf("Historical reply %d", i)}},
+		})
+	}
+	_, acStream, err := eng.StartRun(ctx, RunRequest{
+		WorkspaceID: ws.ID,
+		SessionID:   compSess.ID,
+		Prompt:      "AUTO_COMPACT_TRIGGER",
+		PermMode:    PermModeAuto,
+	})
+	if err != nil {
+		t.Fatalf("StartRun AUTO_COMPACT_TRIGGER: %v", err)
+	}
+	var sawAutoCompacted bool
+	for _, ev := range drainRunEvents(acStream) {
+		if ev.Type == EventCompacted {
+			sawAutoCompacted = true
+		}
+	}
+	if !sawAutoCompacted {
+		t.Fatal("expected EventCompacted emitted automatically when InputTokens >= 85% of ContextWindow")
+	}
+
+	// spawn_subagent (explorer: read-only, non-recursive, max 8 steps, emits SubagentStarted & SubagentCompleted)
+	_, subStream, err := eng.StartRun(ctx, RunRequest{
+		WorkspaceID: ws.ID,
+		Prompt:      "PARENT_DELEGATE_SUBAGENT",
+		PermMode:    PermModeAuto,
+	})
+	if err != nil {
+		t.Fatalf("StartRun PARENT_DELEGATE_SUBAGENT: %v", err)
+	}
+	var sawSubStart, sawSubDone bool
+	for _, ev := range drainRunEvents(subStream) {
+		switch ev.Type {
+		case EventSubagentStarted:
+			if p, ok := ev.Payload.(SubagentStartedPayload); ok && p.AgentRole == "explorer" && p.ReadOnly && p.MaxSteps == MaxSubagentSteps {
+				sawSubStart = true
+			}
+		case EventSubagentCompleted:
+			if p, ok := ev.Payload.(SubagentCompletedPayload); ok && p.Status == "completed" && strings.Contains(p.Summary, "Explorer distilled report") {
+				sawSubDone = true
+			}
+		}
+	}
+	if !sawSubStart || !sawSubDone || subagentHit.Load() == 0 {
+		t.Fatalf("expected spawn_subagent lifecycle events & execution: start=%v done=%v hits=%d", sawSubStart, sawSubDone, subagentHit.Load())
+	}
+
+	// 5. SubscribeRun (live attach + post-completion replay), PublishSystemEvent, and redacted runs.jsonl
+	liveRunID, livePrimary, err := eng.StartRun(ctx, RunRequest{
+		WorkspaceID: ws.ID,
+		Prompt:      "SUBSCRIBE_LIVE_RUN",
+	})
+	if err != nil {
+		t.Fatalf("StartRun SUBSCRIBE_LIVE_RUN: %v", err)
+	}
+	// Wait until chunk-before-attach has been emitted into active history before calling SubscribeRun
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		replay, _, unsub, sErr := eng.SubscribeRun(liveRunID)
+		if sErr == nil {
+			hasFirstChunk := false
+			for _, ev := range replay {
+				if ev.Type == EventTextDelta {
+					if m, ok := ev.Payload.(map[string]any); ok && m["text"] == "chunk-before-attach " {
+						hasFirstChunk = true
+					}
+				}
+			}
+			unsub()
+			if hasFirstChunk {
+				break
+			}
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	replayMid, liveSubCh, unsubLive, err := eng.SubscribeRun(liveRunID)
+	if err != nil {
+		t.Fatalf("SubscribeRun mid-run: %v", err)
+	}
+	defer unsubLive()
+	close(liveStreamGate)
+
+	liveTail := drainRunEvents(liveSubCh)
+	_ = drainRunEvents(livePrimary)
+	eng.WaitBackground()
+
+	var combinedText strings.Builder
+	for _, ev := range append(replayMid, liveTail...) {
+		if ev.Type == EventTextDelta {
+			if m, ok := ev.Payload.(map[string]any); ok {
+				if s, ok := m["text"].(string); ok {
+					combinedText.WriteString(s)
+				}
+			}
+		}
+	}
+	if combinedText.String() != "chunk-before-attach chunk-after-attach" {
+		t.Fatalf("SubscribeRun replay + live delta mismatch: got %q", combinedText.String())
+	}
+
+	// Post-completion SubscribeRun replays from bounded recentRuns cache and returns a closed channel
+	postReplay, postCh, postUnsub, err := eng.SubscribeRun(liveRunID)
+	if err != nil || len(postReplay) == 0 {
+		t.Fatalf("SubscribeRun post-completion expected replay, got len=%d err=%v", len(postReplay), err)
+	}
+	postUnsub()
+	if _, open := <-postCh; open {
+		t.Fatal("expected post-completion SubscribeRun live channel to be closed")
+	}
+
+	eng.PublishSystemEvent(EventAlwaysOnUpdated, map[string]any{"inbox_pending": 0})
+	var sawReloadEvent, sawAlwaysOnEvent bool
+drainLoop:
+	for {
+		select {
+		case ev := <-globalSub:
+			if ev.Type == EventConfigReloaded {
+				sawReloadEvent = true
+			}
+			if ev.Type == EventAlwaysOnUpdated {
+				sawAlwaysOnEvent = true
+			}
+		default:
+			break drainLoop
+		}
+	}
+	if !sawReloadEvent || !sawAlwaysOnEvent {
+		t.Fatalf("expected global EventConfigReloaded (%v) and EventAlwaysOnUpdated (%v)", sawReloadEvent, sawAlwaysOnEvent)
+	}
+
+	// Verify runtime/logs/runs.jsonl exists, contains redacted RunLogRecords, and ZERO .json files exist in vaultRoot!
+	runsLogBytes, err := os.ReadFile(filepath.Join(cfgMgr.Paths().LogsDir(), "runs.jsonl"))
+	if err != nil || len(runsLogBytes) == 0 {
+		t.Fatalf("expected non-empty runtime/logs/runs.jsonl, err=%v", err)
+	}
+	if strings.Contains(string(runsLogBytes), "sk-ant-test-key") {
+		t.Fatalf("runs.jsonl leaked raw API key:\n%s", string(runsLogBytes))
+	}
+	if !strings.Contains(string(runsLogBytes), "[REDACTED]") {
+		t.Fatalf("expected [REDACTED] prompt preview in runs.jsonl, got:\n%s", string(runsLogBytes))
+	}
+	if err := filepath.WalkDir(vaultRoot, func(p string, d os.DirEntry, wErr error) error {
+		if wErr != nil {
+			return wErr
+		}
+		if !d.IsDir() && strings.HasSuffix(strings.ToLower(d.Name()), ".json") {
+			return fmt.Errorf("forbidden .json file inside vault: %s", p)
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+}

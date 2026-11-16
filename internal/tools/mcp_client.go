@@ -20,7 +20,10 @@ import (
 	"time"
 
 	"gorness.dev/gorness/internal/config"
+	"gorness.dev/gorness/internal/llm"
 )
+
+const maxMCPStderrRingBytes = 16 * 1024
 
 type mcpTransportClient interface {
 	Call(ctx context.Context, toolName string, arguments json.RawMessage) (ToolResult, error)
@@ -223,6 +226,24 @@ func (m *MCPManager) RegisterInto(reg *Registry) {
 	}
 }
 
+func (m *MCPManager) IsHealthy() bool {
+	if m == nil {
+		return false
+	}
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	for _, c := range m.clients {
+		if sc, ok := c.(*stdioMCPClient); ok {
+			select {
+			case <-sc.doneCh:
+				return false
+			default:
+			}
+		}
+	}
+	return true
+}
+
 func (m *MCPManager) Close() error {
 	if m == nil {
 		return nil
@@ -265,11 +286,8 @@ func (m *MCPManager) resolveKVMap(ctx context.Context, in map[string]string, all
 			continue
 		}
 		out[k] = v
-		lk := strings.ToLower(k)
-		if strings.Contains(lk, "key") || strings.Contains(lk, "token") || strings.Contains(lk, "secret") || strings.Contains(lk, "auth") {
-			if trimmed != "" {
-				secrets = append(secrets, v)
-			}
+		if config.IsSecretHeaderOrEnvKey(k) && trimmed != "" {
+			secrets = append(secrets, v)
 		}
 	}
 	return out, secrets, nil
@@ -305,6 +323,157 @@ type jsonRPCResponse struct {
 		Code    int    `json:"code"`
 		Message string `json:"message"`
 	} `json:"error"`
+}
+
+type jsonRPCRoundTripFunc func(ctx context.Context, method string, params any, expectReply bool) (json.RawMessage, error)
+
+func buildJSONRPCPayload(method string, params any, id *uint64) ([]byte, error) {
+	payload := map[string]any{
+		"jsonrpc": "2.0",
+		"method":  method,
+		"params":  params,
+	}
+	if id != nil {
+		payload["id"] = *id
+	}
+	return json.Marshal(payload)
+}
+
+func roundTripJSONRPC(
+	ctx context.Context,
+	rt jsonRPCRoundTripFunc,
+	method string,
+	params any,
+	out any,
+) error {
+	expectReply := out != nil || method == "initialize"
+	rawRes, err := rt(ctx, method, params, expectReply)
+	if err != nil {
+		return err
+	}
+	if out == nil || len(rawRes) == 0 {
+		return nil
+	}
+	if rawTarget, ok := out.(*json.RawMessage); ok {
+		*rawTarget = append(json.RawMessage(nil), rawRes...)
+		return nil
+	}
+	if err := json.Unmarshal(rawRes, out); err != nil {
+		return fmt.Errorf("decode %s response: %w", method, err)
+	}
+	return nil
+}
+
+func mcpHandshakeAndListTools(ctx context.Context, rt jsonRPCRoundTripFunc) ([]mcpRemoteToolSpec, error) {
+	initParams := map[string]any{
+		"protocolVersion": "2024-11-05",
+		"capabilities":    map[string]any{},
+		"clientInfo":      map[string]any{"name": "gorness", "version": config.Version},
+	}
+	if err := roundTripJSONRPC(ctx, rt, "initialize", initParams, nil); err != nil {
+		return nil, err
+	}
+	_, _ = rt(ctx, "notifications/initialized", map[string]any{}, false)
+
+	var allTools []mcpRemoteToolSpec
+	cursor := ""
+	for page := 0; page < 20; page++ {
+		params := map[string]any{}
+		if cursor != "" {
+			params["cursor"] = cursor
+		}
+		var parsed mcpToolsListResult
+		if err := roundTripJSONRPC(ctx, rt, "tools/list", params, &parsed); err != nil {
+			return nil, err
+		}
+		allTools = append(allTools, parsed.Tools...)
+		if parsed.NextCursor == "" || parsed.NextCursor == cursor {
+			break
+		}
+		cursor = parsed.NextCursor
+	}
+	return allTools, nil
+}
+
+func mcpCallRemoteTool(ctx context.Context, rt jsonRPCRoundTripFunc, toolName string, arguments json.RawMessage) (ToolResult, error) {
+	argsObj := json.RawMessage(`{}`)
+	if len(bytes.TrimSpace(arguments)) > 0 {
+		argsObj = arguments
+	}
+	var rawRes json.RawMessage
+	if err := roundTripJSONRPC(ctx, rt, "tools/call", map[string]any{
+		"name":      toolName,
+		"arguments": argsObj,
+	}, &rawRes); err != nil {
+		return ToolResult{}, err
+	}
+	return decodeMCPCallPayload(rawRes), nil
+}
+
+// stderrRingBuffer 保存最近 capBytes 字节的子进程 stderr 输出，支持并发安全写入与快照读取。
+type stderrRingBuffer struct {
+	mu       sync.Mutex
+	ring     []byte
+	capBytes int
+	start    int
+	size     int
+}
+
+func newStderrRingBuffer(capBytes int) *stderrRingBuffer {
+	if capBytes <= 0 {
+		capBytes = maxMCPStderrRingBytes
+	}
+	return &stderrRingBuffer{
+		ring:     make([]byte, capBytes),
+		capBytes: capBytes,
+	}
+}
+
+func (b *stderrRingBuffer) Write(p []byte) (int, error) {
+	origLen := len(p)
+	if origLen == 0 || b == nil || b.capBytes <= 0 {
+		return origLen, nil
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	if len(p) >= b.capBytes {
+		copy(b.ring, p[len(p)-b.capBytes:])
+		b.start = 0
+		b.size = b.capBytes
+		return origLen, nil
+	}
+
+	for _, ch := range p {
+		writeIdx := (b.start + b.size) % b.capBytes
+		b.ring[writeIdx] = ch
+		if b.size < b.capBytes {
+			b.size++
+		} else {
+			b.start = (b.start + 1) % b.capBytes
+		}
+	}
+	return origLen, nil
+}
+
+func (b *stderrRingBuffer) String() string {
+	if b == nil {
+		return ""
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.size == 0 {
+		return ""
+	}
+	out := make([]byte, b.size)
+	firstPart := b.capBytes - b.start
+	if firstPart >= b.size {
+		copy(out, b.ring[b.start:b.start+b.size])
+	} else {
+		copy(out, b.ring[b.start:])
+		copy(out[firstPart:], b.ring[:b.size-firstPart])
+	}
+	return strings.TrimSpace(string(out))
 }
 
 // ============================================================================
@@ -346,53 +515,15 @@ func startHTTPMCPClient(
 		secrets:    secrets,
 	}
 
-	initParams := map[string]any{
-		"protocolVersion": "2024-11-05",
-		"capabilities":    map[string]any{},
-		"clientInfo":      map[string]any{"name": "gorness", "version": "1.0.0"},
-	}
-	if _, err := c.rpcRequest(ctx, "initialize", initParams, true); err != nil {
+	allTools, err := mcpHandshakeAndListTools(ctx, c.rpcRequest)
+	if err != nil {
 		return nil, nil, err
-	}
-	_, _ = c.rpcRequest(ctx, "notifications/initialized", map[string]any{}, false)
-
-	var allTools []mcpRemoteToolSpec
-	cursor := ""
-	for page := 0; page < 20; page++ {
-		params := map[string]any{}
-		if cursor != "" {
-			params["cursor"] = cursor
-		}
-		rawRes, err := c.rpcRequest(ctx, "tools/list", params, true)
-		if err != nil {
-			return nil, nil, err
-		}
-		var parsed mcpToolsListResult
-		if err := json.Unmarshal(rawRes, &parsed); err != nil {
-			return nil, nil, fmt.Errorf("decode tools/list: %w", err)
-		}
-		allTools = append(allTools, parsed.Tools...)
-		if parsed.NextCursor == "" || parsed.NextCursor == cursor {
-			break
-		}
-		cursor = parsed.NextCursor
 	}
 	return c, allTools, nil
 }
 
 func (c *httpMCPClient) Call(ctx context.Context, toolName string, arguments json.RawMessage) (ToolResult, error) {
-	argsObj := json.RawMessage(`{}`)
-	if len(bytes.TrimSpace(arguments)) > 0 {
-		argsObj = arguments
-	}
-	rawRes, err := c.rpcRequest(ctx, "tools/call", map[string]any{
-		"name":      toolName,
-		"arguments": argsObj,
-	}, true)
-	if err != nil {
-		return ToolResult{}, err
-	}
-	return decodeMCPCallPayload(rawRes), nil
+	return mcpCallRemoteTool(ctx, c.rpcRequest, toolName, arguments)
 }
 
 func (c *httpMCPClient) Close() error {
@@ -406,16 +537,13 @@ func (c *httpMCPClient) rpcRequest(ctx context.Context, method string, params an
 	reqCtx, cancel := context.WithTimeout(ctx, c.timeout)
 	defer cancel()
 
-	payload := map[string]any{
-		"jsonrpc": "2.0",
-		"method":  method,
-		"params":  params,
-	}
+	var idPtr *uint64
 	if expectReply {
-		payload["id"] = c.seq.Add(1)
+		id := c.seq.Add(1)
+		idPtr = &id
 	}
 
-	bodyBytes, err := json.Marshal(payload)
+	bodyBytes, err := buildJSONRPCPayload(method, params, idPtr)
 	if err != nil {
 		return nil, err
 	}
@@ -456,7 +584,7 @@ func (c *httpMCPClient) rpcRequest(ctx context.Context, method string, params an
 		return nil, nil
 	}
 
-	rawBody, err := io.ReadAll(io.LimitReader(resp.Body, 4*1024*1024))
+	rawBody, err := io.ReadAll(io.LimitReader(resp.Body, 8*1024*1024))
 	if err != nil {
 		return nil, err
 	}
@@ -480,29 +608,22 @@ func (c *httpMCPClient) rpcRequest(ctx context.Context, method string, params an
 }
 
 func parseSSERPCResponse(raw []byte, out *jsonRPCResponse) error {
-	scanner := bufio.NewScanner(bytes.NewReader(raw))
-	scanner.Buffer(make([]byte, 64*1024), 4*1024*1024)
-	var dataLines []string
-	for scanner.Scan() {
-		line := scanner.Text()
-		if strings.TrimSpace(line) == "" {
-			if len(dataLines) > 0 {
-				joined := strings.Join(dataLines, "\n")
-				dataLines = dataLines[:0]
-				var cand jsonRPCResponse
-				if err := json.Unmarshal([]byte(joined), &cand); err == nil && (len(cand.Result) > 0 || cand.Error != nil) {
-					*out = cand
-					return nil
-				}
+	reader := llm.NewSSEReader(bytes.NewReader(raw))
+	for {
+		ev, err := reader.Next()
+		if err != nil {
+			if errors.Is(err, io.EOF) {
+				break
 			}
+			return err
+		}
+		data := strings.TrimSpace(ev.Data)
+		if data == "" || data == "[DONE]" {
 			continue
 		}
-		if after, ok := strings.CutPrefix(line, "data:"); ok {
-			dataLines = append(dataLines, strings.TrimSpace(after))
-		}
-	}
-	if len(dataLines) > 0 {
-		if err := json.Unmarshal([]byte(strings.Join(dataLines, "\n")), out); err == nil {
+		var cand jsonRPCResponse
+		if uErr := json.Unmarshal([]byte(data), &cand); uErr == nil && (len(cand.Result) > 0 || cand.Error != nil) {
+			*out = cand
 			return nil
 		}
 	}
@@ -516,6 +637,7 @@ func parseSSERPCResponse(raw []byte, out *jsonRPCResponse) error {
 type stdioMCPClient struct {
 	cmd     *exec.Cmd
 	stdin   io.WriteCloser
+	stderr  *stderrRingBuffer
 	timeout time.Duration
 	secrets []string
 
@@ -562,7 +684,8 @@ func startStdioMCPClient(
 		_ = stdin.Close()
 		return nil, nil, err
 	}
-	cmd.Stderr = io.Discard
+	stderrRing := newStderrRingBuffer(maxMCPStderrRingBytes)
+	cmd.Stderr = stderrRing
 
 	if err := cmd.Start(); err != nil {
 		_ = stdin.Close()
@@ -572,6 +695,7 @@ func startStdioMCPClient(
 	c := &stdioMCPClient{
 		cmd:     cmd,
 		stdin:   stdin,
+		stderr:  stderrRing,
 		timeout: timeout,
 		secrets: secrets,
 		pending: make(map[uint64]chan jsonRPCResponse),
@@ -585,41 +709,11 @@ func startStdioMCPClient(
 		c.failAllPending()
 	}()
 
-	initParams := map[string]any{
-		"protocolVersion": "2024-11-05",
-		"capabilities":    map[string]any{},
-		"clientInfo":      map[string]any{"name": "gorness", "version": "1.0.0"},
-	}
-	if _, err := c.rpcRequest(ctx, "initialize", initParams, true); err != nil {
+	allTools, err := mcpHandshakeAndListTools(ctx, c.rpcRequest)
+	if err != nil {
 		_ = c.Close()
 		return nil, nil, err
 	}
-	_, _ = c.rpcRequest(ctx, "notifications/initialized", map[string]any{}, false)
-
-	var allTools []mcpRemoteToolSpec
-	cursor := ""
-	for page := 0; page < 20; page++ {
-		params := map[string]any{}
-		if cursor != "" {
-			params["cursor"] = cursor
-		}
-		rawRes, err := c.rpcRequest(ctx, "tools/list", params, true)
-		if err != nil {
-			_ = c.Close()
-			return nil, nil, err
-		}
-		var parsed mcpToolsListResult
-		if err := json.Unmarshal(rawRes, &parsed); err != nil {
-			_ = c.Close()
-			return nil, nil, fmt.Errorf("decode stdio tools/list: %w", err)
-		}
-		allTools = append(allTools, parsed.Tools...)
-		if parsed.NextCursor == "" || parsed.NextCursor == cursor {
-			break
-		}
-		cursor = parsed.NextCursor
-	}
-
 	return c, allTools, nil
 }
 
@@ -710,6 +804,21 @@ func (c *stdioMCPClient) failAllPending() {
 	}
 }
 
+func (c *stdioMCPClient) Stderr() string {
+	if c == nil || c.stderr == nil {
+		return ""
+	}
+	return config.Redact(c.stderr.String(), c.secrets)
+}
+
+func (c *stdioMCPClient) formatStdioError(baseMsg string) error {
+	tail := c.Stderr()
+	if tail == "" {
+		return errors.New(baseMsg)
+	}
+	return fmt.Errorf("%s (stderr: %s)", baseMsg, tail)
+}
+
 func (c *stdioMCPClient) rpcRequest(ctx context.Context, method string, params any, expectReply bool) (json.RawMessage, error) {
 	if ctx == nil {
 		ctx = context.Background()
@@ -718,28 +827,22 @@ func (c *stdioMCPClient) rpcRequest(ctx context.Context, method string, params a
 	defer cancel()
 
 	var id uint64
+	var idPtr *uint64
 	var replyCh chan jsonRPCResponse
 	if expectReply {
 		id = c.seq.Add(1)
+		idPtr = &id
 		replyCh = make(chan jsonRPCResponse, 1)
 		c.pendMu.Lock()
 		if c.closed {
 			c.pendMu.Unlock()
-			return nil, errors.New("mcp stdio client closed")
+			return nil, c.formatStdioError("mcp stdio client closed")
 		}
 		c.pending[id] = replyCh
 		c.pendMu.Unlock()
 	}
 
-	payload := map[string]any{
-		"jsonrpc": "2.0",
-		"method":  method,
-		"params":  params,
-	}
-	if expectReply {
-		payload["id"] = id
-	}
-	encoded, err := json.Marshal(payload)
+	encoded, err := buildJSONRPCPayload(method, params, idPtr)
 	if err != nil {
 		return nil, err
 	}
@@ -754,7 +857,7 @@ func (c *stdioMCPClient) rpcRequest(ctx context.Context, method string, params a
 			delete(c.pending, id)
 			c.pendMu.Unlock()
 		}
-		return nil, wErr
+		return nil, c.formatStdioError(fmt.Sprintf("mcp stdio write failed: %v", wErr))
 	}
 	if !expectReply {
 		return nil, nil
@@ -763,7 +866,7 @@ func (c *stdioMCPClient) rpcRequest(ctx context.Context, method string, params a
 	select {
 	case resp, ok := <-replyCh:
 		if !ok {
-			return nil, errors.New("mcp stdio subprocess exited before replying")
+			return nil, c.formatStdioError("mcp stdio subprocess exited before replying")
 		}
 		if resp.Error != nil {
 			return nil, fmt.Errorf("mcp stdio error %d: %s", resp.Error.Code, config.Redact(resp.Error.Message, c.secrets))
@@ -773,23 +876,15 @@ func (c *stdioMCPClient) rpcRequest(ctx context.Context, method string, params a
 		c.pendMu.Lock()
 		delete(c.pending, id)
 		c.pendMu.Unlock()
+		if tail := c.Stderr(); tail != "" {
+			return nil, fmt.Errorf("%w (stderr: %s)", reqCtx.Err(), tail)
+		}
 		return nil, reqCtx.Err()
 	}
 }
 
 func (c *stdioMCPClient) Call(ctx context.Context, toolName string, arguments json.RawMessage) (ToolResult, error) {
-	argsObj := json.RawMessage(`{}`)
-	if len(bytes.TrimSpace(arguments)) > 0 {
-		argsObj = arguments
-	}
-	rawRes, err := c.rpcRequest(ctx, "tools/call", map[string]any{
-		"name":      toolName,
-		"arguments": argsObj,
-	}, true)
-	if err != nil {
-		return ToolResult{}, err
-	}
-	return decodeMCPCallPayload(rawRes), nil
+	return mcpCallRemoteTool(ctx, c.rpcRequest, toolName, arguments)
 }
 
 func (c *stdioMCPClient) Close() error {

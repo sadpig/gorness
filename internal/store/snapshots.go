@@ -34,6 +34,9 @@ type FileSnapshotRecord struct {
 	AfterHash  string     `json:"after_hash,omitempty"`
 }
 
+// SnapshotRecord aliases FileSnapshotRecord for snapshot timeline inspection APIs.
+type SnapshotRecord = FileSnapshotRecord
+
 // SnapshotStore 基于 SHA-256 内容寻址块与按会话追加账本支撑 /rewind 毫秒级精确回滚源码。
 type SnapshotStore struct {
 	paths config.VaultPaths
@@ -74,6 +77,143 @@ func (s *SnapshotStore) ledgerPath(sessionID string) string {
 
 func (s *SnapshotStore) ledgerLockPath(sessionID string) string {
 	return filepath.Join(s.paths.RuntimeDir(), "locks", "snap-"+sessionID+".lock")
+}
+
+func (s *SnapshotStore) gcLockPath() string {
+	return filepath.Join(s.paths.RuntimeDir(), "locks", "snap-gc.lock")
+}
+
+// ListSessionRecords returns all FileSnapshotRecord entries recorded for sessionID in chronological order.
+func (s *SnapshotStore) ListSessionRecords(wsID, sessionID string) ([]SnapshotRecord, error) {
+	if wsID != "" {
+		if err := ValidateSafeID(wsID); err != nil {
+			return nil, fmt.Errorf("invalid workspace id: %w", err)
+		}
+	}
+	if err := ValidateSafeID(sessionID); err != nil {
+		return nil, fmt.Errorf("invalid session id: %w", err)
+	}
+
+	var out []SnapshotRecord
+	err := WithFlock(s.ledgerLockPath(sessionID), false, func() error {
+		recs, rErr := readSnapshotLedger(s.ledgerPath(sessionID))
+		if rErr != nil {
+			if errors.Is(rErr, os.ErrNotExist) {
+				out = []SnapshotRecord{}
+				return nil
+			}
+			return rErr
+		}
+		out = recs
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	if out == nil {
+		out = []SnapshotRecord{}
+	}
+	return out, nil
+}
+
+// DeleteSessionSnapshots removes sessionID's snapshot ledger and garbage-collects any SHA-256 blobs
+// that are no longer referenced by any remaining session ledger in runtime/snapshots/ledgers/.
+func (s *SnapshotStore) DeleteSessionSnapshots(wsID, sessionID string) error {
+	if wsID != "" {
+		if err := ValidateSafeID(wsID); err != nil {
+			return fmt.Errorf("invalid workspace id: %w", err)
+		}
+	}
+	if err := ValidateSafeID(sessionID); err != nil {
+		return fmt.Errorf("invalid session id: %w", err)
+	}
+
+	return WithFlock(s.gcLockPath(), true, func() error {
+		err := WithFlock(s.ledgerLockPath(sessionID), true, func() error {
+			if rmErr := os.Remove(s.ledgerPath(sessionID)); rmErr != nil && !errors.Is(rmErr, os.ErrNotExist) {
+				return fmt.Errorf("remove snapshot ledger %s: %w", sessionID, rmErr)
+			}
+			return nil
+		})
+		if err != nil {
+			return err
+		}
+		return s.gcUnreferencedBlobsUnlocked()
+	})
+}
+
+func (s *SnapshotStore) gcUnreferencedBlobsUnlocked() error {
+	referenced := make(map[string]struct{})
+	ledgersDir := s.ledgersRoot()
+	entries, err := os.ReadDir(ledgersDir)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		return fmt.Errorf("readdir snapshot ledgers %s: %w", ledgersDir, err)
+	}
+
+	for _, ent := range entries {
+		if ent.IsDir() || !strings.HasSuffix(ent.Name(), ".jsonl") {
+			continue
+		}
+		recs, rErr := readSnapshotLedger(filepath.Join(ledgersDir, ent.Name()))
+		if rErr != nil {
+			// Fail-safe: if any concurrent ledger cannot be parsed, abort blob GC rather than deleting live blobs.
+			if errors.Is(rErr, os.ErrNotExist) {
+				continue
+			}
+			return nil
+		}
+		for _, rec := range recs {
+			if bh := strings.ToLower(strings.TrimSpace(rec.BeforeHash)); isValidSHA256Hex(bh) {
+				referenced[bh] = struct{}{}
+			}
+			if ah := strings.ToLower(strings.TrimSpace(rec.AfterHash)); isValidSHA256Hex(ah) {
+				referenced[ah] = struct{}{}
+			}
+		}
+	}
+
+	blobsDir := s.blobsRoot()
+	shards, err := os.ReadDir(blobsDir)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		return nil
+	}
+	for _, shard := range shards {
+		if !shard.IsDir() {
+			continue
+		}
+		shardPath := filepath.Join(blobsDir, shard.Name())
+		blobEntries, bErr := os.ReadDir(shardPath)
+		if bErr != nil {
+			continue
+		}
+		remaining := 0
+		for _, be := range blobEntries {
+			if be.IsDir() {
+				remaining++
+				continue
+			}
+			digest := strings.ToLower(be.Name())
+			if !isValidSHA256Hex(digest) {
+				remaining++
+				continue
+			}
+			if _, live := referenced[digest]; live {
+				remaining++
+				continue
+			}
+			_ = os.Remove(filepath.Join(shardPath, be.Name()))
+		}
+		if remaining == 0 {
+			_ = os.Remove(shardPath)
+		}
+	}
+	return nil
 }
 
 func (s *SnapshotStore) PutBlob(data []byte) (sha256Hex string, err error) {
@@ -162,8 +302,10 @@ func (s *SnapshotStore) RecordStepChange(rec FileSnapshotRecord) error {
 		return fmt.Errorf("unknown snapshot change kind %q", rec.Kind)
 	}
 
-	return WithFlock(s.ledgerLockPath(rec.SessionID), true, func() error {
-		return appendJSONLine(s.ledgerPath(rec.SessionID), rec)
+	return WithFlock(s.gcLockPath(), false, func() error {
+		return WithFlock(s.ledgerLockPath(rec.SessionID), true, func() error {
+			return appendJSONLine(s.ledgerPath(rec.SessionID), rec)
+		})
 	})
 }
 

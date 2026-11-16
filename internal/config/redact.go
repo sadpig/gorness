@@ -86,3 +86,68 @@ func isBidiControl(r rune) bool {
 		return false
 	}
 }
+
+// IsSecretHeaderOrEnvKey reports whether a header or environment variable name carries sensitive credentials.
+func IsSecretHeaderOrEnvKey(key string) bool {
+	lower := strings.ToLower(strings.TrimSpace(key))
+	if lower == "" {
+		return false
+	}
+	switch lower {
+	case "authorization", "proxy-authorization", "cookie", "set-cookie", "x-api-key", "api-key", "apikey":
+		return true
+	}
+	for _, marker := range []string{
+		"secret",
+		"token",
+		"password",
+		"passwd",
+		"credential",
+		"private_key",
+		"private-key",
+		"api_key",
+		"api-key",
+		"apikey",
+		"access_key",
+		"access-key",
+		"session_key",
+		"session-key",
+		"bearer",
+		"auth",
+	} {
+		if strings.Contains(lower, marker) {
+			return true
+		}
+	}
+	return false
+}
+
+// SanitizeSecretMap returns a shallow copy of in where secret header/env values are replaced with "[REDACTED]"
+// (preserving non-sensitive env:/keychain: symbolic references) and any inline token patterns are scrubbed.
+func SanitizeSecretMap(in map[string]string) map[string]string {
+	if in == nil {
+		return nil
+	}
+	out := make(map[string]string, len(in))
+	for k, v := range in {
+		trimmed := strings.TrimSpace(v)
+		if trimmed == "" {
+			out[k] = v
+			continue
+		}
+		if IsSecretHeaderOrEnvKey(k) {
+			if strings.HasPrefix(trimmed, "env:") || strings.HasPrefix(trimmed, "keychain:") {
+				out[k] = trimmed
+			} else {
+				out[k] = "[REDACTED]"
+			}
+			continue
+		}
+		if strings.HasPrefix(trimmed, "cmd:") {
+			out[k] = "cmd:[REDACTED]"
+			continue
+		}
+		out[k] = Redact(v, nil)
+	}
+	return out
+}

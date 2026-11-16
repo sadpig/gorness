@@ -13,6 +13,8 @@ import (
 	"sync"
 	"syscall"
 	"time"
+
+	"gorness.dev/gorness/internal/config"
 )
 
 type SandboxMode string
@@ -156,7 +158,7 @@ func (s *SeatbeltRunner) BuildProfile(wsRoot string, extraWriteDirs []string, mo
 	if commonGitDir != "" {
 		fmt.Fprintf(&b, "  (subpath %q)\n", escapeSBPL(commonGitDir))
 	}
-	if worktreeGitDir != "" && (commonGitDir == "" || !isWithinOrEqualPath(worktreeGitDir, commonGitDir)) {
+	if worktreeGitDir != "" && (commonGitDir == "" || !config.IsWithinRoot(worktreeGitDir, commonGitDir)) {
 		fmt.Fprintf(&b, "  (subpath %q)\n", escapeSBPL(worktreeGitDir))
 	}
 	b.WriteString(")\n")
@@ -169,13 +171,13 @@ func (s *SeatbeltRunner) BuildProfile(wsRoot string, extraWriteDirs []string, mo
 		fmt.Fprintf(&b, "  (subpath %q)\n", escapeSBPL(filepath.Join(canonHome, "Library", "Keychains")))
 		fmt.Fprintf(&b, "  (subpath %q)\n", escapeSBPL(filepath.Join(canonHome, ".gorness")))
 		b.WriteString(")\n")
-		if canonVault == "" && canonWs != "" && isStrictlyWithinPath(canonWs, filepath.Join(canonHome, ".gorness", "runtime", "worktrees")) {
+		if canonVault == "" && canonWs != "" && config.IsStrictlyWithinRoot(canonWs, filepath.Join(canonHome, ".gorness", "runtime", "worktrees")) {
 			fmt.Fprintf(&b, "(allow file-read* (subpath %q))\n", escapeSBPL(canonWs))
 		}
 	}
 	if canonVault != "" {
 		fmt.Fprintf(&b, "(deny file-read* (subpath %q))\n", escapeSBPL(canonVault))
-		if canonWs != "" && isStrictlyWithinPath(canonWs, filepath.Join(canonVault, "runtime", "worktrees")) {
+		if canonWs != "" && config.IsStrictlyWithinRoot(canonWs, filepath.Join(canonVault, "runtime", "worktrees")) {
 			fmt.Fprintf(&b, "(allow file-read* (subpath %q))\n", escapeSBPL(canonWs))
 		}
 	}
@@ -228,20 +230,23 @@ func (s *SeatbeltRunner) BuildProfile(wsRoot string, extraWriteDirs []string, mo
 		fmt.Fprintf(&b, "  (subpath %q)\n", escapeSBPL(filepath.Join(canonHome, ".gorness")))
 		b.WriteString(")\n")
 		if canonVault == "" && mode != SandboxReadOnly && canonWs != "" &&
-			isStrictlyWithinPath(canonWs, filepath.Join(canonHome, ".gorness", "runtime", "worktrees")) {
+			config.IsStrictlyWithinRoot(canonWs, filepath.Join(canonHome, ".gorness", "runtime", "worktrees")) {
 			fmt.Fprintf(&b, "(allow file-write* (subpath %q))\n", escapeSBPL(canonWs))
 		}
 	}
 	if canonVault != "" {
 		fmt.Fprintf(&b, "(deny file-write* (subpath %q))\n", escapeSBPL(canonVault))
 		if mode != SandboxReadOnly && canonWs != "" &&
-			isStrictlyWithinPath(canonWs, filepath.Join(canonVault, "runtime", "worktrees")) {
+			config.IsStrictlyWithinRoot(canonWs, filepath.Join(canonVault, "runtime", "worktrees")) {
 			fmt.Fprintf(&b, "(allow file-write* (subpath %q))\n", escapeSBPL(canonWs))
 		}
 	}
 	if canonWs != "" {
 		b.WriteString("(deny file-write*\n")
 		fmt.Fprintf(&b, "  (subpath %q)\n", escapeSBPL(filepath.Join(canonWs, ".gorness")))
+		fmt.Fprintf(&b, "  (subpath %q)\n", escapeSBPL(filepath.Join(canonWs, ".github", "workflows")))
+		fmt.Fprintf(&b, "  (subpath %q)\n", escapeSBPL(filepath.Join(canonWs, ".vscode")))
+		fmt.Fprintf(&b, "  (subpath %q)\n", escapeSBPL(filepath.Join(canonWs, ".idea")))
 		fmt.Fprintf(&b, "  (subpath %q)\n", escapeSBPL(filepath.Join(canonWs, ".git", "hooks")))
 		fmt.Fprintf(&b, "  (subpath %q)\n", escapeSBPL(filepath.Join(canonWs, ".git", "config")))
 		fmt.Fprintf(&b, "  (literal %q)\n", escapeSBPL(filepath.Join(canonWs, ".git", "config.lock")))
@@ -313,7 +318,7 @@ func resolveGitWorktreeDirs(canonWs, canonHome, canonVault string) (worktreeGitD
 	if cDir == "" || cDir == "/" {
 		return "", ""
 	}
-	if !isStrictlyWithinPath(wtDir, filepath.Join(cDir, "worktrees")) {
+	if !config.IsStrictlyWithinRoot(wtDir, filepath.Join(cDir, "worktrees")) {
 		return "", ""
 	}
 
@@ -327,12 +332,12 @@ func resolveGitWorktreeDirs(canonWs, canonHome, canonVault string) (worktreeGitD
 				filepath.Join(canonHome, "Library", "Keychains"),
 				filepath.Join(canonHome, ".gorness"),
 			} {
-				if isWithinOrEqualPath(target, sens) || isWithinOrEqualPath(sens, target) {
+				if config.IsWithinRoot(target, sens) || config.IsWithinRoot(sens, target) {
 					return true
 				}
 			}
 		}
-		if canonVault != "" && (isWithinOrEqualPath(target, canonVault) || isWithinOrEqualPath(canonVault, target)) {
+		if canonVault != "" && (config.IsWithinRoot(target, canonVault) || config.IsWithinRoot(canonVault, target)) {
 			return true
 		}
 		return false
@@ -633,14 +638,13 @@ func canonicalizeExistingOrClean(p string) string {
 	if trimmed == "" {
 		return ""
 	}
-	rawAbs, err := toUncleanedAbs("", trimmed)
-	if err != nil {
-		return filepath.Clean(trimmed)
-	}
-	if resolved, err := resolveCanonicalPath(rawAbs, 0); err == nil {
+	if resolved, err := config.CanonicalPath(trimmed); err == nil && resolved != "" {
 		return resolved
 	}
-	return filepath.Clean(rawAbs)
+	if abs, err := filepath.Abs(trimmed); err == nil {
+		return filepath.Clean(abs)
+	}
+	return filepath.Clean(trimmed)
 }
 
 func escapeSBPL(s string) string {

@@ -17,6 +17,8 @@ import (
 	"sort"
 	"strings"
 	"sync"
+
+	"gorness.dev/gorness/internal/config"
 )
 
 const (
@@ -71,7 +73,7 @@ func (r *Registry) handleSearchCode(ctx context.Context, call CallContext, rawIn
 		if budget <= 0 {
 			budget = defaultRepoMapTokens
 		}
-		rm, err := RepoMap(pg.WorkspaceRoot(), budget)
+		rm, err := RepoMapWithVault(pg.WorkspaceRoot(), pg.VaultRoot(), budget)
 		if err != nil {
 			return ToolResult{}, err
 		}
@@ -176,7 +178,7 @@ func collectSafeWorkspaceFiles(canonWs, canonVault, scopePath, include string) (
 		return []wsFileEntry{{absPath: scopePath, relSlash: relSlash}}, nil
 	}
 
-	wsInWorktree := canonVault != "" && isStrictlyWithinPath(canonWs, filepath.Join(canonVault, "runtime", "worktrees"))
+	wsInWorktree := canonVault != "" && config.IsStrictlyWithinRoot(canonWs, filepath.Join(canonVault, "runtime", "worktrees"))
 
 	var out []wsFileEntry
 	var walk func(dir string)
@@ -196,15 +198,14 @@ func collectSafeWorkspaceFiles(canonWs, canonVault, scopePath, include string) (
 				continue
 			}
 			if lst.Mode()&os.ModeSymlink != 0 {
-				resolved, eErr := filepath.EvalSymlinks(full)
+				resolved, eErr := config.CanonicalPath(full)
 				if eErr != nil {
 					continue
 				}
-				resolved = filepath.Clean(resolved)
-				if !isStrictlyWithinPath(resolved, canonWs) {
+				if !config.IsStrictlyWithinRoot(resolved, canonWs) {
 					continue
 				}
-				if canonVault != "" && isWithinOrEqualPath(resolved, canonVault) && !wsInWorktree {
+				if canonVault != "" && config.IsWithinRoot(resolved, canonVault) && !wsInWorktree {
 					continue
 				}
 				rst, sErr := os.Stat(resolved)
@@ -241,11 +242,7 @@ func collectSafeWorkspaceFiles(canonWs, canonVault, scopePath, include string) (
 }
 
 func shouldSkipSearchDirName(name string) bool {
-	switch name {
-	case ".git", "node_modules", "vendor", "dist", "target", "__pycache__", ".venv", ".next":
-		return true
-	}
-	return false
+	return config.IsIgnoredWalkDir(name)
 }
 
 func matchIncludePatterns(include, relSlash string) bool {
@@ -413,20 +410,32 @@ var (
 
 // RepoMap 并发扫描工作区 Go / TS / Python / Rust 顶层符号并按跨文件引用中心度在 maxTokens 预算内生成高信噪比仓库骨架图。
 func RepoMap(wsRoot string, maxTokens int) (string, error) {
+	return RepoMapWithVault(wsRoot, "", maxTokens)
+}
+
+// RepoMapWithVault 携带真实 vaultRoot 执行安全边界校验并生成仓库符号图。
+func RepoMapWithVault(wsRoot, vaultRoot string, maxTokens int) (string, error) {
 	if strings.TrimSpace(wsRoot) == "" {
 		return "", fmt.Errorf("%w: empty workspace root", ErrInvalidTargetPath)
 	}
-	canonWs, err := filepath.EvalSymlinks(wsRoot)
+	canonWs, err := config.CanonicalPath(wsRoot)
 	if err != nil {
-		return "", fmt.Errorf("canonicalize workspace %s: %w", wsRoot, err)
+		return "", fmt.Errorf("canonicalize workspace %s: %w", wsRoot, wrapOnlyErr(err))
 	}
-	canonWs = filepath.Clean(canonWs)
+	var canonVault string
+	if strings.TrimSpace(vaultRoot) != "" {
+		if cv, vErr := config.CanonicalPath(vaultRoot); vErr == nil {
+			canonVault = cv
+		} else {
+			canonVault = filepath.Clean(vaultRoot)
+		}
+	}
 	if maxTokens <= 0 {
 		maxTokens = defaultRepoMapTokens
 	}
 	maxChars := maxTokens * 4
 
-	files, err := collectSafeWorkspaceFiles(canonWs, "", canonWs, "")
+	files, err := collectSafeWorkspaceFiles(canonWs, canonVault, canonWs, "")
 	if err != nil {
 		return "", err
 	}

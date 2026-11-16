@@ -8,23 +8,47 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 )
 
 type fakeKeychainStore struct {
+	mu    sync.Mutex
 	items map[string]string
 	calls int32
 }
 
 func (f *fakeKeychainStore) GetSecret(_ context.Context, service string) (string, error) {
 	atomic.AddInt32(&f.calls, 1)
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	v, ok := f.items[service]
 	if !ok {
 		return "", errors.New("item not found in fake keychain")
 	}
 	return v, nil
+}
+
+func (f *fakeKeychainStore) SetSecret(key, value string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.items == nil {
+		f.items = make(map[string]string)
+	}
+	f.items[key] = value
+	return nil
+}
+
+func (f *fakeKeychainStore) DeleteSecret(key string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if _, ok := f.items[key]; !ok {
+		return errors.New("item not found in fake keychain")
+	}
+	delete(f.items, key)
+	return nil
 }
 
 func TestBootstrapVaultCreatesDefaultFilesAndPermissions(t *testing.T) {
@@ -697,5 +721,262 @@ checkSkillDir:
 		}
 	case <-time.After(300 * time.Millisecond):
 		t.Fatal("timed out waiting for Watch notification on new skill directory SKILL.md")
+	}
+}
+
+func TestSlice1PathSecHooksValidationAndKeychain(t *testing.T) {
+	if Version != "1.0.0" {
+		t.Fatalf("expected Version == 1.0.0, got %q", Version)
+	}
+
+	homeDir := t.TempDir()
+	wsDir := filepath.Join(t.TempDir(), "repo")
+	vaultRoot := filepath.Join(homeDir, ".gorness")
+	if err := os.MkdirAll(filepath.Join(wsDir, ".gorness"), 0o755); err != nil {
+		t.Fatalf("mkdir ws .gorness: %v", err)
+	}
+
+	// 1. ExpandHome, CanonicalPath (non-existent leaf + symlink + loop), IsWithinRoot, IsProtectedAutoRunPath
+	if got := ExpandHome("~/projects/app", homeDir); got != filepath.ToSlash(homeDir)+"/projects/app" {
+		t.Fatalf("ExpandHome mismatch: %q", got)
+	}
+	realTargetDir := filepath.Join(wsDir, "real_pkg")
+	if err := os.MkdirAll(realTargetDir, 0o755); err != nil {
+		t.Fatalf("mkdir realTargetDir: %v", err)
+	}
+	linkDir := filepath.Join(wsDir, "linked_pkg")
+	if err := os.Symlink(realTargetDir, linkDir); err != nil {
+		t.Fatalf("symlink linkDir: %v", err)
+	}
+	canonLeaf, err := CanonicalPath(filepath.Join(linkDir, "future", "new_file.go"))
+	if err != nil {
+		t.Fatalf("CanonicalPath non-existent leaf: %v", err)
+	}
+	canonRealDir, _ := CanonicalPath(realTargetDir)
+	if !IsStrictlyWithinRoot(canonLeaf, canonRealDir) {
+		t.Fatalf("expected %q strictly within %q", canonLeaf, canonRealDir)
+	}
+	loopA := filepath.Join(wsDir, "loop_a")
+	loopB := filepath.Join(wsDir, "loop_b")
+	_ = os.Symlink(loopB, loopA)
+	_ = os.Symlink(loopA, loopB)
+	if _, err := CanonicalPath(filepath.Join(loopA, "leaf.txt")); !errors.Is(err, ErrSymlinkDepthExceeded) {
+		t.Fatalf("expected ErrSymlinkDepthExceeded on symlink loop, got %v", err)
+	}
+	if !IsIgnoredWalkDir("node_modules") || !IsIgnoredWalkDir(".git") || IsIgnoredWalkDir("internal") {
+		t.Fatal("IsIgnoredWalkDir mismatch")
+	}
+
+	for _, relProtected := range []string{
+		".git/hooks/pre-commit",
+		".gorness/hooks.toml",
+		".vscode/tasks.json",
+		".idea/workspace.xml",
+		".env.production",
+		".github/workflows/release.yml",
+	} {
+		if _, ok := IsProtectedAutoRunPath(filepath.Join(wsDir, filepath.FromSlash(relProtected)), wsDir, homeDir); !ok {
+			t.Fatalf("expected IsProtectedAutoRunPath=true for %s", relProtected)
+		}
+	}
+	if _, ok := IsProtectedAutoRunPath(filepath.Join(vaultRoot, "runtime", "worktrees", "wt-1", "main.go"), wsDir, homeDir); ok {
+		t.Fatal("expected worktree file inside runtime/worktrees/wt-1 NOT to be flagged as protected .gorness config")
+	}
+	if _, ok := IsProtectedAutoRunPath(filepath.Join(wsDir, "internal", "service.go"), wsDir, homeDir); ok {
+		t.Fatal("expected regular source file NOT to be protected")
+	}
+
+	// 2. ParseFrontmatterAs[T] & SanitizeSecretMap
+	type customDocMeta struct {
+		Slug string   `toml:"slug" yaml:"slug"`
+		Tags []string `toml:"tags" yaml:"tags"`
+	}
+	fmMeta, fmBody, err := ParseFrontmatterAs[customDocMeta]("+++\nslug = \"arch-note\"\ntags = [\"kernel\", \"sec\"]\n+++\nBody line.\n")
+	if err != nil || fmMeta.Slug != "arch-note" || len(fmMeta.Tags) != 2 || strings.TrimSpace(fmBody) != "Body line." {
+		t.Fatalf("ParseFrontmatterAs TOML failed: meta=%+v body=%q err=%v", fmMeta, fmBody, err)
+	}
+	sanitized := SanitizeSecretMap(map[string]string{
+		"Authorization":  "Bearer sk-super-secret-99999999",
+		"OPENAI_API_KEY": "sk-live-secret-88888888",
+		"RUST_LOG":       "info",
+		"KEY_REF":        "keychain:openai_prod",
+	})
+	if sanitized["Authorization"] != "[REDACTED]" || sanitized["OPENAI_API_KEY"] != "[REDACTED]" {
+		t.Fatalf("expected secret keys redacted, got %+v", sanitized)
+	}
+	if sanitized["RUST_LOG"] != "info" || sanitized["KEY_REF"] != "keychain:openai_prod" {
+		t.Fatalf("expected safe plain env & keychain ref preserved, got %+v", sanitized)
+	}
+
+	// 3. Global & Workspace hooks.toml + ComputeWorkspaceTrustHashes / VerifyWorkspaceTrust
+	mgr, err := NewManager(Options{VaultRoot: vaultRoot})
+	if err != nil {
+		t.Fatalf("NewManager: %v", err)
+	}
+	globalHooks := `
+[[pre_tool_use]]
+tool = "run_command"
+command = "echo global-pre"
+`
+	if err := os.WriteFile(mgr.Paths().HooksFile(), []byte(globalHooks), 0o600); err != nil {
+		t.Fatalf("write global hooks.toml: %v", err)
+	}
+	if _, err := mgr.Reload(); err != nil {
+		t.Fatalf("Reload global hooks: %v", err)
+	}
+	if len(mgr.Current().Hooks.PreToolUse) != 1 {
+		t.Fatalf("expected 1 global pre_tool_use hook, got %+v", mgr.Current().Hooks)
+	}
+
+	wsHooksPath := filepath.Join(wsDir, ".gorness", "hooks.toml")
+	wsHooks := `
+[[post_tool_use]]
+tool = "edit_file"
+command = "gofmt -s -w ."
+`
+	if err := os.WriteFile(wsHooksPath, []byte(wsHooks), 0o600); err != nil {
+		t.Fatalf("write ws hooks.toml: %v", err)
+	}
+
+	// Untrusted workspace hooks.toml MUST be skipped with warning and flagged by VerifyWorkspaceTrust
+	untrustedList, trustedOK := VerifyWorkspaceTrust(wsDir, nil)
+	if trustedOK || len(untrustedList) == 0 {
+		t.Fatalf("expected untrusted workspace hooks.toml flagged, got list=%v ok=%v", untrustedList, trustedOK)
+	}
+	untrustedSnap, warnings, err := mgr.ForWorkspace(wsDir, nil)
+	if err != nil {
+		t.Fatalf("ForWorkspace untrusted: %v", err)
+	}
+	if len(untrustedSnap.Hooks.PostToolUse) != 0 || len(warnings) == 0 {
+		t.Fatalf("expected untrusted workspace hooks skipped with warning, got hooks=%+v warnings=%v", untrustedSnap.Hooks, warnings)
+	}
+
+	// ComputeWorkspaceTrustHashes -> VerifyWorkspaceTrust passes & workspace hooks merge cleanly!
+	hashes, err := ComputeWorkspaceTrustHashes(wsDir)
+	if err != nil || len(hashes) == 0 {
+		t.Fatalf("ComputeWorkspaceTrustHashes failed: hashes=%v err=%v", hashes, err)
+	}
+	if bad, ok := VerifyWorkspaceTrust(wsDir, hashes); !ok {
+		t.Fatalf("expected trusted workspace to verify cleanly, got untrusted=%v", bad)
+	}
+	trustedSnap, warnings, err := mgr.ForWorkspace(wsDir, hashes)
+	if err != nil || len(warnings) != 0 {
+		t.Fatalf("ForWorkspace trusted failed: warnings=%v err=%v", warnings, err)
+	}
+	if len(trustedSnap.Hooks.PreToolUse) != 1 || len(trustedSnap.Hooks.PostToolUse) != 1 {
+		t.Fatalf("expected merged global + workspace hooks, got %+v", trustedSnap.Hooks)
+	}
+
+	// Tampering with hooks.toml invalidates VerifyWorkspaceTrust immediately
+	if err := os.WriteFile(wsHooksPath, []byte(wsHooks+"\n# tampered\n"), 0o600); err != nil {
+		t.Fatalf("tamper ws hooks: %v", err)
+	}
+	if bad, ok := VerifyWorkspaceTrust(wsDir, hashes); ok || len(bad) != 1 || bad[0] != ".gorness/hooks.toml" {
+		t.Fatalf("expected tampered .gorness/hooks.toml detected, got bad=%v ok=%v", bad, ok)
+	}
+
+	// 4. ValidateCandidate: UITheme/UILang valid overlay, .json rejection, cycle DAG rejection, bad model ref rejection
+	candSnap, err := mgr.ValidateCandidate(map[string][]byte{
+		"config.toml": []byte("host = \"127.0.0.1\"\nport = 3456\nui_theme = \"dark\"\nui_lang = \"en\"\ndefault_provider = \"anthropic\"\ndefault_model = \"claude-sonnet-5-5\"\n"),
+	})
+	if err != nil {
+		t.Fatalf("ValidateCandidate valid config.toml failed: %v", err)
+	}
+	if candSnap.Global.UITheme != "dark" || candSnap.Global.UILang != "en" {
+		t.Fatalf("expected UITheme=dark UILang=en in candidate snapshot, got %+v", candSnap.Global)
+	}
+	// Disk snapshot must remain untouched by ValidateCandidate!
+	if mgr.Current().Global.UITheme != "" {
+		t.Fatalf("ValidateCandidate mutated live manager state: %+v", mgr.Current().Global)
+	}
+
+	if _, err := mgr.ValidateCandidate(map[string][]byte{"illegal.json": []byte(`{}`)}); err == nil {
+		t.Fatal("expected ValidateCandidate to reject .json file inside vault")
+	}
+	cycleWF := `
+id = "cyclic-wf"
+topology = "dag"
+[[nodes]]
+id = "n1"
+role = "coder"
+[[nodes]]
+id = "n2"
+role = "verifier"
+[[edges]]
+from = "n1"
+to = "n2"
+[[edges]]
+from = "n2"
+to = "n1"
+`
+	if _, err := mgr.ValidateCandidate(map[string][]byte{"workflows/cyclic-wf.toml": []byte(cycleWF)}); err == nil {
+		t.Fatal("expected ValidateCandidate to reject cyclic workflow DAG")
+	}
+	badRefCfg := "host = \"127.0.0.1\"\nport = 3456\ndefault_provider = \"nonexistent_provider\"\ndefault_model = \"ghost\"\n"
+	if _, err := mgr.ValidateCandidate(map[string][]byte{"config.toml": []byte(badRefCfg)}); err == nil {
+		t.Fatal("expected ValidateCandidate to reject unknown default_provider")
+	}
+
+	// 5. MacOSKeychainStore SetSecret / GetSecret / DeleteSecret via injectable SecurityRunnerFunc
+	secVault := make(map[string]string)
+	kc := NewMacOSKeychainStore(func(_ context.Context, args ...string) ([]byte, error) {
+		if len(args) == 0 {
+			return nil, errors.New("missing subcommand")
+		}
+		switch args[0] {
+		case "add-generic-password":
+			// Expect: add-generic-password -U -s gorness -a <key> -w <value>
+			var acct, val string
+			for i := 1; i+1 < len(args); i++ {
+				if args[i] == "-a" {
+					acct = args[i+1]
+				}
+				if args[i] == "-w" {
+					val = args[i+1]
+				}
+			}
+			secVault[acct] = val
+			return nil, nil
+		case "find-generic-password":
+			var acct string
+			for i := 1; i+1 < len(args); i++ {
+				if args[i] == "-a" {
+					acct = args[i+1]
+				}
+			}
+			if v, ok := secVault[acct]; ok {
+				return []byte(v + "\n"), nil
+			}
+			return nil, errors.New("item not found")
+		case "delete-generic-password":
+			var acct string
+			for i := 1; i+1 < len(args); i++ {
+				if args[i] == "-a" {
+					acct = args[i+1]
+				}
+			}
+			if _, ok := secVault[acct]; !ok {
+				return nil, errors.New("could not be found in the keychain")
+			}
+			delete(secVault, acct)
+			return nil, nil
+		default:
+			return nil, errors.New("unexpected subcommand")
+		}
+	})
+
+	if err := kc.SetSecret("anthropic_prod", "sk-ant-kc-987654321"); err != nil {
+		t.Fatalf("MacOSKeychainStore.SetSecret: %v", err)
+	}
+	gotSecret, err := kc.GetSecret(context.Background(), "anthropic_prod")
+	if err != nil || gotSecret != "sk-ant-kc-987654321" {
+		t.Fatalf("MacOSKeychainStore.GetSecret: got=%q err=%v", gotSecret, err)
+	}
+	if err := kc.DeleteSecret("anthropic_prod"); err != nil {
+		t.Fatalf("MacOSKeychainStore.DeleteSecret: %v", err)
+	}
+	// Idempotent delete when item already missing
+	if err := kc.DeleteSecret("anthropic_prod"); err != nil {
+		t.Fatalf("MacOSKeychainStore.DeleteSecret idempotent check: %v", err)
 	}
 }
