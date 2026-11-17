@@ -243,18 +243,24 @@ func GenerateIconset(iconsetDir string) error {
 	return nil
 }
 
+const (
+	IconSupersample    = 4
+	squircleHalfExtent = 0.824
+)
+
 func renderMasterIcon(size int) *image.NRGBA {
 	img := image.NewNRGBA(image.Rect(0, 0, size, size))
-	const samples = 2
+	const samples = IconSupersample
 	invSamples := 1.0 / float64(samples*samples)
+	invSize := 2.0 / float64(size)
 
 	for y := 0; y < size; y++ {
 		for x := 0; x < size; x++ {
 			var rSum, gSum, bSum, aSum float64
 			for sy := 0; sy < samples; sy++ {
+				v := (float64(y)+(float64(sy)+0.5)/samples)*invSize - 1.0
 				for sx := 0; sx < samples; sx++ {
-					u := ((float64(x)+((float64(sx)+0.5)/samples))/float64(size))*2.0 - 1.0
-					v := ((float64(y)+((float64(sy)+0.5)/samples))/float64(size))*2.0 - 1.0
+					u := (float64(x)+(float64(sx)+0.5)/samples)*invSize - 1.0
 					cr, cg, cb, ca := sampleIconPixel(u, v)
 					rSum += cr
 					gSum += cg
@@ -273,49 +279,199 @@ func renderMasterIcon(size int) *image.NRGBA {
 	return img
 }
 
+type agentNode struct {
+	u, v   float64
+	radius float64
+	r, g, b float64
+}
+
+var orbitAgentNodes = [3]agentNode{
+	// Cyan agent micro-core (upper-right on primary -30° orbit)
+	{u: 0.48, v: -0.27, radius: 0.066, r: 0.133, g: 0.827, b: 0.933},
+	// Amber agent micro-core (lower-left on primary -30° orbit)
+	{u: -0.42, v: 0.34, radius: 0.062, r: 0.961, g: 0.620, b: 0.043},
+	// Violet agent micro-core (upper-left on secondary +30° orbit)
+	{u: -0.34, v: -0.31, radius: 0.060, r: 0.659, g: 0.333, b: 0.969},
+}
+
 func sampleIconPixel(u, v float64) (r, g, b, a float64) {
-	const halfExtent = 0.825
-	ax := math.Abs(u) / halfExtent
-	ay := math.Abs(v) / halfExtent
-	squircle := math.Pow(ax, 4.6) + math.Pow(ay, 4.6)
+	ax := math.Abs(u) / squircleHalfExtent
+	ay := math.Abs(v) / squircleHalfExtent
+	// Apple continuous curvature superellipse (n = 5.0)
+	ax2 := ax * ax
+	ay2 := ay * ay
+	squircle := ax2*ax2*ax + ay2*ay2*ay
 	if squircle > 1.0 {
 		return 0, 0, 0, 0
 	}
 
-	t := (v + halfExtent) / (2 * halfExtent)
-	r = 0.085 - 0.035*t
-	g = 0.090 - 0.035*t
-	b = 0.115 - 0.035*t
-
-	if squircle > 0.945 {
-		rim := (squircle - 0.945) / 0.055
-		shine := 0.20 * (1.0 - 0.65*t) * rim
-		r += shine
-		g += shine
-		b += shine * 1.15
+	// 1. Cosmic Deep Indigo base gradient (135° top-left to bottom-right: #1e1b4b -> #0f172a -> #0a0a14)
+	t := clamp01(((0.78*v + 0.22*u) + squircleHalfExtent) / (2.0 * squircleHalfExtent))
+	vNorm := clamp01((v + squircleHalfExtent) / (2.0 * squircleHalfExtent))
+	if t < 0.5 {
+		k := t * 2.0
+		r = lerp(0.1176, 0.0588, k)
+		g = lerp(0.1059, 0.0902, k)
+		b = lerp(0.2941, 0.1647, k)
+	} else {
+		k := (t - 0.5) * 2.0
+		r = lerp(0.0588, 0.0392, k)
+		g = lerp(0.0902, 0.0392, k)
+		b = lerp(0.1647, 0.0784, k)
 	}
 
-	dist := math.Hypot(u, v)
+	// Soft upper-center radial sky highlight
+	hlDx := u + 0.08
+	hlDy := v + 0.40
+	hlDist2 := hlDx*hlDx + hlDy*hlDy
+	if hlDist2 < 0.52 {
+		falloff := 1.0 - hlDist2/0.52
+		falloff *= falloff
+		r += 0.075 * falloff
+		g += 0.105 * falloff
+		b += 0.210 * falloff
+	}
+
+	// Subtle central nebula glow behind the emblem
+	dist2 := u*u + v*v
+	if dist2 < 0.36 {
+		neb := 1.0 - dist2/0.36
+		neb *= neb
+		r += 0.035 * neb
+		g += 0.085 * neb
+		b += 0.165 * neb
+	}
+
+	// 2. Dual 30°-tilted glowing agent orbits
+	const (
+		cos30 = 0.8660254037844386
+		sin30 = 0.5
+	)
+	// Primary orbit tilted at -30° (major axis bottom-left to top-right)
+	ox1 := u*cos30 - v*sin30
+	oy1 := u*sin30 + v*cos30
+	e1 := math.Sqrt((ox1/0.55)*(ox1/0.55) + (oy1/0.24)*(oy1/0.24))
+	dOrbit1 := math.Abs(e1 - 1.0)
+	if dOrbit1 < 0.095 {
+		glow := math.Pow(1.0-dOrbit1/0.095, 2.2)
+		coreLine := 0.0
+		if dOrbit1 < 0.018 {
+			coreLine = 1.0 - dOrbit1/0.018
+		}
+		w := clamp01(0.42*glow + 0.55*coreLine)
+		r = lerp(r, 0.38, w)
+		g = lerp(g, 0.78, w)
+		b = lerp(b, 0.98, w)
+	}
+
+	// Secondary orbit tilted at +30° (major axis top-left to bottom-right)
+	ox2 := u*cos30 + v*sin30
+	oy2 := -u*sin30 + v*cos30
+	e2 := math.Sqrt((ox2/0.52)*(ox2/0.52) + (oy2/0.22)*(oy2/0.22))
+	dOrbit2 := math.Abs(e2 - 1.0)
+	if dOrbit2 < 0.085 {
+		glow := math.Pow(1.0-dOrbit2/0.085, 2.2)
+		coreLine := 0.0
+		if dOrbit2 < 0.016 {
+			coreLine = 1.0 - dOrbit2/0.016
+		}
+		w := clamp01(0.34*glow + 0.46*coreLine)
+		r = lerp(r, 0.62, w)
+		g = lerp(g, 0.55, w)
+		b = lerp(b, 0.98, w)
+	}
+
+	// 3. Central 3D crystal "G" emblem & luminous core
+	dist := math.Sqrt(dist2)
 	angle := math.Atan2(v, u)
 
-	inRing := dist >= 0.31 && dist <= 0.46
-	inGap := angle > -0.64 && angle < -0.04
-	inBar := u >= 0.02 && u <= 0.46 && v >= -0.068 && v <= 0.072
+	inRing := dist >= 0.245 && dist <= 0.375
+	inGap := angle > -0.60 && angle < -0.05
+	inBar := u >= 0.02 && u <= 0.375 && v >= -0.058 && v <= 0.062
 
 	if (inRing && !inGap) || inBar {
-		r, g, b = 0.96, 0.97, 0.99
+		// 3D faceted crystal shading with top-left specular bevel
+		facet := clamp01(0.5 - 0.65*u - 0.75*v)
+		cr := lerp(0.68, 0.97, facet)
+		cg := lerp(0.86, 0.99, facet)
+		cb := lerp(0.99, 1.00, facet)
+
+		// Inner crystal ridge highlight
+		ringMid := math.Abs(dist-0.310) / 0.065
+		if inRing && !inGap && ringMid < 0.35 {
+			ridge := (1.0 - ringMid/0.35) * 0.18
+			cr = clamp01(cr + ridge)
+			cg = clamp01(cg + ridge)
+			cb = clamp01(cb + ridge)
+		}
+		r, g, b = cr, cg, cb
 	}
 
-	if dist <= 0.125 {
-		r, g, b = 0.16, 0.59, 1.00
+	// Luminous central crystal energy core
+	if dist <= 0.175 {
+		if dist > 0.132 {
+			halo := 1.0 - (dist-0.132)/0.043
+			halo *= halo
+			r = lerp(r, 0.18, 0.65*halo)
+			g = lerp(g, 0.68, 0.65*halo)
+			b = lerp(b, 1.00, 0.65*halo)
+		} else {
+			specDist := math.Sqrt((u+0.042)*(u+0.042) + (v+0.042)*(v+0.042))
+			spec := clamp01(1.0 - specDist/0.14)
+			r = lerp(0.12, 0.92, spec*spec)
+			g = lerp(0.56, 0.98, spec)
+			b = 1.00
+		}
 	}
 
-	nodeDist := math.Hypot(u-0.33, v+0.25)
-	if nodeDist <= 0.078 {
-		r, g, b = 0.19, 0.82, 0.35
+	// 4. Three heterogeneous agent micro-cores (Cyan, Amber, Violet)
+	for _, nd := range orbitAgentNodes {
+		dx := u - nd.u
+		dy := v - nd.v
+		ndDist := math.Sqrt(dx*dx + dy*dy)
+		haloRadius := nd.radius * 1.95
+		if ndDist <= haloRadius {
+			if ndDist > nd.radius {
+				h := 1.0 - (ndDist-nd.radius)/(haloRadius-nd.radius)
+				h *= h
+				r = lerp(r, nd.r, 0.55*h)
+				g = lerp(g, nd.g, 0.55*h)
+				b = lerp(b, nd.b, 0.55*h)
+			} else {
+				specDx := dx + nd.radius*0.30
+				specDy := dy + nd.radius*0.30
+				spec := clamp01(1.0 - math.Sqrt(specDx*specDx+specDy*specDy)/(nd.radius*1.15))
+				r = lerp(nd.r*0.85, 1.0, spec*spec*0.75)
+				g = lerp(nd.g*0.85, 1.0, spec*spec*0.75)
+				b = lerp(nd.b*0.85, 1.0, spec*spec*0.75)
+			}
+		}
+	}
+
+	// 5. Inner Glass Bevel: 1.5px bottom/inner ambient occlusion + 0.5px top crystal glass highlight rim
+	if squircle > 0.900 && squircle <= 0.985 {
+		aoBand := 1.0 - math.Abs(squircle-0.945)/0.045
+		if aoBand > 0 {
+			ao := 0.28 * (0.30 + 0.70*vNorm) * aoBand
+			r *= 1.0 - ao
+			g *= 1.0 - ao
+			b *= 1.0 - ao
+		}
+	}
+	if squircle > 0.962 {
+		rim := (squircle - 0.962) / 0.038
+		topFalloff := math.Pow(clamp01(1.0-vNorm*0.88), 1.5)
+		glass := 0.35 * rim * topFalloff
+		r = lerp(r, 1.0, glass)
+		g = lerp(g, 1.0, glass)
+		b = lerp(b, 1.0, glass)
 	}
 
 	return clamp01(r), clamp01(g), clamp01(b), 1.0
+}
+
+func lerp(a, b, t float64) float64 {
+	return a + (b-a)*t
 }
 
 func clamp01(x float64) float64 {
