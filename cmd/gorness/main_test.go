@@ -338,7 +338,7 @@ func TestCLIHeadlessJSONAndACPRoundTrip(t *testing.T) {
 		// Exercise Bubble Tea TUI Model lifecycle against live loopback daemon
 		m := tui.NewModel(dCtx, daemonURL, wsDir)
 		rendered := m.View()
-		if !strings.Contains(rendered, "Gorness TUI") {
+		if !strings.Contains(rendered, "Gorness 终端工作台") && !strings.Contains(rendered, "Gorness TUI") {
 			t.Fatalf("unexpected TUI View output:\n%s", rendered)
 		}
 
