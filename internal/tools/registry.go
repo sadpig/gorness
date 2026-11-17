@@ -135,6 +135,7 @@ type CallContext struct {
 	SessionID             string
 	Seq                   uint64
 	SandboxMode           SandboxMode
+	DefaultTimeoutSec     int
 	AllowedDomains        []string
 	ExtraWriteDirs        []string
 	AllowOutsideWorkspace bool
@@ -246,27 +247,29 @@ func (t *ReadHashTracker) Clear() {
 }
 
 type RegistryOptions struct {
-	WorkspaceID   string
-	WorkspaceRoot string
-	VaultPaths    config.VaultPaths
-	Snapshots     *store.SnapshotStore
-	Artifacts     *store.ArtifactStore
-	PathGuard     *PathGuard
-	Seatbelt      *SeatbeltRunner
-	Skills        *SkillCatalog
-	ReadHashes    *ReadHashTracker
+	WorkspaceID              string
+	WorkspaceRoot            string
+	VaultPaths               config.VaultPaths
+	Snapshots                *store.SnapshotStore
+	Artifacts                *store.ArtifactStore
+	PathGuard                *PathGuard
+	Seatbelt                 *SeatbeltRunner
+	Skills                   *SkillCatalog
+	ReadHashes               *ReadHashTracker
+	DefaultCommandTimeoutSec int
 }
 
 // Registry 聚合核心内置工具、动态 activate_skill、MCP 外部工具与超过 12 个工具时的自动 BM25 search_tools 延迟加载。
 type Registry struct {
-	wsID       string
-	wsRoot     string
-	vaultPaths config.VaultPaths
-	snapshots  *store.SnapshotStore
-	artifacts  *store.ArtifactStore
-	pathGuard  *PathGuard
-	seatbelt   *SeatbeltRunner
-	readHashes *ReadHashTracker
+	wsID              string
+	wsRoot            string
+	vaultPaths        config.VaultPaths
+	snapshots         *store.SnapshotStore
+	artifacts         *store.ArtifactStore
+	pathGuard         *PathGuard
+	seatbelt          *SeatbeltRunner
+	readHashes        *ReadHashTracker
+	defaultTimeoutSec int
 
 	mu     sync.RWMutex
 	tools  map[string]Tool
@@ -298,17 +301,23 @@ func NewRegistry(opts RegistryOptions) (*Registry, error) {
 		art, _ = store.NewArtifactStore(opts.VaultPaths)
 	}
 
+	defaultTimeout := opts.DefaultCommandTimeoutSec
+	if defaultTimeout <= 0 {
+		defaultTimeout = defaultCommandTimeoutSec
+	}
+
 	r := &Registry{
-		wsID:       opts.WorkspaceID,
-		wsRoot:     opts.WorkspaceRoot,
-		vaultPaths: opts.VaultPaths,
-		snapshots:  opts.Snapshots,
-		artifacts:  art,
-		pathGuard:  pg,
-		seatbelt:   sb,
-		readHashes: rh,
-		tools:      make(map[string]Tool),
-		skills:     opts.Skills,
+		wsID:              opts.WorkspaceID,
+		wsRoot:            opts.WorkspaceRoot,
+		vaultPaths:        opts.VaultPaths,
+		snapshots:         opts.Snapshots,
+		artifacts:         art,
+		pathGuard:         pg,
+		seatbelt:          sb,
+		readHashes:        rh,
+		defaultTimeoutSec: defaultTimeout,
+		tools:             make(map[string]Tool),
+		skills:            opts.Skills,
 	}
 
 	for _, coreTool := range []Tool{
@@ -574,7 +583,14 @@ func (r *Registry) handleRunCommand(ctx context.Context, call CallContext, rawIn
 		inWS = resolvedInWS
 	}
 
-	timeout := time.Duration(defaultCommandTimeoutSec) * time.Second
+	baseTimeoutSec := r.defaultTimeoutSec
+	if call.DefaultTimeoutSec > 0 {
+		baseTimeoutSec = call.DefaultTimeoutSec
+	}
+	if baseTimeoutSec <= 0 {
+		baseTimeoutSec = defaultCommandTimeoutSec
+	}
+	timeout := time.Duration(baseTimeoutSec) * time.Second
 	if in.TimeoutSec > 0 {
 		timeout = time.Duration(in.TimeoutSec) * time.Second
 	}
@@ -631,7 +647,18 @@ func (r *Registry) handleRunCommand(ctx context.Context, call CallContext, rawIn
 	}
 	out.WriteString("]\n")
 	if res.Combined != "" {
-		out.WriteString(config.Redact(res.Combined, call.Secrets))
+		combined := res.Combined
+		const maxPreRedactBytes = 64 * 1024
+		if len(combined) > maxPreRedactBytes {
+			head := truncateUTF8Prefix(combined, 40*1024)
+			tail := truncateUTF8Suffix(combined, 16*1024)
+			omitted := len(combined) - len(head) - len(tail)
+			if omitted < 0 {
+				omitted = 0
+			}
+			combined = fmt.Sprintf("%s\n... [pre-truncated %d bytes] ...\n%s", head, omitted, tail)
+		}
+		out.WriteString(config.Redact(combined, call.Secrets))
 	}
 	if res.GitChanges != "" {
 		if !strings.HasSuffix(out.String(), "\n") {
@@ -653,7 +680,10 @@ func (r *Registry) handleRunCommand(ctx context.Context, call CallContext, rawIn
 }
 
 func quickGitStatus(dir string) string {
-	if _, err := os.Stat(filepath.Join(dir, ".git")); err != nil {
+	if strings.TrimSpace(dir) == "" {
+		return ""
+	}
+	if st, err := os.Stat(dir); err != nil || !st.IsDir() {
 		return ""
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)

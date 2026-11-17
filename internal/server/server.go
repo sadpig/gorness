@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"math"
 	"net/http"
 	"os"
 	"os/exec"
@@ -162,6 +163,9 @@ func (s *Server) buildMux() http.Handler {
 	mux.HandleFunc("GET /api/config", s.handleGetConfig)
 	mux.HandleFunc("PUT /api/config/global", s.handleUpdateGlobalConfig)
 	mux.HandleFunc("POST /api/config/providers", s.handleUpsertProvider)
+	mux.HandleFunc("POST /api/config/providers/discover-models", s.handleDiscoverProviderModels)
+	mux.HandleFunc("POST /api/config/providers/fetch-models", s.handleFetchProviderModels)
+	mux.HandleFunc("GET /api/config/providers/{id}/models", s.handleFetchProviderModels)
 	mux.HandleFunc("DELETE /api/config/providers/{id}", s.handleDeleteProvider)
 	mux.HandleFunc("POST /api/config/agents", s.handleUpsertAgent)
 	mux.HandleFunc("DELETE /api/config/agents/{id}", s.handleDeleteAgent)
@@ -198,6 +202,8 @@ func (s *Server) buildMux() http.Handler {
 	mux.HandleFunc("GET /api/workspaces/{wsID}/grants", s.handleListWorkspaceGrants)
 	mux.HandleFunc("DELETE /api/workspaces/{wsID}/grants", s.handleDeleteWorkspaceGrants)
 	mux.HandleFunc("GET /api/workspaces/{wsID}/files", s.handleListWorkspaceFiles)
+	mux.HandleFunc("GET /api/workspaces/{wsID}/tree", s.handleWorkspaceTree)
+	mux.HandleFunc("GET /api/workspaces/{wsID}/git", s.handleWorkspaceGit)
 	mux.HandleFunc("GET /api/workspaces/{wsID}/file", s.handleReadWorkspaceFile)
 	mux.HandleFunc("GET /api/workspaces/{wsID}/skills", s.handleListWorkspaceSkills)
 	mux.HandleFunc("GET /api/workspaces/{wsID}/artifacts", s.handleListWorkspaceArtifacts)
@@ -443,6 +449,104 @@ func (s *Server) handleGetConfig(w http.ResponseWriter, _ *http.Request) {
 	})
 }
 
+func parsePatchInt(patch map[string]any, key string) (int, bool) {
+	raw, exists := patch[key]
+	if !exists || raw == nil {
+		return 0, false
+	}
+	switch v := raw.(type) {
+	case float64:
+		return int(math.Round(v)), true
+	case int:
+		return v, true
+	case int64:
+		return int(v), true
+	case json.Number:
+		if i, err := v.Int64(); err == nil {
+			return int(i), true
+		}
+		if f, err := v.Float64(); err == nil {
+			return int(math.Round(f)), true
+		}
+	case string:
+		trimmed := strings.TrimSpace(v)
+		if i, err := strconv.Atoi(trimmed); err == nil {
+			return i, true
+		}
+		if f, err := strconv.ParseFloat(trimmed, 64); err == nil {
+			return int(math.Round(f)), true
+		}
+	}
+	return 0, false
+}
+
+func parsePatchFloat(patch map[string]any, key string) (float64, bool) {
+	raw, exists := patch[key]
+	if !exists || raw == nil {
+		return 0, false
+	}
+	switch v := raw.(type) {
+	case float64:
+		return v, true
+	case int:
+		return float64(v), true
+	case int64:
+		return float64(v), true
+	case json.Number:
+		if f, err := v.Float64(); err == nil {
+			return f, true
+		}
+	case string:
+		if f, err := strconv.ParseFloat(strings.TrimSpace(v), 64); err == nil {
+			return f, true
+		}
+	}
+	return 0, false
+}
+
+func parsePatchBool(patch map[string]any, key string) (bool, bool) {
+	raw, exists := patch[key]
+	if !exists || raw == nil {
+		return false, false
+	}
+	switch v := raw.(type) {
+	case bool:
+		return v, true
+	case float64:
+		return v != 0, true
+	case int:
+		return v != 0, true
+	case string:
+		switch strings.ToLower(strings.TrimSpace(v)) {
+		case "true", "1", "yes", "on":
+			return true, true
+		case "false", "0", "no", "off":
+			return false, true
+		}
+	}
+	return false, false
+}
+
+func clampIntVal(v, minV, maxV int) int {
+	if v < minV {
+		return minV
+	}
+	if v > maxV {
+		return maxV
+	}
+	return v
+}
+
+func clampFloatVal(v, minV, maxV float64) float64 {
+	if v < minV {
+		return minV
+	}
+	if v > maxV {
+		return maxV
+	}
+	return v
+}
+
 func (s *Server) handleUpdateGlobalConfig(w http.ResponseWriter, r *http.Request) {
 	if s.cfg == nil {
 		writeJSONError(w, http.StatusServiceUnavailable, "config manager unavailable")
@@ -485,21 +589,107 @@ func (s *Server) handleUpdateGlobalConfig(w http.ResponseWriter, r *http.Request
 	}
 	if v, ok := patch["permission_mode"].(string); ok && strings.TrimSpace(v) != "" {
 		cur.PermissionMode = core.NormalizePermMode(v)
+	} else if v, ok := patch["default_perm_mode"].(string); ok && strings.TrimSpace(v) != "" {
+		cur.PermissionMode = core.NormalizePermMode(v)
 	}
 	if v, ok := patch["sandbox_mode"].(string); ok && strings.TrimSpace(v) != "" {
 		cur.SandboxMode = string(tools.NormalizeSandboxMode(v))
+	} else if v, ok := patch["default_sandbox_mode"].(string); ok && strings.TrimSpace(v) != "" {
+		cur.SandboxMode = string(tools.NormalizeSandboxMode(v))
 	}
-	if v, ok := patch["max_concurrency"].(float64); ok && int(v) > 0 {
-		cur.MaxConcurrency = int(v)
+	if v, ok := parsePatchInt(patch, "max_concurrency"); ok {
+		cur.MaxConcurrency = clampIntVal(v, 1, 32)
 	}
-	if v, ok := patch["max_tool_concurrency"].(float64); ok && int(v) > 0 {
-		cur.MaxToolConcurrency = int(v)
+	if v, ok := parsePatchInt(patch, "max_tool_concurrency"); ok {
+		cur.MaxToolConcurrency = clampIntVal(v, 1, 16)
 	}
-	if v, ok := patch["max_steps"].(float64); ok && int(v) > 0 {
-		cur.MaxSteps = int(v)
+	if v, ok := parsePatchInt(patch, "max_steps"); ok {
+		cur.MaxSteps = clampIntVal(v, 4, 256)
+	} else if v, ok := parsePatchInt(patch, "max_turns"); ok {
+		cur.MaxSteps = clampIntVal(v, 4, 256)
 	}
-	if v, ok := patch["inbox_debounce_ms"].(float64); ok && int(v) >= 0 {
-		cur.InboxDebounceMS = int(v)
+	if v, ok := parsePatchInt(patch, "subagent_max_steps"); ok {
+		cur.SubagentMaxSteps = clampIntVal(v, 2, 32)
+	}
+	if v, ok := parsePatchInt(patch, "auto_compact_threshold_percent"); ok {
+		if v <= 0 {
+			cur.AutoCompactThresholdPercent = 0
+			cur.AutoCompactRatio = 0
+		} else {
+			clamped := clampIntVal(v, 50, 95)
+			cur.AutoCompactThresholdPercent = clamped
+			cur.AutoCompactRatio = float64(clamped) / 100.0
+		}
+	} else if f, ok := parsePatchFloat(patch, "auto_compact_ratio"); ok {
+		if f <= 0 {
+			cur.AutoCompactThresholdPercent = 0
+			cur.AutoCompactRatio = 0
+		} else {
+			if f > 1.0 {
+				f = f / 100.0
+			}
+			clamped := clampFloatVal(f, 0.50, 0.95)
+			cur.AutoCompactRatio = clamped
+			cur.AutoCompactThresholdPercent = int(math.Round(clamped * 100))
+		}
+	}
+	if f, ok := parsePatchFloat(patch, "kept_recent_turns_ratio"); ok {
+		if f > 1.0 {
+			f = f / 100.0
+		}
+		cur.KeptRecentTurnsRatio = clampFloatVal(f, 0.10, 0.50)
+	}
+	if v, ok := parsePatchInt(patch, "command_timeout_seconds"); ok {
+		clamped := clampIntVal(v, 10, 1800)
+		cur.CommandTimeoutSeconds = clamped
+		cur.CommandTimeoutSec = clamped
+	} else if v, ok := parsePatchInt(patch, "command_timeout_sec"); ok {
+		clamped := clampIntVal(v, 10, 1800)
+		cur.CommandTimeoutSeconds = clamped
+		cur.CommandTimeoutSec = clamped
+	}
+	if b, ok := parsePatchBool(patch, "auto_generate_title"); ok {
+		cur.AutoGenerateTitle = b
+	}
+	if b, ok := parsePatchBool(patch, "auto_dream"); ok {
+		cur.AutoDream = b
+	}
+	if v, ok := parsePatchInt(patch, "dreamer_idle_minutes"); ok {
+		if v <= 0 {
+			cur.DreamerIdleMinutes = 0
+			cur.DreamIdleMinutes = 0
+		} else {
+			clamped := clampIntVal(v, 1, 240)
+			cur.DreamerIdleMinutes = clamped
+			cur.DreamIdleMinutes = clamped
+		}
+	} else if v, ok := parsePatchInt(patch, "dream_idle_minutes"); ok {
+		if v <= 0 {
+			cur.DreamerIdleMinutes = 0
+			cur.DreamIdleMinutes = 0
+		} else {
+			clamped := clampIntVal(v, 1, 240)
+			cur.DreamerIdleMinutes = clamped
+			cur.DreamIdleMinutes = clamped
+		}
+	}
+	if v, ok := parsePatchInt(patch, "witness_timeout_seconds"); ok {
+		clamped := clampIntVal(v, 30, 1800)
+		cur.WitnessTimeoutSeconds = clamped
+		cur.WitnessStallSec = clamped
+	} else if v, ok := parsePatchInt(patch, "witness_stall_sec"); ok {
+		clamped := clampIntVal(v, 30, 1800)
+		cur.WitnessTimeoutSeconds = clamped
+		cur.WitnessStallSec = clamped
+	}
+	if v, ok := parsePatchInt(patch, "llm_max_retries"); ok {
+		cur.LLMMaxRetries = clampIntVal(v, 0, 5)
+	}
+	if v, ok := parsePatchInt(patch, "llm_timeout_sec"); ok {
+		cur.LLMTimeoutSec = clampIntVal(v, 15, 600)
+	}
+	if v, ok := parsePatchInt(patch, "inbox_debounce_ms"); ok {
+		cur.InboxDebounceMS = clampIntVal(v, 50, 10000)
 	}
 	if !isLoopbackHostname(cur.Host) {
 		cur.Host = "127.0.0.1"
@@ -1609,70 +1799,15 @@ func (s *Server) handleUpdateWorkspace(w http.ResponseWriter, r *http.Request) {
 }
 
 type workspaceFileEntry struct {
+	Path    string `json:"path"`
 	RelPath string `json:"rel_path"`
+	Name    string `json:"name"`
 	IsDir   bool   `json:"is_dir"`
 	Size    int64  `json:"size,omitempty"`
 }
 
 func (s *Server) handleListWorkspaceFiles(w http.ResponseWriter, r *http.Request) {
-	wsID := r.PathValue("wsID")
-	ws, err := s.engine.Workspaces().Get(wsID)
-	if err != nil {
-		writeJSONError(w, http.StatusNotFound, err.Error())
-		return
-	}
-	var vaultRoot string
-	if s.cfg != nil {
-		vaultRoot = s.cfg.Paths().Root
-	}
-	pg, err := tools.NewPathGuard(ws.RootPath, vaultRoot)
-	if err != nil {
-		writeJSONError(w, http.StatusBadRequest, err.Error())
-		return
-	}
-
-	const maxFiles = 400
-	var files []workspaceFileEntry
-	root := pg.WorkspaceRoot()
-	_ = filepath.WalkDir(root, func(path string, d os.DirEntry, wErr error) error {
-		if wErr != nil || path == root {
-			return nil
-		}
-		name := d.Name()
-		if d.IsDir() {
-			switch name {
-			case ".git", "node_modules", ".worktrees", "dist", "vendor", ".superpowers":
-				return filepath.SkipDir
-			}
-		}
-		if len(files) >= maxFiles {
-			return filepath.SkipAll
-		}
-		// Skip symlinks escaping workspace
-		_, rel, inWS, rErr := pg.ResolveInWorkspace(path)
-		if rErr != nil || !inWS || rel == "" || rel == "." {
-			if d.IsDir() {
-				return filepath.SkipDir
-			}
-			return nil
-		}
-		var sz int64
-		if !d.IsDir() {
-			if info, iErr := d.Info(); iErr == nil {
-				sz = info.Size()
-			}
-		}
-		files = append(files, workspaceFileEntry{
-			RelPath: rel,
-			IsDir:   d.IsDir(),
-			Size:    sz,
-		})
-		return nil
-	})
-	if files == nil {
-		files = []workspaceFileEntry{}
-	}
-	writeJSON(w, http.StatusOK, map[string]any{"files": files})
+	s.handleWorkspaceTree(w, r)
 }
 
 func (s *Server) handleReadWorkspaceFile(w http.ResponseWriter, r *http.Request) {
@@ -2342,6 +2477,16 @@ func (s *Server) handleStartRunStream(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	streamClosed := false
+	defer func() {
+		if !streamClosed && evCh != nil {
+			go func() {
+				for range evCh {
+				}
+			}()
+		}
+	}()
+
 	w.Header().Set("X-Gorness-Run-ID", runID)
 	flusher, ok := prepareSSEHeaders(w)
 	if !ok {
@@ -2360,6 +2505,7 @@ func (s *Server) handleStartRunStream(w http.ResponseWriter, r *http.Request) {
 			return
 		case ev, open := <-evCh:
 			if !open {
+				streamClosed = true
 				return
 			}
 			if err := writeSSEFrame(w, flusher, ev.Type, ev); err != nil {

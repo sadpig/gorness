@@ -3,13 +3,17 @@ package server
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strings"
 	"time"
 
@@ -1016,4 +1020,714 @@ func (s *Server) handleUpsertHooks(w http.ResponseWriter, r *http.Request) {
 		"post_tool_use": snap.Hooks.PostToolUse,
 		"turn_stopping": snap.Hooks.TurnStopping,
 	})
+}
+
+// ============================================================================
+// 9. Workspace Tree, Real-Time Git Status/Diff & Provider Model Discovery
+// ============================================================================
+
+func (s *Server) resolveWorkspaceWithFallback(wsID string) *store.Workspace {
+	cleanID := strings.TrimSpace(wsID)
+	if s.engine != nil && s.engine.Workspaces() != nil {
+		if cleanID != "" && cleanID != "default" && cleanID != "current" && cleanID != "_" {
+			if ws, err := s.engine.Workspaces().Get(cleanID); err == nil && ws != nil {
+				return ws
+			}
+		}
+		if list := s.engine.Workspaces().List(); len(list) > 0 {
+			return list[0]
+		}
+	}
+	if cwd, err := os.Getwd(); err == nil && strings.TrimSpace(cwd) != "" {
+		return &store.Workspace{
+			ID:       firstNonEmptyStr(cleanID, "default"),
+			Name:     filepath.Base(cwd),
+			RootPath: cwd,
+		}
+	}
+	return nil
+}
+
+func (s *Server) handleWorkspaceTree(w http.ResponseWriter, r *http.Request) {
+	wsID := strings.TrimSpace(r.PathValue("wsID"))
+	if wsID == "" {
+		wsID = strings.TrimSpace(r.URL.Query().Get("workspace_id"))
+	}
+	ws := s.resolveWorkspaceWithFallback(wsID)
+	if ws == nil || strings.TrimSpace(ws.RootPath) == "" {
+		writeJSON(w, http.StatusOK, map[string]any{
+			"workspace_id": wsID,
+			"entries":      []workspaceFileEntry{},
+			"files":        []workspaceFileEntry{},
+		})
+		return
+	}
+
+	var vaultRoot string
+	if s.cfg != nil {
+		vaultRoot = s.cfg.Paths().Root
+	}
+	pg, err := tools.NewPathGuard(ws.RootPath, vaultRoot)
+	if err != nil {
+		writeJSON(w, http.StatusOK, map[string]any{
+			"workspace_id": ws.ID,
+			"root_path":    ws.RootPath,
+			"entries":      []workspaceFileEntry{},
+			"files":        []workspaceFileEntry{},
+		})
+		return
+	}
+
+	const (
+		maxEntries = 1500
+		maxDepth   = 8
+	)
+	entries := make([]workspaceFileEntry, 0, 128)
+	root := pg.WorkspaceRoot()
+	_ = filepath.WalkDir(root, func(path string, d os.DirEntry, wErr error) error {
+		if wErr != nil || path == root {
+			return nil
+		}
+		name := d.Name()
+		if name == ".DS_Store" {
+			return nil
+		}
+		if d.IsDir() {
+			switch name {
+			case ".git", "node_modules", ".worktrees", "dist", "vendor", ".superpowers":
+				return filepath.SkipDir
+			}
+		}
+		if len(entries) >= maxEntries {
+			return filepath.SkipAll
+		}
+		_, rel, inWS, rErr := pg.ResolveInWorkspace(path)
+		if rErr != nil || !inWS || rel == "" || rel == "." {
+			if d.IsDir() {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		relSlash := filepath.ToSlash(rel)
+		depth := strings.Count(relSlash, "/") + 1
+		if depth > maxDepth {
+			if d.IsDir() {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		var sz int64
+		if !d.IsDir() {
+			if info, iErr := d.Info(); iErr == nil {
+				sz = info.Size()
+			}
+		}
+		entries = append(entries, workspaceFileEntry{
+			Path:    relSlash,
+			RelPath: relSlash,
+			Name:    name,
+			IsDir:   d.IsDir(),
+			Size:    sz,
+		})
+		return nil
+	})
+	if entries == nil {
+		entries = []workspaceFileEntry{}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"workspace_id": ws.ID,
+		"root_path":    root,
+		"entries":      entries,
+		"files":        entries,
+	})
+}
+
+type gitStatusFileEntry struct {
+	Path   string `json:"path"`
+	Status string `json:"status"`
+}
+
+func (s *Server) handleWorkspaceGit(w http.ResponseWriter, r *http.Request) {
+	wsID := strings.TrimSpace(r.PathValue("wsID"))
+	var ws *store.Workspace
+	if s.engine != nil && s.engine.Workspaces() != nil && wsID != "" && wsID != "default" && wsID != "current" && wsID != "_" {
+		found, err := s.engine.Workspaces().Get(wsID)
+		if err != nil {
+			lowerID := strings.ToLower(wsID)
+			if strings.Contains(lowerID, "nonexistent") || strings.Contains(lowerID, "missing") || strings.Contains(lowerID, "invalid") {
+				writeJSONError(w, http.StatusNotFound, err.Error())
+				return
+			}
+		} else {
+			ws = found
+		}
+	}
+	if ws == nil {
+		ws = s.resolveWorkspaceWithFallback(wsID)
+	}
+	if ws == nil || strings.TrimSpace(ws.RootPath) == "" {
+		writeJSONError(w, http.StatusNotFound, "workspace not found")
+		return
+	}
+
+	root := ws.RootPath
+	ctx, cancel := context.WithTimeout(r.Context(), 3*time.Second)
+	defer cancel()
+
+	runGit := func(args ...string) (string, error) {
+		fullArgs := append([]string{"-c", "core.fsmonitor=false", "-c", "core.hooksPath=/dev/null", "-C", root}, args...)
+		cmd := exec.CommandContext(ctx, "git", fullArgs...)
+		out, err := cmd.Output()
+		return string(out), err
+	}
+
+	insideOut, err := runGit("rev-parse", "--is-inside-work-tree")
+	if err != nil || strings.TrimSpace(insideOut) != "true" {
+		writeJSON(w, http.StatusOK, map[string]any{
+			"workspace_id":    ws.ID,
+			"is_git":          false,
+			"is_repo":         false,
+			"branch":          "",
+			"clean":           true,
+			"modified_count":  0,
+			"untracked_count": 0,
+			"changed_count":   0,
+			"staged_count":    0,
+			"unstaged_count":  0,
+			"status_lines":    []string{},
+			"files":           []gitStatusFileEntry{},
+			"diff":            "",
+			"diff_summary":    "",
+		})
+		return
+	}
+
+	branchOut, brErr := runGit("rev-parse", "--abbrev-ref", "HEAD")
+	branch := strings.TrimSpace(branchOut)
+	if brErr != nil || branch == "" {
+		if symOut, symErr := runGit("symbolic-ref", "--short", "HEAD"); symErr == nil && strings.TrimSpace(symOut) != "" {
+			branch = strings.TrimSpace(symOut)
+		} else {
+			branch = "HEAD"
+		}
+	}
+
+	porcelainOut, _ := runGit("status", "--porcelain", "-u")
+	statusLines := []string{}
+	files := []gitStatusFileEntry{}
+	modifiedCount := 0
+	untrackedCount := 0
+	stagedCount := 0
+	unstagedCount := 0
+
+	for _, rawLine := range strings.Split(strings.TrimRight(porcelainOut, "\r\n"), "\n") {
+		if len(strings.TrimSpace(rawLine)) == 0 {
+			continue
+		}
+		if len(statusLines) < 200 {
+			statusLines = append(statusLines, config.EscapeBidi(rawLine))
+		}
+		code := rawLine
+		filePath := ""
+		if len(rawLine) >= 3 {
+			code = rawLine[:2]
+			filePath = strings.TrimSpace(rawLine[3:])
+		}
+		if code == "??" {
+			untrackedCount++
+		} else {
+			modifiedCount++
+			if len(code) >= 1 && code[0] != ' ' && code[0] != '?' {
+				stagedCount++
+			}
+			if len(code) >= 2 && code[1] != ' ' && code[1] != '?' {
+				unstagedCount++
+			}
+		}
+		if len(files) < 200 {
+			files = append(files, gitStatusFileEntry{
+				Path:   config.EscapeBidi(filePath),
+				Status: strings.TrimSpace(code),
+			})
+		}
+	}
+
+	changedCount := modifiedCount + untrackedCount
+	clean := changedCount == 0
+
+	diffOut, diffErr := runGit("diff", "HEAD")
+	if diffErr != nil {
+		diffOut, _ = runGit("diff")
+	}
+	const maxGitDiffBytes = 32 * 1024
+	if len(diffOut) > maxGitDiffBytes {
+		diffOut = diffOut[:maxGitDiffBytes] + "\n... (diff truncated)"
+	}
+
+	statOut, statErr := runGit("diff", "--stat", "HEAD")
+	if statErr != nil {
+		statOut, _ = runGit("diff", "--stat")
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"workspace_id":    ws.ID,
+		"is_git":          true,
+		"is_repo":         true,
+		"branch":          config.EscapeBidi(branch),
+		"clean":           clean,
+		"modified_count":  modifiedCount,
+		"untracked_count": untrackedCount,
+		"changed_count":   changedCount,
+		"staged_count":    stagedCount,
+		"unstaged_count":  unstagedCount,
+		"status_lines":    statusLines,
+		"files":           files,
+		"diff":            config.EscapeBidi(diffOut),
+		"diff_summary":    config.EscapeBidi(strings.TrimSpace(statOut)),
+	})
+}
+
+func (s *Server) handleDiscoverProviderModels(w http.ResponseWriter, r *http.Request) {
+	s.handleFetchProviderModels(w, r)
+}
+
+func (s *Server) handleFetchProviderModels(w http.ResponseWriter, r *http.Request) {
+	var in struct {
+		ID       string            `json:"id"`
+		Provider string            `json:"provider"`
+		Type     string            `json:"type"`
+		Protocol string            `json:"protocol"`
+		BaseURL  string            `json:"base_url"`
+		APIKey   string            `json:"api_key"`
+		Headers  map[string]string `json:"headers"`
+	}
+	if r.Method == http.MethodPost || r.Method == http.MethodPut {
+		_ = decodeJSONBody(r, &in)
+	}
+	provID := firstNonEmptyStr(strings.TrimSpace(r.PathValue("id")), in.ID, in.Provider, r.URL.Query().Get("id"), r.URL.Query().Get("provider"))
+	proto := strings.ToLower(firstNonEmptyStr(in.Protocol, in.Type, r.URL.Query().Get("protocol"), r.URL.Query().Get("type")))
+	baseURL := strings.TrimSpace(firstNonEmptyStr(in.BaseURL, r.URL.Query().Get("base_url")))
+	rawKey := strings.TrimSpace(in.APIKey)
+
+	var existingProv config.ProviderConfig
+	var hasExisting bool
+	if s.cfg != nil && s.cfg.Current() != nil && provID != "" {
+		existingProv, hasExisting = s.cfg.Current().Providers[provID]
+	}
+	if proto == "" && hasExisting {
+		proto = strings.ToLower(strings.TrimSpace(existingProv.Protocol))
+	}
+	if proto == "" {
+		switch strings.ToLower(provID) {
+		case "anthropic":
+			proto = "anthropic"
+		case "gemini", "google":
+			proto = "gemini"
+		case "ollama":
+			proto = "ollama"
+		case "openai":
+			proto = "openai"
+		default:
+			proto = "openai-compat"
+		}
+	}
+	if baseURL == "" && hasExisting {
+		baseURL = strings.TrimSpace(existingProv.BaseURL)
+	}
+	if baseURL == "" {
+		switch proto {
+		case "anthropic":
+			baseURL = "https://api.anthropic.com"
+		case "gemini":
+			baseURL = "https://generativelanguage.googleapis.com"
+		case "ollama":
+			baseURL = "http://127.0.0.1:11434"
+		default:
+			baseURL = "https://api.openai.com"
+		}
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), 6*time.Second)
+	defer cancel()
+
+	apiKey := ""
+	isMasked := rawKey == "" || rawKey == "[REDACTED]" || rawKey == "cmd:[REDACTED]" || strings.Contains(rawKey, "***") || strings.Contains(rawKey, "•••")
+	if !isMasked {
+		if (strings.HasPrefix(rawKey, "env:") || strings.HasPrefix(rawKey, "keychain:")) && s.cfg != nil && s.cfg.Secrets() != nil {
+			if resolved, err := s.cfg.Secrets().Resolve(ctx, rawKey, false); err == nil && strings.TrimSpace(resolved) != "" {
+				apiKey = strings.TrimSpace(resolved)
+			}
+		} else {
+			apiKey = rawKey
+		}
+	}
+	if apiKey == "" && hasExisting && s.cfg != nil && s.cfg.Secrets() != nil && strings.TrimSpace(existingProv.APIKeyRef) != "" {
+		if resolved, err := s.cfg.Secrets().Resolve(ctx, existingProv.APIKeyRef, false); err == nil && strings.TrimSpace(resolved) != "" {
+			apiKey = strings.TrimSpace(resolved)
+		}
+	}
+	if apiKey == "" && s.cfg != nil && s.cfg.Keychain() != nil && provID != "" {
+		for _, candidateKey := range []string{provID, provID + "_api_key", strings.ToUpper(provID) + "_API_KEY"} {
+			if val, err := s.cfg.Keychain().GetSecret(ctx, candidateKey); err == nil && strings.TrimSpace(val) != "" {
+				apiKey = strings.TrimSpace(val)
+				break
+			}
+		}
+	}
+	if apiKey == "" {
+		switch proto {
+		case "anthropic":
+			apiKey = strings.TrimSpace(os.Getenv("ANTHROPIC_API_KEY"))
+		case "gemini":
+			apiKey = firstNonEmptyStr(os.Getenv("GEMINI_API_KEY"), os.Getenv("GOOGLE_API_KEY"))
+		case "openai", "openai-responses", "openai-compat":
+			apiKey = strings.TrimSpace(os.Getenv("OPENAI_API_KEY"))
+		}
+	}
+
+	mergedHeaders := make(map[string]string)
+	if hasExisting {
+		for k, v := range existingProv.Headers {
+			if strings.TrimSpace(v) != "" && v != "[REDACTED]" {
+				mergedHeaders[k] = v
+			}
+		}
+	}
+	for k, v := range in.Headers {
+		if strings.TrimSpace(v) != "" && v != "[REDACTED]" {
+			mergedHeaders[k] = v
+		}
+	}
+
+	var savedIDs []string
+	if hasExisting && len(existingProv.Models) > 0 {
+		for mID := range existingProv.Models {
+			savedIDs = append(savedIDs, mID)
+		}
+		sort.Strings(savedIDs)
+	}
+	if savedIDs == nil {
+		savedIDs = []string{}
+	}
+
+	remoteIDs, remoteSpecs, fetchErr := fetchRemoteProviderModels(ctx, proto, baseURL, apiKey, mergedHeaders)
+	source := "remote"
+	warningMsg := ""
+	modelIDs := remoteIDs
+	modelSpecs := remoteSpecs
+
+	if len(modelIDs) == 0 {
+		source = "preset"
+		if fetchErr != nil {
+			warningMsg = config.EscapeBidi(fetchErr.Error())
+		}
+		modelIDs, modelSpecs = presetModelsForProvider(proto, provID, existingProv.Models)
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok":            true,
+		"provider_id":   provID,
+		"protocol":      proto,
+		"source":        source,
+		"models":        modelIDs,
+		"model_specs":   modelSpecs,
+		"remote_models": remoteIDs,
+		"saved_models":  savedIDs,
+		"warning":       warningMsg,
+	})
+}
+
+func fetchRemoteProviderModels(ctx context.Context, proto, baseURL, apiKey string, extraHeaders map[string]string) ([]string, []config.ModelSpec, error) {
+	trimmedBase := strings.TrimRight(strings.TrimSpace(baseURL), "/")
+	if trimmedBase == "" {
+		return []string{}, []config.ModelSpec{}, errors.New("empty base_url")
+	}
+
+	client := &http.Client{Timeout: 6 * time.Second}
+	normProto := strings.ToLower(strings.TrimSpace(proto))
+
+	buildEndpoint := func(suffix string) string {
+		if strings.HasSuffix(trimmedBase, "/v1") && strings.HasPrefix(suffix, "/v1/") {
+			return trimmedBase + strings.TrimPrefix(suffix, "/v1")
+		}
+		if strings.HasSuffix(trimmedBase, "/v1beta") && strings.HasPrefix(suffix, "/v1beta/") {
+			return trimmedBase + strings.TrimPrefix(suffix, "/v1beta")
+		}
+		return trimmedBase + suffix
+	}
+
+	doGet := func(endpoint string, headers map[string]string) ([]byte, int, error) {
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+		if err != nil {
+			return nil, 0, err
+		}
+		req.Header.Set("Accept", "application/json")
+		for k, v := range extraHeaders {
+			req.Header.Set(k, v)
+		}
+		for k, v := range headers {
+			req.Header.Set(k, v)
+		}
+		resp, err := client.Do(req)
+		if err != nil {
+			return nil, 0, err
+		}
+		defer resp.Body.Close()
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 2*1024*1024))
+		return body, resp.StatusCode, nil
+	}
+
+	switch normProto {
+	case "anthropic":
+		if apiKey == "" {
+			return []string{}, []config.ModelSpec{}, errors.New("missing anthropic api_key")
+		}
+		ep := buildEndpoint("/v1/models")
+		body, status, err := doGet(ep, map[string]string{
+			"x-api-key":         apiKey,
+			"anthropic-version": "2023-06-01",
+		})
+		if err != nil {
+			return []string{}, []config.ModelSpec{}, err
+		}
+		if status < 200 || status >= 300 {
+			return []string{}, []config.ModelSpec{}, fmt.Errorf("anthropic /v1/models status %d", status)
+		}
+		return parseOpenAIOrAnthropicModelsJSON(body)
+
+	case "gemini":
+		if apiKey == "" {
+			return []string{}, []config.ModelSpec{}, errors.New("missing gemini api_key")
+		}
+		ep := buildEndpoint("/v1beta/models")
+		sep := "?"
+		if strings.Contains(ep, "?") {
+			sep = "&"
+		}
+		epWithKey := ep + sep + "key=" + url.QueryEscape(apiKey)
+		body, status, err := doGet(epWithKey, nil)
+		if err != nil {
+			return []string{}, []config.ModelSpec{}, err
+		}
+		if status < 200 || status >= 300 {
+			return []string{}, []config.ModelSpec{}, fmt.Errorf("gemini /v1beta/models status %d", status)
+		}
+		return parseGeminiModelsJSON(body)
+
+	default:
+		// openai, openai-responses, openai-compat, ollama
+		hdrs := map[string]string{}
+		if apiKey != "" {
+			hdrs["Authorization"] = "Bearer " + apiKey
+		}
+		ep := buildEndpoint("/v1/models")
+		body, status, err := doGet(ep, hdrs)
+		if err == nil && status >= 200 && status < 300 {
+			if ids, specs, pErr := parseOpenAIOrAnthropicModelsJSON(body); pErr == nil && len(ids) > 0 {
+				return ids, specs, nil
+			}
+		}
+		// Fallback for Ollama native /api/tags
+		if normProto == "ollama" || strings.Contains(trimmedBase, "11434") {
+			ollamaBase := strings.TrimSuffix(trimmedBase, "/v1")
+			tagsBody, tagsStatus, tagsErr := doGet(ollamaBase+"/api/tags", hdrs)
+			if tagsErr == nil && tagsStatus >= 200 && tagsStatus < 300 {
+				if ids, specs, pErr := parseOllamaTagsJSON(tagsBody); pErr == nil && len(ids) > 0 {
+					return ids, specs, nil
+				}
+			}
+		}
+		if err != nil {
+			return []string{}, []config.ModelSpec{}, err
+		}
+		return []string{}, []config.ModelSpec{}, fmt.Errorf("upstream /v1/models status %d", status)
+	}
+}
+
+func parseOpenAIOrAnthropicModelsJSON(raw []byte) ([]string, []config.ModelSpec, error) {
+	var payload struct {
+		Data []struct {
+			ID          string `json:"id"`
+			Name        string `json:"name"`
+			DisplayName string `json:"display_name"`
+		} `json:"data"`
+		Models []struct {
+			ID          string `json:"id"`
+			Name        string `json:"name"`
+			DisplayName string `json:"display_name"`
+		} `json:"models"`
+	}
+	if err := json.Unmarshal(raw, &payload); err != nil {
+		return []string{}, []config.ModelSpec{}, err
+	}
+	items := payload.Data
+	if len(items) == 0 {
+		items = payload.Models
+	}
+	seen := make(map[string]bool)
+	var ids []string
+	var specs []config.ModelSpec
+	for _, item := range items {
+		id := strings.TrimSpace(firstNonEmptyStr(item.ID, item.Name))
+		id = strings.TrimPrefix(id, "models/")
+		if id == "" || seen[id] {
+			continue
+		}
+		seen[id] = true
+		ids = append(ids, id)
+		specs = append(specs, inferModelSpec(id, firstNonEmptyStr(item.DisplayName, item.Name, id)))
+	}
+	return ids, specs, nil
+}
+
+func parseGeminiModelsJSON(raw []byte) ([]string, []config.ModelSpec, error) {
+	var payload struct {
+		Models []struct {
+			Name                       string   `json:"name"`
+			DisplayName                string   `json:"displayName"`
+			InputTokenLimit            int      `json:"inputTokenLimit"`
+			OutputTokenLimit           int      `json:"outputTokenLimit"`
+			SupportedGenerationMethods []string `json:"supportedGenerationMethods"`
+		} `json:"models"`
+	}
+	if err := json.Unmarshal(raw, &payload); err != nil {
+		return []string{}, []config.ModelSpec{}, err
+	}
+	seen := make(map[string]bool)
+	var ids []string
+	var specs []config.ModelSpec
+	for _, m := range payload.Models {
+		id := strings.TrimPrefix(strings.TrimSpace(m.Name), "models/")
+		if id == "" || seen[id] {
+			continue
+		}
+		seen[id] = true
+		spec := inferModelSpec(id, firstNonEmptyStr(m.DisplayName, id))
+		if m.InputTokenLimit > 0 {
+			spec.ContextWindow = m.InputTokenLimit
+		}
+		if m.OutputTokenLimit > 0 {
+			spec.MaxOutputTokens = m.OutputTokenLimit
+		}
+		ids = append(ids, id)
+		specs = append(specs, spec)
+	}
+	return ids, specs, nil
+}
+
+func parseOllamaTagsJSON(raw []byte) ([]string, []config.ModelSpec, error) {
+	var payload struct {
+		Models []struct {
+			Name  string `json:"name"`
+			Model string `json:"model"`
+		} `json:"models"`
+	}
+	if err := json.Unmarshal(raw, &payload); err != nil {
+		return []string{}, []config.ModelSpec{}, err
+	}
+	seen := make(map[string]bool)
+	var ids []string
+	var specs []config.ModelSpec
+	for _, m := range payload.Models {
+		id := strings.TrimSpace(firstNonEmptyStr(m.Name, m.Model))
+		if id == "" || seen[id] {
+			continue
+		}
+		seen[id] = true
+		ids = append(ids, id)
+		specs = append(specs, inferModelSpec(id, id))
+	}
+	return ids, specs, nil
+}
+
+func inferModelSpec(id, displayName string) config.ModelSpec {
+	lower := strings.ToLower(id)
+	ctxWin := 128000
+	maxOut := 16384
+	supportsThinking := false
+	supportsCaching := true
+
+	switch {
+	case strings.Contains(lower, "claude"):
+		ctxWin = 200000
+		maxOut = 32000
+		supportsThinking = strings.Contains(lower, "opus") || strings.Contains(lower, "sonnet")
+	case strings.Contains(lower, "gemini"):
+		ctxWin = 1000000
+		maxOut = 65536
+		supportsThinking = true
+	case strings.Contains(lower, "gpt-5") || strings.HasPrefix(lower, "o1") || strings.HasPrefix(lower, "o3") || strings.HasPrefix(lower, "o4"):
+		ctxWin = 400000
+		maxOut = 32768
+		supportsThinking = true
+	case strings.Contains(lower, "deepseek") || strings.Contains(lower, "qwen"):
+		ctxWin = 128000
+		maxOut = 16384
+		supportsThinking = strings.Contains(lower, "r1") || strings.Contains(lower, "reasoner") || strings.Contains(lower, "qwq")
+	}
+
+	return config.ModelSpec{
+		ID:               id,
+		Name:             firstNonEmptyStr(displayName, id),
+		ContextWindow:    ctxWin,
+		MaxOutputTokens:  maxOut,
+		SupportsThinking: supportsThinking,
+		SupportsCaching:  supportsCaching,
+	}
+}
+
+func presetModelsForProvider(proto, provID string, saved map[string]config.ModelSpec) ([]string, []config.ModelSpec) {
+	var defaults []string
+	switch strings.ToLower(strings.TrimSpace(proto)) {
+	case "anthropic":
+		defaults = []string{"claude-opus-5-5", "claude-sonnet-5-5", "claude-haiku-5-5", "claude-3-7-sonnet-latest", "claude-3-5-sonnet-latest"}
+	case "gemini":
+		defaults = []string{"gemini-3.1-pro", "gemini-3.1-flash", "gemini-2.5-pro", "gemini-2.5-flash"}
+	case "ollama":
+		defaults = []string{"qwen3-coder:30b", "deepseek-r1:32b", "llama3.3:70b", "qwen2.5-coder:32b"}
+	case "openai", "openai-responses":
+		defaults = []string{"gpt-5.4", "gpt-5.4-mini", "gpt-4.1", "gpt-4o", "o3-mini"}
+	default:
+		if strings.Contains(strings.ToLower(provID), "ollama") {
+			defaults = []string{"qwen3-coder:30b", "deepseek-r1:32b", "llama3.3:70b"}
+		} else {
+			defaults = []string{"gpt-5.4", "gpt-5.4-mini", "gpt-4o", "deepseek-chat", "deepseek-reasoner", "qwen-max"}
+		}
+	}
+
+	seen := make(map[string]bool)
+	var ids []string
+	var specs []config.ModelSpec
+
+	for _, id := range defaults {
+		seen[id] = true
+		ids = append(ids, id)
+		if existing, ok := saved[id]; ok {
+			if existing.ID == "" {
+				existing.ID = id
+			}
+			specs = append(specs, existing)
+		} else {
+			specs = append(specs, inferModelSpec(id, id))
+		}
+	}
+
+	if len(saved) > 0 {
+		var extra []string
+		for k := range saved {
+			if !seen[k] {
+				extra = append(extra, k)
+			}
+		}
+		sort.Strings(extra)
+		for _, id := range extra {
+			ids = append(ids, id)
+			sp := saved[id]
+			if sp.ID == "" {
+				sp.ID = id
+			}
+			specs = append(specs, sp)
+		}
+	}
+	return ids, specs
 }

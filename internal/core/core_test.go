@@ -3253,3 +3253,95 @@ drainLoop:
 		t.Fatal(err)
 	}
 }
+
+func TestUnconsumedRunStreamDoesNotDeadlockAndReleasesSessionLock(t *testing.T) {
+	ctx := context.Background()
+	wsRoot := filepath.Join(t.TempDir(), "workspace")
+	if err := os.MkdirAll(wsRoot, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	streamer := llm.StreamerFunc(func(ctx context.Context, _ llm.Request) (<-chan llm.StreamEvent, error) {
+		ch := make(chan llm.StreamEvent, 512)
+		go func() {
+			defer close(ch)
+			// Emit 400 deltas (> 256 stream buffer capacity) to verify sendRunEvent never blocks when caller abandons stream.
+			for i := 0; i < 400; i++ {
+				ch <- llm.StreamEvent{Type: llm.StreamTextDelta, Text: "x"}
+			}
+			ch <- llm.StreamEvent{
+				Type:         llm.StreamDone,
+				StopReason:   "end_turn",
+				InputTokens:  100,
+				OutputTokens: 400,
+			}
+		}()
+		return ch, nil
+	})
+
+	eng, cfgMgr, _, _ := setupTestEngine(t, nil, streamer)
+	ws, err := eng.Workspaces().Register(wsRoot, "Deadlock Test WS")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Disable auto-generate title via config to also verify auto_generate_title=false is respected.
+	rawCfg := `host = "127.0.0.1"
+port = 3456
+default_provider = "anthropic"
+default_model = "claude-sonnet-5-5"
+auto_generate_title = false
+`
+	if err := os.WriteFile(cfgMgr.Paths().ConfigFile(), []byte(rawCfg), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := cfgMgr.Reload(); err != nil {
+		t.Fatal(err)
+	}
+
+	sess, err := eng.Sessions().Create(ws.ID, "", "coder")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Start run and intentionally NEVER read from the returned stream channel.
+	_, _, err = eng.StartRun(ctx, RunRequest{
+		WorkspaceID: ws.ID,
+		SessionID:   sess.ID,
+		Prompt:      "Emit 400 chunks without consumer",
+	})
+	if err != nil {
+		t.Fatalf("StartRun: %v", err)
+	}
+
+	doneCh := make(chan struct{})
+	go func() {
+		eng.WaitBackground()
+		close(doneCh)
+	}()
+
+	select {
+	case <-doneCh:
+	case <-time.After(3 * time.Second):
+		t.Fatal("deadlock detected: AgentLoop blocked on unconsumed run stream")
+	}
+
+	// Verify session flock was released and a second run on the same session succeeds immediately.
+	_, stream2, err := eng.StartRun(ctx, RunRequest{
+		WorkspaceID: ws.ID,
+		SessionID:   sess.ID,
+		Prompt:      "Second run after unconsumed stream",
+	})
+	if err != nil {
+		t.Fatalf("expected session lock to be released for second run, got: %v", err)
+	}
+	_ = drainRunEvents(stream2)
+	eng.WaitBackground()
+
+	meta, err := eng.Sessions().GetMeta(sess.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if meta.Title != defaultSessionTitle {
+		t.Fatalf("expected default session title %q when auto_generate_title=false, got %q", defaultSessionTitle, meta.Title)
+	}
+}

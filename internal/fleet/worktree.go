@@ -512,16 +512,14 @@ func canonicalizeDir(p string) string {
 	if trimmed == "" {
 		return ""
 	}
+	if canon, err := config.CanonicalPath(trimmed); err == nil && canon != "" {
+		return canon
+	}
 	if abs, err := filepath.Abs(trimmed); err == nil {
 		trimmed = abs
 	}
 	if resolved, err := filepath.EvalSymlinks(trimmed); err == nil {
 		return filepath.Clean(resolved)
-	}
-	// 若末级尚不存在，尝试规范化已存在的父目录（消除 macOS /var -> /private/var 偏差）
-	parent := filepath.Dir(trimmed)
-	if resolvedParent, err := filepath.EvalSymlinks(parent); err == nil {
-		return filepath.Join(filepath.Clean(resolvedParent), filepath.Base(trimmed))
 	}
 	return filepath.Clean(trimmed)
 }

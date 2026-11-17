@@ -154,6 +154,7 @@ type Service struct {
 
 	dreamMu                sync.Mutex
 	disableAutoDream       bool
+	customDreamCooldown    bool
 	dreamSessionThreshold  int
 	dreamCooldown          time.Duration
 	completedSinceDream    int
@@ -236,6 +237,7 @@ func NewService(opts ServiceOptions) (*Service, error) {
 		wakeCh:                make(chan struct{}, 1),
 		captures:              make(map[string]*runNotificationCapture),
 		disableAutoDream:      opts.DisableAutoDream,
+		customDreamCooldown:   opts.DreamCooldown > 0,
 		dreamSessionThreshold: dreamThresh,
 		dreamCooldown:         dreamCooldown,
 	}
@@ -351,13 +353,25 @@ func (s *Service) maybeAutoDream(ctx context.Context) {
 	if s.disableAutoDream {
 		return
 	}
+	cooldown := s.dreamCooldown
+	if s.cfg != nil && s.cfg.Current() != nil {
+		g := s.cfg.Current().Global
+		if g.MaxSteps > 0 || g.MaxConcurrency > 0 || g.DefaultProvider != "" {
+			if !g.AutoDream || g.DreamerIdleMinutes <= 0 {
+				return
+			}
+			if !s.customDreamCooldown && g.DreamerIdleMinutes > 0 {
+				cooldown = time.Duration(g.DreamerIdleMinutes) * time.Minute
+			}
+		}
+	}
 	now := s.now().UTC()
 	s.dreamMu.Lock()
 	if s.dreamRunning || s.completedSinceDream < s.dreamSessionThreshold {
 		s.dreamMu.Unlock()
 		return
 	}
-	if !s.lastDreamAt.IsZero() && now.Sub(s.lastDreamAt) < s.dreamCooldown {
+	if !s.lastDreamAt.IsZero() && now.Sub(s.lastDreamAt) < cooldown {
 		s.dreamMu.Unlock()
 		return
 	}
@@ -374,7 +388,7 @@ func (s *Service) maybeAutoDream(ctx context.Context) {
 		s.dreamMu.Unlock()
 		return
 	}
-	if !s.lastDreamAt.IsZero() && now.Sub(s.lastDreamAt) < s.dreamCooldown {
+	if !s.lastDreamAt.IsZero() && now.Sub(s.lastDreamAt) < cooldown {
 		s.dreamMu.Unlock()
 		return
 	}

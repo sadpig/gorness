@@ -146,9 +146,16 @@ func (e *Engine) executeSpawnSubagent(
 		}
 	}
 
+	maxSubSteps := MaxSubagentSteps
+	if parent.wsSnap != nil && parent.wsSnap.Global.SubagentMaxSteps >= 2 {
+		maxSubSteps = parent.wsSnap.Global.SubagentMaxSteps
+		if maxSubSteps > 32 {
+			maxSubSteps = 32
+		}
+	}
 	stepsBudget := in.MaxSteps
-	if stepsBudget <= 0 || stepsBudget > MaxSubagentSteps {
-		stepsBudget = MaxSubagentSteps
+	if stepsBudget <= 0 || stepsBudget > maxSubSteps {
+		stepsBudget = maxSubSteps
 	}
 
 	desiredPerm := PermModePlan
@@ -211,14 +218,15 @@ func (e *Engine) executeSpawnSubagent(
 	}
 
 	childReg, err := tools.NewRegistry(tools.RegistryOptions{
-		WorkspaceID:   parent.ws.ID,
-		WorkspaceRoot: parent.effectiveRoot,
-		VaultPaths:    parent.wsSnap.Paths,
-		Snapshots:     e.snapshots,
-		PathGuard:     parent.pathGuard,
-		Seatbelt:      e.seatbelt,
-		Skills:        parent.skills,
-		ReadHashes:    e.readHashes,
+		WorkspaceID:              parent.ws.ID,
+		WorkspaceRoot:            parent.effectiveRoot,
+		VaultPaths:               parent.wsSnap.Paths,
+		Snapshots:                e.snapshots,
+		PathGuard:                parent.pathGuard,
+		Seatbelt:                 e.seatbelt,
+		Skills:                   parent.skills,
+		ReadHashes:               e.readHashes,
+		DefaultCommandTimeoutSec: parent.wsSnap.Global.CommandTimeoutSeconds,
 	})
 	if err != nil {
 		return tools.ToolResult{}, err

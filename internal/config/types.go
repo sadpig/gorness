@@ -31,22 +31,36 @@ func (v VaultPaths) SocketPath() string    { return filepath.Join(v.Root, "runti
 func (v VaultPaths) LogsDir() string       { return filepath.Join(v.Root, "runtime", "logs") }
 
 type GlobalConfig struct {
-	Host               string   `toml:"host" json:"host"`
-	Port               int      `toml:"port" json:"port"`
-	Theme              string   `toml:"theme" json:"theme"`
-	Language           string   `toml:"language" json:"language"`
-	UITheme            string   `toml:"ui_theme,omitempty" json:"ui_theme,omitempty"`
-	UILang             string   `toml:"ui_lang,omitempty" json:"ui_lang,omitempty"`
-	DefaultProvider    string   `toml:"default_provider" json:"default_provider"`
-	DefaultModel       string   `toml:"default_model" json:"default_model"`
-	DefaultEffort      string   `toml:"default_effort" json:"default_effort"`
-	PermissionMode     string   `toml:"permission_mode" json:"permission_mode"`
-	SandboxMode        string   `toml:"sandbox_mode" json:"sandbox_mode"`
-	MaxConcurrency     int      `toml:"max_concurrency" json:"max_concurrency"`
-	MaxToolConcurrency int      `toml:"max_tool_concurrency" json:"max_tool_concurrency"`
-	MaxSteps           int      `toml:"max_steps" json:"max_steps"`
-	InboxDebounceMS    int      `toml:"inbox_debounce_ms" json:"inbox_debounce_ms"`
-	ExtraSkillDirs     []string `toml:"extra_skill_dirs,omitempty" json:"extra_skill_dirs,omitempty"`
+	Host                        string   `toml:"host" json:"host"`
+	Port                        int      `toml:"port" json:"port"`
+	Theme                       string   `toml:"theme" json:"theme"`
+	Language                    string   `toml:"language" json:"language"`
+	UITheme                     string   `toml:"ui_theme,omitempty" json:"ui_theme,omitempty"`
+	UILang                      string   `toml:"ui_lang,omitempty" json:"ui_lang,omitempty"`
+	DefaultProvider             string   `toml:"default_provider" json:"default_provider"`
+	DefaultModel                string   `toml:"default_model" json:"default_model"`
+	DefaultEffort               string   `toml:"default_effort" json:"default_effort"`
+	PermissionMode              string   `toml:"permission_mode" json:"permission_mode"`
+	SandboxMode                 string   `toml:"sandbox_mode" json:"sandbox_mode"`
+	MaxConcurrency              int      `toml:"max_concurrency" json:"max_concurrency"`
+	MaxToolConcurrency          int      `toml:"max_tool_concurrency" json:"max_tool_concurrency"`
+	MaxSteps                    int      `toml:"max_steps" json:"max_steps"`
+	SubagentMaxSteps            int      `toml:"subagent_max_steps" json:"subagent_max_steps"`
+	AutoCompactThresholdPercent int      `toml:"auto_compact_threshold_percent" json:"auto_compact_threshold_percent"`
+	AutoCompactRatio            float64  `toml:"auto_compact_ratio" json:"auto_compact_ratio"`
+	KeptRecentTurnsRatio        float64  `toml:"kept_recent_turns_ratio" json:"kept_recent_turns_ratio"`
+	CommandTimeoutSeconds       int      `toml:"command_timeout_seconds" json:"command_timeout_seconds"`
+	CommandTimeoutSec           int      `toml:"command_timeout_sec" json:"command_timeout_sec"`
+	AutoGenerateTitle           bool     `toml:"auto_generate_title" json:"auto_generate_title"`
+	AutoDream                   bool     `toml:"auto_dream" json:"auto_dream"`
+	DreamerIdleMinutes          int      `toml:"dreamer_idle_minutes" json:"dreamer_idle_minutes"`
+	DreamIdleMinutes            int      `toml:"dream_idle_minutes" json:"dream_idle_minutes"`
+	WitnessTimeoutSeconds       int      `toml:"witness_timeout_seconds" json:"witness_timeout_seconds"`
+	WitnessStallSec             int      `toml:"witness_stall_sec" json:"witness_stall_sec"`
+	LLMMaxRetries               int      `toml:"llm_max_retries" json:"llm_max_retries"`
+	LLMTimeoutSec               int      `toml:"llm_timeout_sec" json:"llm_timeout_sec"`
+	InboxDebounceMS             int      `toml:"inbox_debounce_ms" json:"inbox_debounce_ms"`
+	ExtraSkillDirs              []string `toml:"extra_skill_dirs,omitempty" json:"extra_skill_dirs,omitempty"`
 }
 
 type ModelSpec struct {

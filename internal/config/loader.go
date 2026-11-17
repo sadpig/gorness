@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
 	"sort"
@@ -587,12 +588,14 @@ func (m *Manager) loadGlobalSnapshot() (*Snapshot, error) {
 	globalCfg := defaultGlobalConfig()
 	globalCfg.Language = ""
 	globalCfg.UILang = ""
-	if raw, err := os.ReadFile(m.paths.ConfigFile()); err != nil {
-		return nil, &fileLoadError{File: m.paths.ConfigFile(), Err: err}
-	} else if err := toml.Unmarshal(raw, &globalCfg); err != nil {
+	rawConfig, err := os.ReadFile(m.paths.ConfigFile())
+	if err != nil {
 		return nil, &fileLoadError{File: m.paths.ConfigFile(), Err: err}
 	}
-	normalizeGlobalLanguage(&globalCfg)
+	if err := toml.Unmarshal(rawConfig, &globalCfg); err != nil {
+		return nil, &fileLoadError{File: m.paths.ConfigFile(), Err: err}
+	}
+	NormalizeGlobalConfig(&globalCfg, rawConfig)
 
 	rawProviders, err := os.ReadFile(m.paths.ProvidersFile())
 	if err != nil {
@@ -738,14 +741,16 @@ func (m *Manager) ValidateCandidate(overlay map[string][]byte) (*Snapshot, error
 	globalCfg := defaultGlobalConfig()
 	globalCfg.Language = ""
 	globalCfg.UILang = ""
+	var rawConfigCandidate []byte
 	if raw, ok, err := readCandidateFile("config.toml", m.paths.ConfigFile()); err != nil {
 		return nil, err
 	} else if ok {
+		rawConfigCandidate = raw
 		if err := toml.Unmarshal(raw, &globalCfg); err != nil {
 			return nil, &fileLoadError{File: m.paths.ConfigFile(), Err: err}
 		}
 	}
-	normalizeGlobalLanguage(&globalCfg)
+	NormalizeGlobalConfig(&globalCfg, rawConfigCandidate)
 
 	providers := make(map[string]ProviderConfig)
 	if raw, ok, err := readCandidateFile("providers.toml", m.paths.ProvidersFile()); err != nil {
@@ -1322,20 +1327,34 @@ func writeIfMissing(path string, data []byte, perm os.FileMode) error {
 
 func defaultGlobalConfig() GlobalConfig {
 	return GlobalConfig{
-		Host:               "127.0.0.1",
-		Port:               3456,
-		Theme:              "auto",
-		Language:           "zh",
-		UILang:             "zh",
-		DefaultProvider:    "anthropic",
-		DefaultModel:       "claude-sonnet-5-5",
-		DefaultEffort:      "high",
-		PermissionMode:     "auto",
-		SandboxMode:        "strict",
-		MaxConcurrency:     4,
-		MaxToolConcurrency: 8,
-		MaxSteps:           64,
-		InboxDebounceMS:    400,
+		Host:                        "127.0.0.1",
+		Port:                        3456,
+		Theme:                       "auto",
+		Language:                    "zh",
+		UILang:                      "zh",
+		DefaultProvider:             "anthropic",
+		DefaultModel:                "claude-sonnet-5-5",
+		DefaultEffort:               "high",
+		PermissionMode:              "auto",
+		SandboxMode:                 "strict",
+		MaxConcurrency:              4,
+		MaxToolConcurrency:          4,
+		MaxSteps:                    64,
+		SubagentMaxSteps:            8,
+		AutoCompactThresholdPercent: 85,
+		AutoCompactRatio:            0.85,
+		KeptRecentTurnsRatio:        0.30,
+		CommandTimeoutSeconds:       120,
+		CommandTimeoutSec:           120,
+		AutoGenerateTitle:           true,
+		AutoDream:                   true,
+		DreamerIdleMinutes:          15,
+		DreamIdleMinutes:            15,
+		WitnessTimeoutSeconds:       180,
+		WitnessStallSec:             180,
+		LLMMaxRetries:               2,
+		LLMTimeoutSec:               120,
+		InboxDebounceMS:             400,
 	}
 }
 
@@ -1357,6 +1376,221 @@ func normalizeGlobalLanguage(cfg *GlobalConfig) {
 	}
 }
 
+func clampIntRange(v, minV, maxV int) int {
+	if v < minV {
+		return minV
+	}
+	if v > maxV {
+		return maxV
+	}
+	return v
+}
+
+func clampFloatRange(v, minV, maxV float64) float64 {
+	if v < minV {
+		return minV
+	}
+	if v > maxV {
+		return maxV
+	}
+	return v
+}
+
+// NormalizeGlobalConfig applies defaults, alias synchronization, and safe range clamping to GlobalConfig.
+func NormalizeGlobalConfig(cfg *GlobalConfig, rawTOML []byte) {
+	if cfg == nil {
+		return
+	}
+	normalizeGlobalLanguage(cfg)
+
+	var rawMap map[string]any
+	if len(rawTOML) > 0 {
+		_ = toml.Unmarshal(rawTOML, &rawMap)
+	}
+	hasRawKey := func(k string) bool {
+		if rawMap == nil {
+			return false
+		}
+		_, ok := rawMap[k]
+		return ok
+	}
+
+	if cfg.MaxConcurrency <= 0 {
+		cfg.MaxConcurrency = 4
+	}
+	cfg.MaxConcurrency = clampIntRange(cfg.MaxConcurrency, 1, 32)
+
+	if cfg.MaxToolConcurrency <= 0 {
+		cfg.MaxToolConcurrency = 4
+	}
+	cfg.MaxToolConcurrency = clampIntRange(cfg.MaxToolConcurrency, 1, 16)
+
+	if cfg.MaxSteps <= 0 {
+		cfg.MaxSteps = 64
+	}
+	cfg.MaxSteps = clampIntRange(cfg.MaxSteps, 4, 256)
+
+	if cfg.SubagentMaxSteps <= 0 {
+		cfg.SubagentMaxSteps = 8
+	}
+	cfg.SubagentMaxSteps = clampIntRange(cfg.SubagentMaxSteps, 2, 32)
+
+	// Auto-compact threshold percent (50..95 or 0 to disable) & ratio (0.50..0.95 or 0 to disable)
+	switch {
+	case hasRawKey("auto_compact_threshold_percent"):
+		if cfg.AutoCompactThresholdPercent <= 0 {
+			cfg.AutoCompactThresholdPercent = 0
+			cfg.AutoCompactRatio = 0
+		} else {
+			cfg.AutoCompactThresholdPercent = clampIntRange(cfg.AutoCompactThresholdPercent, 50, 95)
+			cfg.AutoCompactRatio = float64(cfg.AutoCompactThresholdPercent) / 100.0
+		}
+	case hasRawKey("auto_compact_ratio"):
+		if cfg.AutoCompactRatio <= 0 {
+			cfg.AutoCompactThresholdPercent = 0
+			cfg.AutoCompactRatio = 0
+		} else {
+			r := cfg.AutoCompactRatio
+			if r > 1.0 {
+				r = r / 100.0
+			}
+			r = clampFloatRange(r, 0.50, 0.95)
+			cfg.AutoCompactRatio = r
+			cfg.AutoCompactThresholdPercent = int(math.Round(r * 100))
+		}
+	default:
+		if cfg.AutoCompactThresholdPercent <= 0 && cfg.AutoCompactRatio <= 0 {
+			if rawMap != nil {
+				cfg.AutoCompactThresholdPercent = 85
+				cfg.AutoCompactRatio = 0.85
+			} else {
+				cfg.AutoCompactThresholdPercent = 0
+				cfg.AutoCompactRatio = 0
+			}
+		} else if cfg.AutoCompactThresholdPercent > 0 && cfg.AutoCompactThresholdPercent != 85 {
+			cfg.AutoCompactThresholdPercent = clampIntRange(cfg.AutoCompactThresholdPercent, 50, 95)
+			cfg.AutoCompactRatio = float64(cfg.AutoCompactThresholdPercent) / 100.0
+		} else if cfg.AutoCompactRatio > 0 && cfg.AutoCompactRatio != 0.85 {
+			r := cfg.AutoCompactRatio
+			if r > 1.0 {
+				r = r / 100.0
+			}
+			r = clampFloatRange(r, 0.50, 0.95)
+			cfg.AutoCompactRatio = r
+			cfg.AutoCompactThresholdPercent = int(math.Round(r * 100))
+		} else {
+			cfg.AutoCompactThresholdPercent = clampIntRange(cfg.AutoCompactThresholdPercent, 50, 95)
+			cfg.AutoCompactRatio = float64(cfg.AutoCompactThresholdPercent) / 100.0
+		}
+	}
+
+	if cfg.KeptRecentTurnsRatio <= 0 {
+		cfg.KeptRecentTurnsRatio = 0.30
+	} else if cfg.KeptRecentTurnsRatio > 1.0 {
+		cfg.KeptRecentTurnsRatio = cfg.KeptRecentTurnsRatio / 100.0
+	}
+	cfg.KeptRecentTurnsRatio = clampFloatRange(cfg.KeptRecentTurnsRatio, 0.10, 0.50)
+
+	// Command timeout seconds (10..1800, default 120)
+	cmdTimeout := cfg.CommandTimeoutSeconds
+	if hasRawKey("command_timeout_seconds") {
+		cmdTimeout = cfg.CommandTimeoutSeconds
+	} else if hasRawKey("command_timeout_sec") {
+		cmdTimeout = cfg.CommandTimeoutSec
+	} else if cfg.CommandTimeoutSeconds > 0 && cfg.CommandTimeoutSeconds != 120 {
+		cmdTimeout = cfg.CommandTimeoutSeconds
+	} else if cfg.CommandTimeoutSec > 0 {
+		cmdTimeout = cfg.CommandTimeoutSec
+	}
+	if cmdTimeout <= 0 {
+		cmdTimeout = 120
+	}
+	cmdTimeout = clampIntRange(cmdTimeout, 10, 1800)
+	cfg.CommandTimeoutSeconds = cmdTimeout
+	cfg.CommandTimeoutSec = cmdTimeout
+
+	if rawMap != nil && !hasRawKey("auto_generate_title") {
+		cfg.AutoGenerateTitle = true
+	}
+	if rawMap != nil && !hasRawKey("auto_dream") {
+		cfg.AutoDream = true
+	}
+
+	// Dreamer idle minutes (0..240, default 15; 0 disables idle trigger)
+	switch {
+	case hasRawKey("dreamer_idle_minutes"):
+		if cfg.DreamerIdleMinutes <= 0 {
+			cfg.DreamerIdleMinutes = 0
+			cfg.DreamIdleMinutes = 0
+		} else {
+			v := clampIntRange(cfg.DreamerIdleMinutes, 1, 240)
+			cfg.DreamerIdleMinutes = v
+			cfg.DreamIdleMinutes = v
+		}
+	case hasRawKey("dream_idle_minutes"):
+		if cfg.DreamIdleMinutes <= 0 {
+			cfg.DreamerIdleMinutes = 0
+			cfg.DreamIdleMinutes = 0
+		} else {
+			v := clampIntRange(cfg.DreamIdleMinutes, 1, 240)
+			cfg.DreamerIdleMinutes = v
+			cfg.DreamIdleMinutes = v
+		}
+	default:
+		if cfg.DreamerIdleMinutes <= 0 && cfg.DreamIdleMinutes <= 0 {
+			if rawMap != nil {
+				cfg.DreamerIdleMinutes = 15
+				cfg.DreamIdleMinutes = 15
+			} else {
+				cfg.DreamerIdleMinutes = 0
+				cfg.DreamIdleMinutes = 0
+			}
+		} else {
+			v := cfg.DreamerIdleMinutes
+			if v <= 0 || (v == 15 && cfg.DreamIdleMinutes > 0 && cfg.DreamIdleMinutes != 15) {
+				v = cfg.DreamIdleMinutes
+			}
+			v = clampIntRange(v, 1, 240)
+			cfg.DreamerIdleMinutes = v
+			cfg.DreamIdleMinutes = v
+		}
+	}
+
+	// Witness stall timeout seconds (30..1800, default 180)
+	witnessSec := cfg.WitnessTimeoutSeconds
+	if hasRawKey("witness_timeout_seconds") {
+		witnessSec = cfg.WitnessTimeoutSeconds
+	} else if hasRawKey("witness_stall_sec") {
+		witnessSec = cfg.WitnessStallSec
+	} else if cfg.WitnessTimeoutSeconds > 0 && cfg.WitnessTimeoutSeconds != 180 {
+		witnessSec = cfg.WitnessTimeoutSeconds
+	} else if cfg.WitnessStallSec > 0 {
+		witnessSec = cfg.WitnessStallSec
+	}
+	if witnessSec <= 0 {
+		witnessSec = 180
+	}
+	witnessSec = clampIntRange(witnessSec, 30, 1800)
+	cfg.WitnessTimeoutSeconds = witnessSec
+	cfg.WitnessStallSec = witnessSec
+
+	// LLM max retries (0..5, default 2) & timeout sec (15..600, default 120)
+	if rawMap != nil && !hasRawKey("llm_max_retries") {
+		cfg.LLMMaxRetries = 2
+	} else {
+		cfg.LLMMaxRetries = clampIntRange(cfg.LLMMaxRetries, 0, 5)
+	}
+	if cfg.LLMTimeoutSec <= 0 {
+		cfg.LLMTimeoutSec = 120
+	}
+	cfg.LLMTimeoutSec = clampIntRange(cfg.LLMTimeoutSec, 15, 600)
+
+	if cfg.InboxDebounceMS <= 0 {
+		cfg.InboxDebounceMS = 400
+	}
+	cfg.InboxDebounceMS = clampIntRange(cfg.InboxDebounceMS, 50, 10000)
+}
+
 const defaultConfigTOML = `# Gorness Global Configuration (全局主配置 / Global Settings)
 host = "127.0.0.1"
 port = 3456
@@ -1369,8 +1603,22 @@ default_effort = "high"       # low | medium | high | xhigh | max
 permission_mode = "auto"      # plan | ask | accept_edits | auto | yolo
 sandbox_mode = "strict"       # strict | readonly | network_allow | off
 max_concurrency = 4
-max_tool_concurrency = 8
+max_tool_concurrency = 4
 max_steps = 64
+subagent_max_steps = 8
+auto_compact_threshold_percent = 85
+auto_compact_ratio = 0.85
+kept_recent_turns_ratio = 0.30
+command_timeout_seconds = 120
+command_timeout_sec = 120
+auto_generate_title = true
+auto_dream = true
+dreamer_idle_minutes = 15
+dream_idle_minutes = 15
+witness_timeout_seconds = 180
+witness_stall_sec = 180
+llm_max_retries = 2
+llm_timeout_sec = 120
 inbox_debounce_ms = 400
 `
 

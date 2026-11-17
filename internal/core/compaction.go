@@ -104,7 +104,13 @@ func (c *Compactor) Compact(ctx context.Context, sessionID string) (*CompactionR
 		}, nil
 	}
 
-	keepCount := int(math.Round(float64(totalTurns) * KeptRecentTurnsRatio))
+	keptRatio := KeptRecentTurnsRatio
+	if c.cfg != nil && c.cfg.Current() != nil {
+		if r := c.cfg.Current().Global.KeptRecentTurnsRatio; r >= 0.10 && r <= 0.50 {
+			keptRatio = r
+		}
+	}
+	keepCount := int(math.Round(float64(totalTurns) * keptRatio))
 	if keepCount < 1 {
 		keepCount = 1
 	}

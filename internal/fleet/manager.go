@@ -429,8 +429,13 @@ func (m *Manager) StartMission(ctx context.Context, req MissionRequest) (*Missio
 		subs:               make(map[uint64]chan MissionEvent),
 	}
 
+	stallTimeout := m.stallTimeout
+	if stallTimeout <= 0 && wsSnap != nil && wsSnap.Global.WitnessTimeoutSeconds > 0 {
+		stallTimeout = time.Duration(wsSnap.Global.WitnessTimeoutSeconds) * time.Second
+	}
+
 	rt.witness = NewWitness(WitnessOptions{
-		StallTimeout:  m.stallTimeout,
+		StallTimeout:  stallTimeout,
 		CheckInterval: m.checkInterval,
 		Now:           m.now,
 		OnStall: func(nodeID string, silentFor time.Duration) {

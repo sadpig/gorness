@@ -835,15 +835,16 @@ func (e *Engine) StartRun(ctx context.Context, req RunRequest) (string, <-chan R
 
 	skillCat := tools.DiscoverSkills(wsSnap, effectiveRoot)
 	reg, err := tools.NewRegistry(tools.RegistryOptions{
-		WorkspaceID:   ws.ID,
-		WorkspaceRoot: effectiveRoot,
-		VaultPaths:    wsSnap.Paths,
-		Snapshots:     e.snapshots,
-		Artifacts:     e.artifacts,
-		PathGuard:     pg,
-		Seatbelt:      e.seatbelt,
-		Skills:        skillCat,
-		ReadHashes:    e.readHashes,
+		WorkspaceID:              ws.ID,
+		WorkspaceRoot:            effectiveRoot,
+		VaultPaths:               wsSnap.Paths,
+		Snapshots:                e.snapshots,
+		Artifacts:                e.artifacts,
+		PathGuard:                pg,
+		Seatbelt:                 e.seatbelt,
+		Skills:                   skillCat,
+		ReadHashes:               e.readHashes,
+		DefaultCommandTimeoutSec: wsSnap.Global.CommandTimeoutSeconds,
 	})
 	if err != nil {
 		unlockSession()
@@ -1121,7 +1122,11 @@ func (e *Engine) StartRun(ctx context.Context, req RunRequest) (string, <-chan R
 		emit(EventRunCompleted, outcome)
 
 		// 首轮对话顺利完成后，异步调度轻量 utility 角色为仍处于默认标题的会话生成精炼标题
-		if outcome.CompletedTurn1 && strings.TrimSpace(req.Prompt) != "" {
+		autoTitle := true
+		if wsSnap != nil && (wsSnap.Global.MaxSteps > 0 || wsSnap.Global.MaxConcurrency > 0 || wsSnap.Global.DefaultProvider != "") {
+			autoTitle = wsSnap.Global.AutoGenerateTitle
+		}
+		if autoTitle && outcome.CompletedTurn1 && strings.TrimSpace(req.Prompt) != "" {
 			if curMeta, mErr := e.sessions.GetMeta(meta.ID); mErr == nil && curMeta.Title == defaultSessionTitle {
 				e.spawnAutoTitler(ws, curMeta.ID, req.Prompt, outcome.FinalText)
 			}
@@ -1580,24 +1585,38 @@ func (e *Engine) collectKnownSecrets() []string {
 	return nil
 }
 
-func sendRunEvent(ctx context.Context, ch chan<- RunEvent, ev RunEvent) {
+func sendRunEvent(ctx context.Context, ch chan RunEvent, ev RunEvent) {
 	select {
 	case ch <- ev:
 		return
 	default:
 	}
-	// 对高频流式增量块，若运行已取消且缓冲区已满则立即丢弃；对状态终态事件优先投递但不无限死锁
+	// 对高频流式增量块，若缓冲区已满（例如客户端已断开或无人消费）直接丢弃，严禁阻塞后台 AgentLoop
 	isDelta := ev.Type == EventTextDelta || ev.Type == EventThinkingDelta
-	if isDelta && ctx.Err() != nil {
+	if isDelta {
 		return
+	}
+	// 对结构化事件与终态事件，至多短暂等待 5ms；若仍满则淘汰最旧事件以确保终态可达且绝不死锁会话锁
+	timer := time.NewTimer(5 * time.Millisecond)
+	defer timer.Stop()
+	select {
+	case ch <- ev:
+		return
+	case <-ctx.Done():
+	case <-timer.C:
 	}
 	select {
 	case ch <- ev:
-	case <-ctx.Done():
-		select {
-		case ch <- ev:
-		default:
-		}
+		return
+	default:
+	}
+	select {
+	case <-ch:
+	default:
+	}
+	select {
+	case ch <- ev:
+	default:
 	}
 }
 

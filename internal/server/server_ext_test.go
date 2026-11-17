@@ -832,3 +832,169 @@ func TestConfigHooksGetAndUpsertWithValidation(t *testing.T) {
 		t.Fatalf("expected hooks to be empty after clearing, got %+v", clearResp.Hooks)
 	}
 }
+
+func TestGlobalConfigEngineParamsWorkspaceGitTreeAndProviderModels(t *testing.T) {
+	srv, _, cleanup := newTestStack(t, nil, nil)
+	defer cleanup()
+
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+	client := ts.Client()
+
+	// 1. PUT /api/config/global with new engine parameters, string/float/bool coercion, and clamping.
+	stGlob, rawGlob, _ := doJSONReq(t, client, ts.URL, http.MethodPut, "/api/config/global", map[string]any{
+		"auto_compact_threshold_percent": 75,
+		"kept_recent_turns_ratio":        0.25,
+		"max_tool_concurrency":           "6",
+		"subagent_max_steps":             12,
+		"command_timeout_seconds":        "180",
+		"auto_generate_title":            "false",
+		"dreamer_idle_minutes":           30,
+		"witness_timeout_seconds":        240,
+		"llm_max_retries":                3,
+		"llm_timeout_sec":                90,
+	})
+	if stGlob != http.StatusOK {
+		t.Fatalf("PUT /api/config/global status=%d: %s", stGlob, string(rawGlob))
+	}
+	var snap config.Snapshot
+	if err := json.Unmarshal(rawGlob, &snap); err != nil {
+		t.Fatalf("decode global snapshot: %v", err)
+	}
+	g := snap.Global
+	if g.AutoCompactThresholdPercent != 75 || g.AutoCompactRatio != 0.75 {
+		t.Fatalf("expected auto_compact 75 / 0.75, got %d / %v", g.AutoCompactThresholdPercent, g.AutoCompactRatio)
+	}
+	if g.KeptRecentTurnsRatio != 0.25 || g.MaxToolConcurrency != 6 || g.SubagentMaxSteps != 12 {
+		t.Fatalf("unexpected concurrency/subagent/compaction params: %+v", g)
+	}
+	if g.CommandTimeoutSeconds != 180 || g.CommandTimeoutSec != 180 {
+		t.Fatalf("expected command timeout 180, got %d / %d", g.CommandTimeoutSeconds, g.CommandTimeoutSec)
+	}
+	if g.AutoGenerateTitle != false || g.DreamerIdleMinutes != 30 || g.WitnessTimeoutSeconds != 240 || g.LLMMaxRetries != 3 || g.LLMTimeoutSec != 90 {
+		t.Fatalf("unexpected global engine params: %+v", g)
+	}
+
+	// Verify out-of-range clamping and 0-disable on auto_compact_threshold_percent.
+	stClamp, rawClamp, _ := doJSONReq(t, client, ts.URL, http.MethodPut, "/api/config/global", map[string]any{
+		"auto_compact_threshold_percent": 0,
+		"max_tool_concurrency":           999,
+		"subagent_max_steps":             1,
+		"command_timeout_seconds":        2,
+		"llm_max_retries":                99,
+	})
+	if stClamp != http.StatusOK {
+		t.Fatalf("PUT /api/config/global clamp status=%d: %s", stClamp, string(rawClamp))
+	}
+	var snapClamp config.Snapshot
+	_ = json.Unmarshal(rawClamp, &snapClamp)
+	if snapClamp.Global.AutoCompactThresholdPercent != 0 || snapClamp.Global.AutoCompactRatio != 0 {
+		t.Fatalf("expected auto_compact disabled (0), got %+v", snapClamp.Global)
+	}
+	if snapClamp.Global.MaxToolConcurrency != 16 || snapClamp.Global.SubagentMaxSteps != 2 || snapClamp.Global.CommandTimeoutSeconds != 10 || snapClamp.Global.LLMMaxRetries != 5 {
+		t.Fatalf("expected clamped values (16, 2, 10, 5), got %+v", snapClamp.Global)
+	}
+
+	// 2. Workspace Git Status & Diff (GET /api/workspaces/{wsID}/git) and Tree (GET /api/workspaces/{wsID}/tree).
+	repoDir := filepath.Join(t.TempDir(), "git-tree-repo")
+	initTempGitRepo(t, repoDir)
+	subDir := filepath.Join(repoDir, "internal", "pkg")
+	if err := os.MkdirAll(subDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(subDir, "service.go"), []byte("package pkg\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(repoDir, "README.md"), []byte("# Updated Repo\nNew line\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	stWS, rawWS, _ := doJSONReq(t, client, ts.URL, http.MethodPost, "/api/workspaces", map[string]any{
+		"name": "Git Tree Repo",
+		"path": repoDir,
+	})
+	if stWS != http.StatusCreated && stWS != http.StatusOK {
+		t.Fatalf("create workspace status=%d: %s", stWS, string(rawWS))
+	}
+	var ws struct {
+		ID string `json:"id"`
+	}
+	_ = json.Unmarshal(rawWS, &ws)
+
+	stGit, rawGit, _ := doJSONReq(t, client, ts.URL, http.MethodGet, "/api/workspaces/"+ws.ID+"/git", nil)
+	if stGit != http.StatusOK {
+		t.Fatalf("GET /api/workspaces/%s/git status=%d: %s", ws.ID, stGit, string(rawGit))
+	}
+	var gitResp struct {
+		IsGit          bool     `json:"is_git"`
+		Branch         string   `json:"branch"`
+		Clean          bool     `json:"clean"`
+		ModifiedCount  int      `json:"modified_count"`
+		UntrackedCount int      `json:"untracked_count"`
+		ChangedCount   int      `json:"changed_count"`
+		StatusLines    []string `json:"status_lines"`
+		Diff           string   `json:"diff"`
+	}
+	if err := json.Unmarshal(rawGit, &gitResp); err != nil {
+		t.Fatalf("decode git response: %v", err)
+	}
+	if !gitResp.IsGit || gitResp.Clean || gitResp.ModifiedCount < 1 || gitResp.UntrackedCount < 1 || !strings.Contains(gitResp.Diff, "Updated Repo") {
+		t.Fatalf("unexpected git status response: %+v", gitResp)
+	}
+
+	stTree, rawTree, _ := doJSONReq(t, client, ts.URL, http.MethodGet, "/api/workspaces/"+ws.ID+"/tree", nil)
+	if stTree != http.StatusOK {
+		t.Fatalf("GET /api/workspaces/%s/tree status=%d: %s", ws.ID, stTree, string(rawTree))
+	}
+	var treeResp struct {
+		Entries []struct {
+			Path  string `json:"path"`
+			Name  string `json:"name"`
+			IsDir bool   `json:"is_dir"`
+		} `json:"entries"`
+	}
+	if err := json.Unmarshal(rawTree, &treeResp); err != nil {
+		t.Fatalf("decode tree response: %v", err)
+	}
+	foundNested := false
+	for _, ent := range treeResp.Entries {
+		if ent.Path == "internal/pkg/service.go" && !ent.IsDir {
+			foundNested = true
+			break
+		}
+	}
+	if !foundNested {
+		t.Fatalf("expected nested file internal/pkg/service.go in tree entries, got: %+v", treeResp.Entries)
+	}
+
+	// 3. POST /api/config/providers/fetch-models with mock upstream OpenAI-compatible server & preset fallback.
+	mockUpstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/v1/models" && r.Header.Get("Authorization") == "Bearer sk-live-test-key" {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"data":[{"id":"gpt-5.4-pro"},{"id":"gpt-5.4-mini"}]}`))
+			return
+		}
+		w.WriteHeader(http.StatusUnauthorized)
+	}))
+	defer mockUpstream.Close()
+
+	stFetch, rawFetch, _ := doJSONReq(t, client, ts.URL, http.MethodPost, "/api/config/providers/fetch-models", map[string]any{
+		"id":       "custom_openai",
+		"protocol": "openai-compat",
+		"base_url": mockUpstream.URL,
+		"api_key":  "sk-live-test-key",
+	})
+	if stFetch != http.StatusOK {
+		t.Fatalf("POST /api/config/providers/fetch-models status=%d: %s", stFetch, string(rawFetch))
+	}
+	var fetchResp struct {
+		Source string   `json:"source"`
+		Models []string `json:"models"`
+	}
+	if err := json.Unmarshal(rawFetch, &fetchResp); err != nil {
+		t.Fatalf("decode fetch-models response: %v", err)
+	}
+	if fetchResp.Source != "remote" || len(fetchResp.Models) != 2 || fetchResp.Models[0] != "gpt-5.4-pro" {
+		t.Fatalf("expected remote models [gpt-5.4-pro, gpt-5.4-mini], got %+v", fetchResp)
+	}
+}

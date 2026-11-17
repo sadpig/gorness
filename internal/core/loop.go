@@ -21,7 +21,8 @@ import (
 
 const (
 	DoomLoopThreshold          = 3
-	DefaultMaxToolConcurrency  = 8
+	DefaultMaxToolConcurrency  = 4
+	MaxToolConcurrencyLimit    = 16
 	DefaultMaxSteps            = 64
 	AutoCompactionContextRatio = 0.85
 )
@@ -51,6 +52,9 @@ type errGroup struct {
 func newErrGroup(parent context.Context, limit int) *errGroup {
 	if limit <= 0 {
 		limit = DefaultMaxToolConcurrency
+	}
+	if limit > MaxToolConcurrencyLimit {
+		limit = MaxToolConcurrencyLimit
 	}
 	ctx, cancel := context.WithCancel(parent)
 	return &errGroup{
@@ -205,8 +209,8 @@ func newAgentLoop(cfg agentLoopConfig) *AgentLoop {
 	if cfg.maxToolConcurrency <= 0 {
 		cfg.maxToolConcurrency = DefaultMaxToolConcurrency
 	}
-	if cfg.maxToolConcurrency > DefaultMaxToolConcurrency {
-		cfg.maxToolConcurrency = DefaultMaxToolConcurrency
+	if cfg.maxToolConcurrency > MaxToolConcurrencyLimit {
+		cfg.maxToolConcurrency = MaxToolConcurrencyLimit
 	}
 	if cfg.now == nil {
 		cfg.now = time.Now
@@ -1134,7 +1138,20 @@ func (l *AgentLoop) maybeAutoCompact(ctx context.Context, spec config.ModelSpec,
 	if l.cfg.compactor == nil || spec.ContextWindow <= 0 || inputTokens <= 0 {
 		return
 	}
-	threshold := int(float64(spec.ContextWindow) * AutoCompactionContextRatio)
+	ratio := AutoCompactionContextRatio
+	if l.cfg.snap != nil {
+		g := l.cfg.snap.Global
+		hasConfiguredGlobal := g.MaxSteps > 0 || g.MaxConcurrency > 0 || g.DefaultProvider != ""
+		if hasConfiguredGlobal && g.AutoCompactThresholdPercent <= 0 && g.AutoCompactRatio <= 0 {
+			return
+		}
+		if g.AutoCompactThresholdPercent >= 50 && g.AutoCompactThresholdPercent <= 95 {
+			ratio = float64(g.AutoCompactThresholdPercent) / 100.0
+		} else if g.AutoCompactRatio >= 0.50 && g.AutoCompactRatio <= 0.95 {
+			ratio = g.AutoCompactRatio
+		}
+	}
+	threshold := int(float64(spec.ContextWindow) * ratio)
 	if threshold < 1 {
 		threshold = 1
 	}

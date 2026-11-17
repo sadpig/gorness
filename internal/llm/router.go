@@ -401,12 +401,24 @@ func (r *Router) StreamWithRetry(ctx context.Context, route ResolvedRoute, req R
 				continue
 			}
 
+			maxRetries := maxRetriesPerRoute
 			baseTimeout := defaultProviderTimeout
+			if r.cfg != nil && r.cfg.Current() != nil {
+				g := r.cfg.Current().Global
+				if g.MaxSteps > 0 || g.MaxConcurrency > 0 || g.DefaultProvider != "" {
+					if g.LLMMaxRetries >= 0 && g.LLMMaxRetries <= 5 {
+						maxRetries = g.LLMMaxRetries
+					}
+					if g.LLMTimeoutSec >= 15 && g.LLMTimeoutSec <= 600 {
+						baseTimeout = time.Duration(g.LLMTimeoutSec) * time.Second
+					}
+				}
+			}
 			if resolvedProv.TimeoutSec > 0 {
 				baseTimeout = time.Duration(resolvedProv.TimeoutSec) * time.Second
 			}
 
-			for retryIdx := 0; retryIdx <= maxRetriesPerRoute; retryIdx++ {
+			for retryIdx := 0; retryIdx <= maxRetries; retryIdx++ {
 				if ctx.Err() != nil {
 					emitEvent(ctx, out, StreamEvent{
 						Type:    StreamError,
@@ -455,7 +467,7 @@ func (r *Router) StreamWithRetry(ctx context.Context, route ResolvedRoute, req R
 				}
 
 				scrubbedErr := r.scrubWithSecrets(attemptErr, gatheredSecrets...)
-				canRetrySameRoute := retryIdx < maxRetriesPerRoute && isRetryableError(attemptErr)
+				canRetrySameRoute := retryIdx < maxRetries && isRetryableError(attemptErr)
 
 				if canRetrySameRoute {
 					if emittedPartial {

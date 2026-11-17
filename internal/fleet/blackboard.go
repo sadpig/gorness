@@ -1035,7 +1035,7 @@ type Witness struct {
 func NewWitness(opts WitnessOptions) *Witness {
 	stall := opts.StallTimeout
 	if stall <= 0 {
-		stall = 90 * time.Second
+		stall = 180 * time.Second
 	}
 	interval := opts.CheckInterval
 	if interval <= 0 {
