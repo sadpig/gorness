@@ -932,7 +932,7 @@ func TestEndToEndMultiProjectSessionFleetAndAlwaysOnAPI(t *testing.T) {
 	deadline := time.Now().Add(5 * time.Second)
 	processed := false
 	for time.Now().Before(deadline) {
-		stResp, gErr := client.Get(ts.URL + "/api/alwayson/state")
+		stResp, gErr := client.Get(ts.URL + "/api/alwayson")
 		if gErr == nil {
 			var st alwayson.AlwaysOnState
 			_ = json.NewDecoder(stResp.Body).Decode(&st)
@@ -1510,12 +1510,12 @@ func TestZeroTypingConfigMatrixRulesMCPAndWorkspaceSuggestions(t *testing.T) {
 	}
 
 	// 1. Verify /api/config/rules updates rules.toml via structured click-toggle arrays.
-	stRules, rawRules := doJSON(http.MethodPost, "/api/config/rules", map[string]any{
+	stRules, rawRules := doJSON(http.MethodPut, "/api/config/rules", map[string]any{
 		"allowed_domains": []string{"api.anthropic.com", "api.deepseek.com", "github.com"},
 		"allow_commands":  []string{"go test*", "npm test*"},
 	})
 	if stRules != http.StatusOK {
-		t.Fatalf("POST /api/config/rules status=%d: %s", stRules, string(rawRules))
+		t.Fatalf("PUT /api/config/rules status=%d: %s", stRules, string(rawRules))
 	}
 	var snapAfterRules config.Snapshot
 	if err := json.Unmarshal(rawRules, &snapAfterRules); err != nil {

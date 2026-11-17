@@ -1,7 +1,6 @@
 package server
 
 import (
-	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -48,6 +47,7 @@ type Server struct {
 	cfg               *config.Manager
 	engine            *core.Engine
 	alwaysOn          *alwayson.Service
+	fallbackMemory    *alwayson.MemoryStore
 	fleet             *fleet.Manager
 	previews          *PreviewStore
 	opener            *ExternalOpener
@@ -55,8 +55,9 @@ type Server struct {
 	heartbeatInterval time.Duration
 	version           string
 
-	configMu sync.Mutex
-	lastDiag atomic.Pointer[config.ReloadDiagnostic]
+	configMu    sync.Mutex
+	lastDiag    atomic.Pointer[config.ReloadDiagnostic]
+	reloadUnsub func()
 
 	bgCtx    context.Context
 	bgCancel context.CancelFunc
@@ -74,7 +75,7 @@ func NewServer(deps Deps) *Server {
 	}
 	ver := strings.TrimSpace(deps.Version)
 	if ver == "" {
-		ver = "1.0.0"
+		ver = config.Version
 	}
 
 	var paths config.VaultPaths
@@ -85,14 +86,20 @@ func NewServer(deps Deps) *Server {
 		paths = deps.Config.Paths()
 	}
 
+	var fallbackMem *alwayson.MemoryStore
+	if strings.TrimSpace(paths.Root) != "" {
+		fallbackMem = alwayson.NewMemoryStore(paths)
+	}
+
 	bgCtx, bgCancel := context.WithCancel(context.Background())
 
 	s := &Server{
 		cfg:               deps.Config,
 		engine:            deps.Engine,
 		alwaysOn:          deps.AlwaysOn,
+		fallbackMemory:    fallbackMem,
 		fleet:             deps.Fleet,
-		previews:          NewPreviewStore(nowFn),
+		previews:          NewPersistentPreviewStore(paths, nowFn),
 		opener:            NewExternalOpener(paths, deps.Opener),
 		now:               nowFn,
 		heartbeatInterval: hb,
@@ -102,8 +109,20 @@ func NewServer(deps Deps) *Server {
 	}
 
 	if s.cfg != nil {
+		s.reloadUnsub = s.cfg.OnReload(func(snap *config.Snapshot) {
+			s.lastDiag.Store(nil)
+			if s.engine != nil {
+				s.engine.PublishSystemEvent(core.EventConfigReloaded, map[string]any{
+					"snapshot":  sanitizeConfigSnapshot(snap),
+					"timestamp": s.now().UTC(),
+				})
+			}
+		})
 		_ = s.cfg.Watch(bgCtx, func(_ *config.Snapshot, diag *config.ReloadDiagnostic) {
 			s.lastDiag.Store(diag)
+			if diag != nil && s.engine != nil {
+				s.engine.PublishSystemEvent(core.EventConfigDiagnostic, diag)
+			}
 		})
 	}
 
@@ -120,8 +139,13 @@ func (s *Server) Previews() *PreviewStore {
 }
 
 func (s *Server) Close() error {
-	if s != nil && s.bgCancel != nil {
-		s.bgCancel()
+	if s != nil {
+		if s.reloadUnsub != nil {
+			s.reloadUnsub()
+		}
+		if s.bgCancel != nil {
+			s.bgCancel()
+		}
 	}
 	return nil
 }
@@ -136,19 +160,30 @@ func (s *Server) buildMux() http.Handler {
 
 	// Config & Live ~/.gorness/ TOML/MD Studio
 	mux.HandleFunc("GET /api/config", s.handleGetConfig)
-	mux.HandleFunc("POST /api/config/global", s.handleUpdateGlobalConfig)
 	mux.HandleFunc("PUT /api/config/global", s.handleUpdateGlobalConfig)
 	mux.HandleFunc("POST /api/config/providers", s.handleUpsertProvider)
 	mux.HandleFunc("DELETE /api/config/providers/{id}", s.handleDeleteProvider)
 	mux.HandleFunc("POST /api/config/agents", s.handleUpsertAgent)
+	mux.HandleFunc("DELETE /api/config/agents/{id}", s.handleDeleteAgent)
 	mux.HandleFunc("POST /api/config/workflows", s.handleUpsertWorkflow)
-	mux.HandleFunc("POST /api/config/rules", s.handleUpsertRules)
+	mux.HandleFunc("DELETE /api/config/workflows/{id}", s.handleDeleteWorkflow)
 	mux.HandleFunc("PUT /api/config/rules", s.handleUpsertRules)
 	mux.HandleFunc("POST /api/config/mcp", s.handleUpsertMCP)
-	mux.HandleFunc("PUT /api/config/mcp", s.handleUpsertMCP)
 	mux.HandleFunc("DELETE /api/config/mcp/{id}", s.handleDeleteMCP)
+	mux.HandleFunc("POST /api/config/secrets", s.handleSetSecret)
+	mux.HandleFunc("DELETE /api/config/secrets/{key}", s.handleDeleteSecret)
 	mux.HandleFunc("GET /api/config/files", s.handleGetConfigFiles)
 	mux.HandleFunc("PUT /api/config/files", s.handleSaveConfigFile)
+
+	// 4-Layer Pointer Memory & Candidate Skills
+	mux.HandleFunc("GET /api/memory", s.handleGetMemory)
+	mux.HandleFunc("PUT /api/memory/layer", s.handleUpdateMemoryLayer)
+	mux.HandleFunc("GET /api/memory/notes/{slug}", s.handleGetMemoryNote)
+	mux.HandleFunc("PUT /api/memory/notes/{slug}", s.handleSaveMemoryNote)
+	mux.HandleFunc("DELETE /api/memory/notes/{slug}", s.handleDeleteMemoryNote)
+	mux.HandleFunc("GET /api/skills/candidates", s.handleListSkillCandidates)
+	mux.HandleFunc("POST /api/skills/candidates/{slug}/promote", s.handlePromoteSkillCandidate)
+	mux.HandleFunc("DELETE /api/skills/candidates/{slug}", s.handleDeleteSkillCandidate)
 
 	// Workspaces
 	mux.HandleFunc("GET /api/workspaces", s.handleListWorkspaces)
@@ -157,11 +192,17 @@ func (s *Server) buildMux() http.Handler {
 	mux.HandleFunc("POST /api/workspaces/pick-folder", s.handlePickWorkspaceFolder)
 	mux.HandleFunc("GET /api/workspaces/{wsID}", s.handleGetWorkspace)
 	mux.HandleFunc("PATCH /api/workspaces/{wsID}", s.handleUpdateWorkspace)
-	mux.HandleFunc("PUT /api/workspaces/{wsID}", s.handleUpdateWorkspace)
+	mux.HandleFunc("POST /api/workspaces/{wsID}/trust", s.handleTrustWorkspace)
+	mux.HandleFunc("GET /api/workspaces/{wsID}/grants", s.handleListWorkspaceGrants)
+	mux.HandleFunc("DELETE /api/workspaces/{wsID}/grants", s.handleDeleteWorkspaceGrants)
 	mux.HandleFunc("GET /api/workspaces/{wsID}/files", s.handleListWorkspaceFiles)
 	mux.HandleFunc("GET /api/workspaces/{wsID}/file", s.handleReadWorkspaceFile)
 	mux.HandleFunc("GET /api/workspaces/{wsID}/skills", s.handleListWorkspaceSkills)
 	mux.HandleFunc("GET /api/workspaces/{wsID}/artifacts", s.handleListWorkspaceArtifacts)
+	mux.HandleFunc("GET /api/workspaces/{wsID}/memory/progress", s.handleListWorkspaceProgress)
+	mux.HandleFunc("GET /api/workspaces/{wsID}/memory/progress/{slug}", s.handleGetWorkspaceProgress)
+	mux.HandleFunc("PUT /api/workspaces/{wsID}/memory/progress/{slug}", s.handleSaveWorkspaceProgress)
+	mux.HandleFunc("DELETE /api/workspaces/{wsID}/memory/progress/{slug}", s.handleDeleteWorkspaceProgress)
 
 	// Sessions
 	mux.HandleFunc("GET /api/sessions", s.handleListSessions)
@@ -169,18 +210,20 @@ func (s *Server) buildMux() http.Handler {
 	mux.HandleFunc("GET /api/sessions/search", s.handleSearchSessions)
 	mux.HandleFunc("GET /api/sessions/{id}", s.handleGetSession)
 	mux.HandleFunc("PATCH /api/sessions/{id}", s.handleUpdateSession)
-	mux.HandleFunc("PUT /api/sessions/{id}", s.handleUpdateSession)
 	mux.HandleFunc("DELETE /api/sessions/{id}", s.handleDeleteSession)
 	mux.HandleFunc("POST /api/sessions/{id}/fork", s.handleForkSession)
 	mux.HandleFunc("POST /api/sessions/{id}/rewind", s.handleRewindSession)
 	mux.HandleFunc("POST /api/sessions/{id}/compact", s.handleCompactSession)
 	mux.HandleFunc("POST /api/sessions/{id}/move", s.handleMoveSession)
-	mux.HandleFunc("GET /api/sessions/{id}/export", s.handleExportSession)
+	mux.HandleFunc("GET /api/sessions/{id}/diff", s.handleDiffSession)
+	mux.HandleFunc("POST /api/sessions/{id}/land", s.handleLandSession)
+	mux.HandleFunc("GET /api/sessions/{id}/export", s.handleDownloadSessionExport)
 	mux.HandleFunc("POST /api/sessions/{id}/export", s.handleExportSession)
 
 	// Runs & Approvals
 	mux.HandleFunc("GET /api/runs", s.handleListActiveRuns)
 	mux.HandleFunc("POST /api/runs/stream", s.handleStartRunStream)
+	mux.HandleFunc("GET /api/runs/{id}/stream", s.handleAttachRunStream)
 	mux.HandleFunc("POST /api/runs/{id}/steer", s.handleSteerRun)
 	mux.HandleFunc("POST /api/runs/{id}/stop", s.handleStopRun)
 	mux.HandleFunc("GET /api/approvals", s.handleListApprovals)
@@ -188,25 +231,27 @@ func (s *Server) buildMux() http.Handler {
 
 	// Always-On Sleep-Wake Primitives
 	mux.HandleFunc("GET /api/alwayson", s.handleAlwaysOnState)
-	mux.HandleFunc("GET /api/alwayson/state", s.handleAlwaysOnState)
 	mux.HandleFunc("POST /api/alwayson/webhook/{source}", s.handleAlwaysOnWebhook)
 	mux.HandleFunc("GET /api/alwayson/timers", s.handleListTimers)
 	mux.HandleFunc("POST /api/alwayson/timers", s.handleCreateTimer)
+	mux.HandleFunc("PATCH /api/alwayson/timers/{id}", s.handleUpdateTimer)
+	mux.HandleFunc("DELETE /api/alwayson/timers/{id}", s.handleDeleteTimer)
+	mux.HandleFunc("POST /api/alwayson/timers/{id}/trigger", s.handleTriggerTimer)
 	mux.HandleFunc("POST /api/alwayson/timers/tick", s.handleTickTimers)
 	mux.HandleFunc("GET /api/alwayson/deferred", s.handleListDeferred)
 	mux.HandleFunc("POST /api/alwayson/deferred/{id}/resolve", s.handleResolveDeferred)
 	mux.HandleFunc("GET /api/alwayson/outbox", s.handleListOutbox)
+	mux.HandleFunc("POST /api/alwayson/outbox/ack", s.handleAckOutbox)
 	mux.HandleFunc("POST /api/alwayson/dream", s.handleRunDream)
 
 	// Visual Multi-Agent Fleet Orchestration
 	mux.HandleFunc("GET /api/fleet/missions", s.handleListMissions)
 	mux.HandleFunc("POST /api/fleet/missions", s.handleStartMission)
 	mux.HandleFunc("GET /api/fleet/missions/{id}", s.handleGetMission)
+	mux.HandleFunc("DELETE /api/fleet/missions/{id}", s.handleDeleteMission)
 	mux.HandleFunc("GET /api/fleet/missions/{id}/stream", s.handleStreamMission)
 	mux.HandleFunc("GET /api/fleet/missions/{id}/nodes/{nodeID}/diff", s.handleInspectNodeDiff)
-	mux.HandleFunc("GET /api/fleet/missions/{id}/diff", s.handleInspectNodeDiffQuery)
 	mux.HandleFunc("POST /api/fleet/missions/{id}/nodes/{nodeID}/steer", s.handleSteerNode)
-	mux.HandleFunc("POST /api/fleet/missions/{id}/steer", s.handleSteerNodeBody)
 	mux.HandleFunc("POST /api/fleet/missions/{id}/stop", s.handleStopMission)
 
 	// Safe Copy-Open & Isolated HTML Artifact Previews
@@ -328,6 +373,7 @@ func (s *Server) handleBootstrap(w http.ResponseWriter, _ *http.Request) {
 		"active_runs":       activeRuns,
 		"pending_approvals": approvals,
 		"alwayson":          aoState,
+		"skill_candidates":  s.listSkillCandidatesSnapshot(),
 		"missions":          missions,
 		"previews":          s.previews.List(""),
 	})
@@ -412,8 +458,18 @@ func (s *Server) handleUpdateGlobalConfig(w http.ResponseWriter, r *http.Request
 	cur := s.cfg.Current().Global
 	if v, ok := patch["theme"].(string); ok && strings.TrimSpace(v) != "" {
 		cur.Theme = strings.TrimSpace(v)
+		cur.UITheme = strings.TrimSpace(v)
+	}
+	if v, ok := patch["ui_theme"].(string); ok && strings.TrimSpace(v) != "" {
+		cur.UITheme = strings.TrimSpace(v)
+		cur.Theme = strings.TrimSpace(v)
 	}
 	if v, ok := patch["language"].(string); ok && strings.TrimSpace(v) != "" {
+		cur.Language = strings.TrimSpace(v)
+		cur.UILang = strings.TrimSpace(v)
+	}
+	if v, ok := patch["ui_lang"].(string); ok && strings.TrimSpace(v) != "" {
+		cur.UILang = strings.TrimSpace(v)
 		cur.Language = strings.TrimSpace(v)
 	}
 	if v, ok := patch["default_provider"].(string); ok && strings.TrimSpace(v) != "" {
@@ -452,6 +508,10 @@ func (s *Server) handleUpdateGlobalConfig(w http.ResponseWriter, r *http.Request
 		writeJSONError(w, http.StatusBadRequest, fmt.Sprintf("marshal config.toml: %v", err))
 		return
 	}
+	if _, err := s.cfg.ValidateCandidate(map[string][]byte{"config.toml": encoded}); err != nil {
+		writeJSONError(w, http.StatusBadRequest, err.Error())
+		return
+	}
 	if err := store.AtomicWriteFile(s.cfg.Paths().ConfigFile(), encoded, 0o600); err != nil {
 		writeJSONError(w, http.StatusInternalServerError, err.Error())
 		return
@@ -487,7 +547,7 @@ func (s *Server) handleUpsertProvider(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	provID := strings.TrimSpace(patch.ID)
-	if err := fleet.ValidateID(provID); err != nil {
+	if err := store.ValidateSafeID(provID); err != nil {
 		writeJSONError(w, http.StatusBadRequest, fmt.Sprintf("invalid provider id: %v", err))
 		return
 	}
@@ -589,6 +649,10 @@ func (s *Server) handleUpsertProvider(w http.ResponseWriter, r *http.Request) {
 		writeJSONError(w, http.StatusBadRequest, fmt.Sprintf("marshal providers.toml: %v", err))
 		return
 	}
+	if _, err := s.cfg.ValidateCandidate(map[string][]byte{"providers.toml": encoded}); err != nil {
+		writeJSONError(w, http.StatusBadRequest, err.Error())
+		return
+	}
 	if err := store.AtomicWriteFile(s.cfg.Paths().ProvidersFile(), encoded, 0o600); err != nil {
 		writeJSONError(w, http.StatusInternalServerError, err.Error())
 		return
@@ -642,7 +706,7 @@ func (s *Server) handleUpsertAgent(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	agentID := strings.TrimSpace(patch.ID)
-	if err := fleet.ValidateID(agentID); err != nil {
+	if err := store.ValidateSafeID(agentID); err != nil {
 		writeJSONError(w, http.StatusBadRequest, fmt.Sprintf("invalid agent id: %v", err))
 		return
 	}
@@ -743,6 +807,10 @@ func (s *Server) handleUpsertAgent(w http.ResponseWriter, r *http.Request) {
 	doc.WriteByte('\n')
 
 	targetPath := filepath.Join(s.cfg.Paths().AgentsDir(), agentID+".md")
+	if _, err := s.cfg.ValidateCandidate(map[string][]byte{"agents/" + agentID + ".md": doc.Bytes()}); err != nil {
+		writeJSONError(w, http.StatusBadRequest, err.Error())
+		return
+	}
 	if err := store.AtomicWriteFile(targetPath, doc.Bytes(), 0o600); err != nil {
 		writeJSONError(w, http.StatusInternalServerError, err.Error())
 		return
@@ -767,7 +835,7 @@ func (s *Server) handleUpsertWorkflow(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	wfID := strings.TrimSpace(in.ID)
-	if err := fleet.ValidateID(wfID); err != nil {
+	if err := store.ValidateSafeID(wfID); err != nil {
 		writeJSONError(w, http.StatusBadRequest, fmt.Sprintf("invalid workflow id: %v", err))
 		return
 	}
@@ -792,6 +860,10 @@ func (s *Server) handleUpsertWorkflow(w http.ResponseWriter, r *http.Request) {
 		writeJSONError(w, http.StatusBadRequest, fmt.Sprintf("marshal workflow: %v", err))
 		return
 	}
+	if _, err := s.cfg.ValidateCandidate(map[string][]byte{"workflows/" + wfID + ".toml": encoded}); err != nil {
+		writeJSONError(w, http.StatusBadRequest, err.Error())
+		return
+	}
 	targetPath := filepath.Join(s.cfg.Paths().WorkflowsDir(), wfID+".toml")
 	if err := store.AtomicWriteFile(targetPath, encoded, 0o600); err != nil {
 		writeJSONError(w, http.StatusInternalServerError, err.Error())
@@ -812,7 +884,7 @@ func (s *Server) handleDeleteProvider(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	provID := strings.TrimSpace(r.PathValue("id"))
-	if err := fleet.ValidateID(provID); err != nil {
+	if err := store.ValidateSafeID(provID); err != nil {
 		writeJSONError(w, http.StatusBadRequest, fmt.Sprintf("invalid provider id: %v", err))
 		return
 	}
@@ -835,6 +907,10 @@ func (s *Server) handleDeleteProvider(w http.ResponseWriter, r *http.Request) {
 	encoded, err := toml.Marshal(doc)
 	if err != nil {
 		writeJSONError(w, http.StatusBadRequest, fmt.Sprintf("marshal providers.toml: %v", err))
+		return
+	}
+	if _, err := s.cfg.ValidateCandidate(map[string][]byte{"providers.toml": encoded}); err != nil {
+		writeJSONError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	if err := store.AtomicWriteFile(s.cfg.Paths().ProvidersFile(), encoded, 0o600); err != nil {
@@ -920,6 +996,10 @@ func (s *Server) handleUpsertRules(w http.ResponseWriter, r *http.Request) {
 		writeJSONError(w, http.StatusBadRequest, fmt.Sprintf("marshal rules.toml: %v", err))
 		return
 	}
+	if _, err := s.cfg.ValidateCandidate(map[string][]byte{"rules.toml": encoded}); err != nil {
+		writeJSONError(w, http.StatusBadRequest, err.Error())
+		return
+	}
 	if err := store.AtomicWriteFile(s.cfg.Paths().RulesFile(), encoded, 0o600); err != nil {
 		writeJSONError(w, http.StatusInternalServerError, err.Error())
 		return
@@ -956,7 +1036,7 @@ func (s *Server) handleUpsertMCP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	srvID := strings.TrimSpace(patch.ID)
-	if err := fleet.ValidateID(srvID); err != nil {
+	if err := store.ValidateSafeID(srvID); err != nil {
 		writeJSONError(w, http.StatusBadRequest, fmt.Sprintf("invalid mcp server id: %v", err))
 		return
 	}
@@ -1040,6 +1120,10 @@ func (s *Server) handleUpsertMCP(w http.ResponseWriter, r *http.Request) {
 		writeJSONError(w, http.StatusBadRequest, fmt.Sprintf("marshal mcp.toml: %v", err))
 		return
 	}
+	if _, err := s.cfg.ValidateCandidate(map[string][]byte{"mcp.toml": encoded}); err != nil {
+		writeJSONError(w, http.StatusBadRequest, err.Error())
+		return
+	}
 	if err := store.AtomicWriteFile(s.cfg.Paths().MCPFile(), encoded, 0o600); err != nil {
 		writeJSONError(w, http.StatusInternalServerError, err.Error())
 		return
@@ -1059,7 +1143,7 @@ func (s *Server) handleDeleteMCP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	srvID := strings.TrimSpace(r.PathValue("id"))
-	if err := fleet.ValidateID(srvID); err != nil {
+	if err := store.ValidateSafeID(srvID); err != nil {
 		writeJSONError(w, http.StatusBadRequest, fmt.Sprintf("invalid mcp server id: %v", err))
 		return
 	}
@@ -1077,6 +1161,10 @@ func (s *Server) handleDeleteMCP(w http.ResponseWriter, r *http.Request) {
 	encoded, err := toml.Marshal(doc)
 	if err != nil {
 		writeJSONError(w, http.StatusBadRequest, fmt.Sprintf("marshal mcp.toml: %v", err))
+		return
+	}
+	if _, err := s.cfg.ValidateCandidate(map[string][]byte{"mcp.toml": encoded}); err != nil {
+		writeJSONError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	if err := store.AtomicWriteFile(s.cfg.Paths().MCPFile(), encoded, 0o600); err != nil {
@@ -1097,7 +1185,7 @@ func (s *Server) handleGetConfigFiles(w http.ResponseWriter, r *http.Request) {
 		writeJSONError(w, http.StatusServiceUnavailable, "config manager unavailable")
 		return
 	}
-	rel := strings.TrimSpace(r.URL.Query().Get("rel"))
+	rel := firstNonEmptyStr(r.URL.Query().Get("rel"), r.URL.Query().Get("rel_path"), r.URL.Query().Get("path"))
 	if rel == "" {
 		writeJSON(w, http.StatusOK, map[string]any{
 			"files": s.listVaultConfigRelPaths(),
@@ -1120,7 +1208,8 @@ func (s *Server) handleGetConfigFiles(w http.ResponseWriter, r *http.Request) {
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"rel_path": normRel,
-		"content":  string(raw),
+		"path":     normRel,
+		"content":  s.sanitizeRawConfigFileContent(string(raw)),
 	})
 }
 
@@ -1131,13 +1220,14 @@ func (s *Server) handleSaveConfigFile(w http.ResponseWriter, r *http.Request) {
 	}
 	var in struct {
 		RelPath string `json:"rel_path"`
+		Path    string `json:"path"`
 		Content string `json:"content"`
 	}
 	if err := decodeJSONBody(r, &in); err != nil {
 		writeJSONError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	absPath, normRel, err := s.resolveEditableVaultFile(in.RelPath)
+	absPath, normRel, err := s.resolveEditableVaultFile(firstNonEmptyStr(in.RelPath, in.Path))
 	if err != nil {
 		writeJSONError(w, http.StatusBadRequest, err.Error())
 		return
@@ -1171,6 +1261,21 @@ func (s *Server) handleSaveConfigFile(w http.ResponseWriter, r *http.Request) {
 	s.configMu.Lock()
 	defer s.configMu.Unlock()
 
+	if existingRaw, err := os.ReadFile(absPath); err == nil && len(existingRaw) > 0 {
+		rawBytes = s.restoreRedactedConfigFileContent(normRel, existingRaw, rawBytes)
+	}
+
+	if _, err := s.cfg.ValidateCandidate(map[string][]byte{normRel: rawBytes}); err != nil {
+		diag := &config.ReloadDiagnostic{
+			File:      absPath,
+			Message:   err.Error(),
+			Timestamp: s.now().UTC(),
+		}
+		s.lastDiag.Store(diag)
+		writeJSONError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
 	if err := store.AtomicWriteFile(absPath, rawBytes, 0o600); err != nil {
 		writeJSONError(w, http.StatusInternalServerError, err.Error())
 		return
@@ -1200,6 +1305,9 @@ func (s *Server) listVaultConfigRelPaths() []string {
 	}
 	paths := s.cfg.Paths()
 	out := []string{"config.toml", "providers.toml", "rules.toml", "mcp.toml"}
+	if st, err := os.Lstat(paths.HooksFile()); err == nil && st.Mode()&os.ModeSymlink == 0 && st.Mode().IsRegular() {
+		out = append(out, "hooks.toml")
+	}
 
 	appendDir := func(subDir, ext string) {
 		entries, err := os.ReadDir(filepath.Join(paths.Root, subDir))
@@ -1225,7 +1333,7 @@ func (s *Server) listVaultConfigRelPaths() []string {
 			if !ent.IsDir() || ent.Type()&os.ModeSymlink != 0 || ent.Name() == "_candidates" {
 				continue
 			}
-			if fleet.ValidateID(ent.Name()) != nil {
+			if store.ValidateSafeID(ent.Name()) != nil {
 				continue
 			}
 			skillMD := filepath.Join(paths.Root, subDir, ent.Name(), "SKILL.md")
@@ -1260,19 +1368,19 @@ func (s *Server) resolveEditableVaultFile(rel string) (absPath, normRel string, 
 
 	allowed := false
 	switch cleaned {
-	case "config.toml", "providers.toml", "rules.toml", "mcp.toml":
+	case "config.toml", "providers.toml", "rules.toml", "mcp.toml", "hooks.toml":
 		allowed = true
 	default:
 		parts := strings.Split(cleaned, "/")
-		if len(parts) == 2 && (parts[0] == "agents" || parts[0] == "memory") && ext == ".md" && fleet.ValidateID(strings.TrimSuffix(parts[1], ".md")) == nil {
+		if len(parts) == 2 && (parts[0] == "agents" || parts[0] == "memory") && ext == ".md" && store.ValidateSafeID(strings.TrimSuffix(parts[1], ".md")) == nil {
 			allowed = true
-		} else if len(parts) == 2 && parts[0] == "workflows" && ext == ".toml" && fleet.ValidateID(strings.TrimSuffix(parts[1], ".toml")) == nil {
+		} else if len(parts) == 2 && parts[0] == "workflows" && ext == ".toml" && store.ValidateSafeID(strings.TrimSuffix(parts[1], ".toml")) == nil {
 			allowed = true
-		} else if len(parts) == 3 && parts[0] == "memory" && parts[1] == "notes" && ext == ".md" && fleet.ValidateID(strings.TrimSuffix(parts[2], ".md")) == nil {
+		} else if len(parts) == 3 && parts[0] == "memory" && parts[1] == "notes" && ext == ".md" && store.ValidateSafeID(strings.TrimSuffix(parts[2], ".md")) == nil {
 			allowed = true
-		} else if len(parts) == 3 && parts[0] == "skills" && parts[1] != "_candidates" && parts[2] == "SKILL.md" && fleet.ValidateID(parts[1]) == nil {
+		} else if len(parts) == 3 && parts[0] == "skills" && parts[1] != "_candidates" && parts[2] == "SKILL.md" && store.ValidateSafeID(parts[1]) == nil {
 			allowed = true
-		} else if len(parts) == 4 && parts[0] == "skills" && parts[1] == "_candidates" && parts[3] == "SKILL.md" && fleet.ValidateID(parts[2]) == nil {
+		} else if len(parts) == 4 && parts[0] == "skills" && parts[1] == "_candidates" && parts[3] == "SKILL.md" && store.ValidateSafeID(parts[2]) == nil {
 			allowed = true
 		}
 	}
@@ -1647,11 +1755,40 @@ func (s *Server) handleListWorkspaceArtifacts(w http.ResponseWriter, r *http.Req
 		return
 	}
 	var items []map[string]any
+	seenFiles := make(map[string]bool)
+	if s.engine != nil && s.engine.Artifacts() != nil {
+		if list, err := s.engine.Artifacts().List(wsID); err == nil {
+			for _, art := range list {
+				seenFiles[art.FileName] = true
+				entry := map[string]any{
+					"id":           art.ID,
+					"name":         art.FileName,
+					"title":        art.Title,
+					"path":         art.Path,
+					"kind":         art.Format,
+					"format":       art.Format,
+					"size_bytes":   art.SizeBytes,
+					"session_id":   art.SessionID,
+					"workspace_id": art.WorkspaceID,
+					"created_at":   art.CreatedAt,
+					"updated_at":   art.UpdatedAt,
+				}
+				if art.Format == "html" {
+					if raw, rErr := os.ReadFile(art.Path); rErr == nil {
+						pv := s.previews.Register(wsID, firstNonEmptyStr(art.Title, art.FileName), string(raw), art.Path)
+						entry["preview_token"] = pv.Token
+						entry["preview_url"] = pv.URL
+					}
+				}
+				items = append(items, entry)
+			}
+		}
+	}
 	if s.cfg != nil {
 		artDir := filepath.Join(s.cfg.Paths().WorkspacesDir(), wsID, "artifacts")
 		if entries, err := os.ReadDir(artDir); err == nil {
 			for _, ent := range entries {
-				if ent.IsDir() {
+				if ent.IsDir() || seenFiles[ent.Name()] {
 					continue
 				}
 				ext := strings.ToLower(filepath.Ext(ent.Name()))
@@ -1722,9 +1859,8 @@ func (s *Server) handleCreateSession(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var wtPath string
-	if in.IsolateGit && s.cfg != nil {
-		pool := fleet.NewWorktreePool(s.cfg.Paths())
-		if pool.IsGitRepo(r.Context(), ws.RootPath) {
+	if in.IsolateGit {
+		if pool := s.worktreePool(); pool != nil && pool.IsGitRepo(r.Context(), ws.RootPath) {
 			if lease, lErr := pool.Acquire(r.Context(), ws.RootPath, "sessions", meta.ID, ""); lErr == nil {
 				wtPath = lease.Path
 			}
@@ -1771,7 +1907,7 @@ func (s *Server) handleGetSession(w http.ResponseWriter, r *http.Request) {
 		writeJSONError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	snaps := s.readSessionSnapshotRecords(id)
+	snaps := s.readSessionSnapshotRecords(meta.WorkspaceID, id)
 	writeJSON(w, http.StatusOK, map[string]any{
 		"meta":      meta,
 		"entries":   entries,
@@ -1779,33 +1915,15 @@ func (s *Server) handleGetSession(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-func (s *Server) readSessionSnapshotRecords(sessionID string) []store.FileSnapshotRecord {
-	if s.cfg == nil || fleet.ValidateID(sessionID) != nil {
-		return []store.FileSnapshotRecord{}
+func (s *Server) readSessionSnapshotRecords(wsID, sessionID string) []store.SnapshotRecord {
+	if s.engine == nil || s.engine.Snapshots() == nil {
+		return []store.SnapshotRecord{}
 	}
-	ledgerPath := filepath.Join(s.cfg.Paths().SnapshotsDir(), "ledgers", sessionID+".jsonl")
-	f, err := os.Open(ledgerPath)
-	if err != nil {
-		return []store.FileSnapshotRecord{}
+	records, err := s.engine.Snapshots().ListSessionRecords(wsID, sessionID)
+	if err != nil || records == nil {
+		return []store.SnapshotRecord{}
 	}
-	defer f.Close()
-
-	var out []store.FileSnapshotRecord
-	sc := bufio.NewScanner(f)
-	for sc.Scan() {
-		line := bytes.TrimSpace(sc.Bytes())
-		if len(line) == 0 {
-			continue
-		}
-		var rec store.FileSnapshotRecord
-		if json.Unmarshal(line, &rec) == nil {
-			out = append(out, rec)
-		}
-	}
-	if out == nil {
-		return []store.FileSnapshotRecord{}
-	}
-	return out
+	return records
 }
 
 func (s *Server) handleUpdateSession(w http.ResponseWriter, r *http.Request) {
@@ -1856,6 +1974,12 @@ func (s *Server) handleDeleteSession(w http.ResponseWriter, r *http.Request) {
 		writeJSONError(w, http.StatusNotFound, err.Error())
 		return
 	}
+	var in struct {
+		Force bool `json:"force"`
+	}
+	_ = decodeJSONBody(r, &in)
+	force := in.Force || strings.EqualFold(strings.TrimSpace(r.URL.Query().Get("force")), "true")
+
 	unlock, locked, err := store.TryFlock(s.engine.Sessions().RunLockPath(id))
 	if err != nil {
 		writeJSONError(w, http.StatusInternalServerError, err.Error())
@@ -1869,6 +1993,10 @@ func (s *Server) handleDeleteSession(w http.ResponseWriter, r *http.Request) {
 
 	if curMeta, gErr := s.engine.Sessions().GetMeta(id); gErr == nil && curMeta != nil {
 		meta = curMeta
+	}
+	if !force && s.isSessionWorktreeDirty(r.Context(), meta) {
+		writeJSONError(w, http.StatusConflict, "session has unmerged changes in isolated git worktree; land changes or pass force=true")
+		return
 	}
 	s.cleanupDeletedSessionWorktree(r.Context(), meta)
 
@@ -1906,18 +2034,20 @@ func (s *Server) cleanupDeletedSessionWorktree(ctx context.Context, meta *store.
 		}
 	}
 
-	pool := fleet.NewWorktreePool(s.cfg.Paths())
-	if rel, err := filepath.Rel(wtRoot, canonWT); err == nil {
-		segs := strings.Split(filepath.ToSlash(rel), "/")
-		if len(segs) == 2 && fleet.ValidateID(segs[0]) == nil && fleet.ValidateID(segs[1]) == nil {
-			_ = pool.Release(ctx, &fleet.WorktreeLease{
-				MissionID: segs[0],
-				NodeID:    segs[1],
-				RepoRoot:  repoRoot,
-				Path:      canonWT,
-				Branch:    fmt.Sprintf("gorness/fleet/%s/%s", segs[0], segs[1]),
-			}, segs[0] == "sessions")
-			return
+	pool := s.worktreePool()
+	if pool != nil {
+		if rel, err := filepath.Rel(wtRoot, canonWT); err == nil {
+			segs := strings.Split(filepath.ToSlash(rel), "/")
+			if len(segs) == 2 && store.ValidateSafeID(segs[0]) == nil && store.ValidateSafeID(segs[1]) == nil {
+				_ = pool.Release(ctx, &fleet.WorktreeLease{
+					MissionID: segs[0],
+					NodeID:    segs[1],
+					RepoRoot:  repoRoot,
+					Path:      canonWT,
+					Branch:    fmt.Sprintf("gorness/fleet/%s/%s", segs[0], segs[1]),
+				}, segs[0] == "sessions")
+				return
+			}
 		}
 	}
 	_ = os.RemoveAll(canonWT)
@@ -1931,8 +2061,9 @@ func (s *Server) handleForkSession(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var in struct {
-		AtSeq *uint64 `json:"at_seq"`
-		Title string  `json:"title"`
+		AtSeq      *uint64 `json:"at_seq"`
+		Title      string  `json:"title"`
+		IsolateGit bool    `json:"isolate_git"`
 	}
 	_ = decodeJSONBody(r, &in)
 
@@ -1944,6 +2075,29 @@ func (s *Server) handleForkSession(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		writeJSONError(w, http.StatusBadRequest, err.Error())
 		return
+	}
+
+	wantWorktree := strings.TrimSpace(meta.WorktreePath) != "" || in.IsolateGit
+	if wantWorktree {
+		var wtPath string
+		if pool := s.worktreePool(); pool != nil && s.engine != nil {
+			if ws, wErr := s.engine.Workspaces().Get(forked.WorkspaceID); wErr == nil && ws != nil && pool.IsGitRepo(r.Context(), ws.RootPath) {
+				baseBranch := ""
+				if strings.TrimSpace(meta.WorktreePath) != "" {
+					baseBranch = s.sessionWorktreeBranch(r.Context(), meta)
+				}
+				lease, lErr := pool.Acquire(r.Context(), ws.RootPath, "sessions", forked.ID, baseBranch)
+				if lErr != nil && baseBranch != "" {
+					lease, lErr = pool.Acquire(r.Context(), ws.RootPath, "sessions", forked.ID, "")
+				}
+				if lErr == nil && lease != nil {
+					wtPath = lease.Path
+				}
+			}
+		}
+		forked, _ = s.engine.Sessions().UpdateMeta(forked.ID, func(m *store.SessionMeta) {
+			m.WorktreePath = wtPath
+		})
 	}
 	writeJSON(w, http.StatusCreated, forked)
 }
@@ -2030,6 +2184,7 @@ func (s *Server) handleMoveSession(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	var in struct {
 		TargetWorkspaceID string `json:"target_workspace_id"`
+		Force             bool   `json:"force"`
 	}
 	if err := decodeJSONBody(r, &in); err != nil {
 		writeJSONError(w, http.StatusBadRequest, err.Error())
@@ -2050,6 +2205,23 @@ func (s *Server) handleMoveSession(w http.ResponseWriter, r *http.Request) {
 	}
 	defer unlock()
 
+	meta, err := s.engine.Sessions().GetMeta(id)
+	if err != nil {
+		writeJSONError(w, http.StatusNotFound, err.Error())
+		return
+	}
+	force := in.Force || strings.EqualFold(strings.TrimSpace(r.URL.Query().Get("force")), "true") || strings.TrimSpace(r.URL.Query().Get("force")) == "1"
+	if !force && s.isSessionWorktreeDirty(r.Context(), meta) {
+		writeJSONError(w, http.StatusConflict, "session has uncommitted or unmerged git worktree changes; land changes or pass force=true")
+		return
+	}
+	if strings.TrimSpace(meta.WorktreePath) != "" && meta.WorkspaceID != in.TargetWorkspaceID {
+		s.cleanupDeletedSessionWorktree(r.Context(), meta)
+		_, _ = s.engine.Sessions().UpdateMeta(id, func(m *store.SessionMeta) {
+			m.WorktreePath = ""
+		})
+	}
+
 	moved, err := s.engine.Sessions().MoveWorkspace(id, in.TargetWorkspaceID)
 	if err != nil {
 		writeJSONError(w, http.StatusBadRequest, err.Error())
@@ -2060,7 +2232,12 @@ func (s *Server) handleMoveSession(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleExportSession(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
-	format := strings.ToLower(strings.TrimSpace(r.URL.Query().Get("format")))
+	var in struct {
+		Format string `json:"format"`
+		Title  string `json:"title"`
+	}
+	_ = decodeJSONBody(r, &in)
+	format := strings.ToLower(firstNonEmptyStr(in.Format, r.URL.Query().Get("format")))
 	if format == "" {
 		format = "md"
 	}
@@ -2069,6 +2246,7 @@ func (s *Server) handleExportSession(w http.ResponseWriter, r *http.Request) {
 		writeJSONError(w, http.StatusNotFound, err.Error())
 		return
 	}
+	title := firstNonEmptyStr(in.Title, meta.Title, id)
 
 	switch format {
 	case "html":
@@ -2078,11 +2256,23 @@ func (s *Server) handleExportSession(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		var savedPath string
-		if s.cfg != nil {
+		if s.engine != nil && s.engine.Artifacts() != nil {
+			if saved, sErr := s.engine.Artifacts().Save(meta.WorkspaceID, store.Artifact{
+				ID:        id,
+				SessionID: id,
+				Title:     title,
+				Format:    "html",
+				FileName:  id + ".html",
+				Content:   doc,
+			}); sErr == nil {
+				savedPath = saved.Path
+			}
+		}
+		if savedPath == "" && s.cfg != nil {
 			savedPath = filepath.Join(s.cfg.Paths().WorkspacesDir(), meta.WorkspaceID, "artifacts", id+".html")
 			_ = store.AtomicWriteFile(savedPath, []byte(doc), 0o600)
 		}
-		pv := s.previews.Register(meta.WorkspaceID, meta.Title, doc, savedPath)
+		pv := s.previews.Register(meta.WorkspaceID, title, doc, savedPath)
 		writeJSON(w, http.StatusOK, map[string]any{
 			"format":        "html",
 			"content":       doc,
@@ -2097,7 +2287,19 @@ func (s *Server) handleExportSession(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		var savedPath string
-		if s.cfg != nil {
+		if s.engine != nil && s.engine.Artifacts() != nil {
+			if saved, sErr := s.engine.Artifacts().Save(meta.WorkspaceID, store.Artifact{
+				ID:        id,
+				SessionID: id,
+				Title:     title,
+				Format:    "md",
+				FileName:  id + ".md",
+				Content:   doc,
+			}); sErr == nil {
+				savedPath = saved.Path
+			}
+		}
+		if savedPath == "" && s.cfg != nil {
 			savedPath = filepath.Join(s.cfg.Paths().WorkspacesDir(), meta.WorkspaceID, "artifacts", id+".md")
 			_ = store.AtomicWriteFile(savedPath, []byte(doc), 0o600)
 		}
@@ -2239,11 +2441,30 @@ func (s *Server) handleResolveApproval(w http.ResponseWriter, r *http.Request) {
 // ============================================================================
 
 func (s *Server) handleAlwaysOnState(w http.ResponseWriter, _ *http.Request) {
-	if s.alwaysOn == nil {
-		writeJSON(w, http.StatusOK, alwayson.AlwaysOnState{})
-		return
+	var st alwayson.AlwaysOnState
+	if s.alwaysOn != nil {
+		st = s.alwaysOn.StateSnapshot()
 	}
-	writeJSON(w, http.StatusOK, s.alwaysOn.StateSnapshot())
+	if st.Inbox == nil {
+		st.Inbox = []alwayson.InboxEvent{}
+	}
+	if st.Timers == nil {
+		st.Timers = []alwayson.TimerEntry{}
+	}
+	if st.Deferred == nil {
+		st.Deferred = []alwayson.DeferredCard{}
+	}
+	if st.Outbox == nil {
+		st.Outbox = []alwayson.OutboxItem{}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"inbox":            st.Inbox,
+		"timers":           st.Timers,
+		"deferred":         st.Deferred,
+		"outbox":           st.Outbox,
+		"updated_at":       st.UpdatedAt,
+		"skill_candidates": s.listSkillCandidatesSnapshot(),
+	})
 }
 
 func (s *Server) handleAlwaysOnWebhook(w http.ResponseWriter, r *http.Request) {
@@ -2334,6 +2555,7 @@ func (s *Server) handleCreateTimer(w http.ResponseWriter, r *http.Request) {
 		ID           string `json:"id"`
 		WorkspaceID  string `json:"workspace_id"`
 		SessionID    string `json:"session_id"`
+		AgentRole    string `json:"agent_role"`
 		Kind         string `json:"kind"`
 		CronExpr     string `json:"cron_expr"`
 		AfterSeconds int    `json:"after_seconds"`
@@ -2353,6 +2575,7 @@ func (s *Server) handleCreateTimer(w http.ResponseWriter, r *http.Request) {
 			ID:          in.ID,
 			WorkspaceID: in.WorkspaceID,
 			SessionID:   in.SessionID,
+			AgentRole:   in.AgentRole,
 			Kind:        alwayson.TimerKindCron,
 			CronExpr:    in.CronExpr,
 			Note:        in.Note,
@@ -2414,14 +2637,23 @@ func (s *Server) handleResolveDeferred(w http.ResponseWriter, r *http.Request) {
 	}
 	id := r.PathValue("id")
 	var in struct {
+		Decision        string   `json:"decision"`
 		Approved        bool     `json:"approved"`
 		SelectedHunkIDs []string `json:"selected_hunk_ids"`
+		Remember        bool     `json:"remember"`
+		Feedback        string   `json:"feedback"`
 	}
 	if err := decodeJSONBody(r, &in); err != nil {
 		writeJSONError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	if err := s.alwaysOn.ResolveDeferred(id, in.Approved, in.SelectedHunkIDs); err != nil {
+	if err := s.alwaysOn.ResolveDeferredCard(id, alwayson.DeferredResolution{
+		Decision:        in.Decision,
+		Approved:        in.Approved,
+		SelectedHunkIDs: in.SelectedHunkIDs,
+		Remember:        in.Remember,
+		Feedback:        in.Feedback,
+	}); err != nil {
 		writeJSONError(w, http.StatusNotFound, err.Error())
 		return
 	}
@@ -2654,16 +2886,6 @@ func (s *Server) handleStreamMission(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleInspectNodeDiff(w http.ResponseWriter, r *http.Request) {
 	missionID := r.PathValue("id")
 	nodeID := r.PathValue("nodeID")
-	s.serveNodeDiff(w, r, missionID, nodeID)
-}
-
-func (s *Server) handleInspectNodeDiffQuery(w http.ResponseWriter, r *http.Request) {
-	missionID := r.PathValue("id")
-	nodeID := strings.TrimSpace(r.URL.Query().Get("node_id"))
-	s.serveNodeDiff(w, r, missionID, nodeID)
-}
-
-func (s *Server) serveNodeDiff(w http.ResponseWriter, r *http.Request, missionID, nodeID string) {
 	wsID, err := s.resolveMissionWorkspace(r.URL.Query().Get("workspace_id"), missionID)
 	if err != nil {
 		writeJSONError(w, http.StatusNotFound, err.Error())
@@ -2685,32 +2907,7 @@ func (s *Server) handleSteerNode(w http.ResponseWriter, r *http.Request) {
 	missionID := r.PathValue("id")
 	nodeID := r.PathValue("nodeID")
 	var in struct {
-		WarehouseID string `json:"workspace_id"`
-		Instruction string `json:"instruction"`
-		Message     string `json:"message"`
-	}
-	if err := decodeJSONBody(r, &in); err != nil {
-		writeJSONError(w, http.StatusBadRequest, err.Error())
-		return
-	}
-	wsID, err := s.resolveMissionWorkspace(firstNonEmptyStr(in.WarehouseID, r.URL.Query().Get("workspace_id")), missionID)
-	if err != nil {
-		writeJSONError(w, http.StatusNotFound, err.Error())
-		return
-	}
-	msg := firstNonEmptyStr(in.Instruction, in.Message)
-	if err := s.fleet.SteerNode(wsID, missionID, nodeID, msg); err != nil {
-		writeJSONError(w, http.StatusBadRequest, err.Error())
-		return
-	}
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "mission_id": missionID, "node_id": nodeID})
-}
-
-func (s *Server) handleSteerNodeBody(w http.ResponseWriter, r *http.Request) {
-	missionID := r.PathValue("id")
-	var in struct {
 		WorkspaceID string `json:"workspace_id"`
-		NodeID      string `json:"node_id"`
 		Instruction string `json:"instruction"`
 		Message     string `json:"message"`
 	}
@@ -2724,11 +2921,15 @@ func (s *Server) handleSteerNodeBody(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	msg := firstNonEmptyStr(in.Instruction, in.Message)
-	if err := s.fleet.SteerNode(wsID, missionID, in.NodeID, msg); err != nil {
+	if msg == "" {
+		writeJSONError(w, http.StatusBadRequest, "steer instruction is required")
+		return
+	}
+	if err := s.fleet.SteerNode(wsID, missionID, nodeID, msg); err != nil {
 		writeJSONError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "mission_id": missionID, "node_id": in.NodeID})
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "mission_id": missionID, "node_id": nodeID})
 }
 
 func (s *Server) handleStopMission(w http.ResponseWriter, r *http.Request) {
@@ -2802,11 +3003,24 @@ func (s *Server) handleCreatePreview(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var savedPath string
-	if strings.TrimSpace(in.WorkspaceID) != "" && strings.TrimSpace(in.SaveName) != "" && s.cfg != nil {
+	if strings.TrimSpace(in.WorkspaceID) != "" && strings.TrimSpace(in.SaveName) != "" {
 		if _, err := s.engine.Workspaces().Get(in.WorkspaceID); err == nil {
 			safeStem := sanitizeCopyStem(strings.TrimSuffix(in.SaveName, ".html"))
-			savedPath = filepath.Join(s.cfg.Paths().WorkspacesDir(), in.WorkspaceID, "artifacts", safeStem+".html")
-			_ = store.AtomicWriteFile(savedPath, []byte(in.HTML), 0o600)
+			if s.engine != nil && s.engine.Artifacts() != nil {
+				if saved, sErr := s.engine.Artifacts().Save(in.WorkspaceID, store.Artifact{
+					ID:       safeStem,
+					Title:    firstNonEmptyStr(in.Title, safeStem),
+					Format:   "html",
+					FileName: safeStem + ".html",
+					Content:  in.HTML,
+				}); sErr == nil {
+					savedPath = saved.Path
+				}
+			}
+			if savedPath == "" && s.cfg != nil {
+				savedPath = filepath.Join(s.cfg.Paths().WorkspacesDir(), in.WorkspaceID, "artifacts", safeStem+".html")
+				_ = store.AtomicWriteFile(savedPath, []byte(in.HTML), 0o600)
+			}
 		}
 	}
 
@@ -2832,14 +3046,8 @@ func sanitizeConfigSnapshot(snap *config.Snapshot) *config.Snapshot {
 		if ref != "" && !strings.HasPrefix(ref, "env:") && !strings.HasPrefix(ref, "keychain:") && !strings.HasPrefix(ref, "cmd:") {
 			p.APIKeyRef = "[REDACTED]"
 		}
-		for hk, hv := range p.Headers {
-			trimmed := strings.TrimSpace(hv)
-			if trimmed != "" && !strings.HasPrefix(trimmed, "env:") && !strings.HasPrefix(trimmed, "keychain:") && !strings.HasPrefix(trimmed, "cmd:") {
-				lhk := strings.ToLower(hk)
-				if strings.Contains(lhk, "key") || strings.Contains(lhk, "token") || strings.Contains(lhk, "auth") || strings.Contains(lhk, "secret") {
-					p.Headers[hk] = "[REDACTED]"
-				}
-			}
+		if len(p.Headers) > 0 {
+			p.Headers = config.SanitizeSecretMap(p.Headers)
 		}
 		cp.Providers[id] = p
 	}
@@ -2849,6 +3057,15 @@ func sanitizeConfigSnapshot(snap *config.Snapshot) *config.Snapshot {
 			a.APIKeyRef = "[REDACTED]"
 			cp.Agents[id] = a
 		}
+	}
+	for id, srv := range cp.MCP.Servers {
+		if len(srv.Env) > 0 {
+			srv.Env = config.SanitizeSecretMap(srv.Env)
+		}
+		if len(srv.Headers) > 0 {
+			srv.Headers = config.SanitizeSecretMap(srv.Headers)
+		}
+		cp.MCP.Servers[id] = srv
 	}
 	return cp
 }

@@ -1,55 +1,180 @@
 package server
 
 import (
-	"crypto/rand"
-	"encoding/hex"
+	"bytes"
 	"fmt"
 	"html"
 	"net/http"
+	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
+	"github.com/pelletier/go-toml/v2"
 	"gorness.dev/gorness/internal/config"
+	"gorness.dev/gorness/internal/store"
 )
 
 // PreviewShellCSP 严格锁定外层预览壳与内层 srcdoc 的内容安全策略，阻断一切网络外联、表单提交与嵌套外框。
 const PreviewShellCSP = "default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; img-src data:; connect-src 'none'; frame-src 'none'; form-action 'none'"
 
-const maxPreviewEntries = 256
+const (
+	maxPreviewEntries           = 256
+	maxPersistedInlineHTMLBytes = 2 * 1024 * 1024 // 2 MiB inline HTML cap in previews.toml
+)
 
 var previewFallbackSeq atomic.Uint64
 
 type PreviewItem struct {
-	Token       string    `json:"token"`
-	WorkspaceID string    `json:"workspace_id,omitempty"`
-	Title       string    `json:"title"`
-	HTML        string    `json:"-"`
-	FilePath    string    `json:"file_path,omitempty"`
-	URL         string    `json:"url"`
-	CreatedAt   time.Time `json:"created_at"`
+	Token       string    `json:"token" toml:"token"`
+	WorkspaceID string    `json:"workspace_id,omitempty" toml:"workspace_id,omitempty"`
+	Title       string    `json:"title" toml:"title"`
+	HTML        string    `json:"-" toml:"html,omitempty"`
+	FilePath    string    `json:"file_path,omitempty" toml:"file_path,omitempty"`
+	SavedPath   string    `json:"saved_path,omitempty" toml:"-"`
+	URL         string    `json:"url" toml:"-"`
+	CreatedAt   time.Time `json:"created_at" toml:"created_at"`
 }
 
-// PreviewStore 管理内存态高熵 HTML 产物预览令牌，并在 /preview/:token 中渲染无 allow-same-origin 的双层隔离沙箱壳。
+type previewRegistryDoc struct {
+	Items []PreviewItem `toml:"items"`
+}
+
+// PreviewStore 管理高熵 HTML 产物预览令牌（持久化至 <vault>/runtime/previews.toml，零 .json），
+// 并在 /preview/:token 中渲染无 allow-same-origin 的双层隔离沙箱壳。
 type PreviewStore struct {
-	mu     sync.RWMutex
-	now    func() time.Time
-	byTok  map[string]PreviewItem
-	byPath map[string]string
-	order  []string
+	mu          sync.RWMutex
+	now         func() time.Time
+	persistPath string
+	lockPath    string
+	byTok       map[string]PreviewItem
+	byPath      map[string]string
+	order       []string
 }
 
 func NewPreviewStore(nowFn func() time.Time) *PreviewStore {
+	return NewPersistentPreviewStore(config.VaultPaths{}, nowFn)
+}
+
+func NewPersistentPreviewStore(paths config.VaultPaths, nowFn func() time.Time) *PreviewStore {
 	if nowFn == nil {
 		nowFn = time.Now
 	}
-	return &PreviewStore{
+	s := &PreviewStore{
 		now:    nowFn,
 		byTok:  make(map[string]PreviewItem),
 		byPath: make(map[string]string),
 	}
+	if strings.TrimSpace(paths.Root) != "" {
+		s.persistPath = filepath.Join(paths.RuntimeDir(), "previews.toml")
+		s.lockPath = filepath.Join(paths.RuntimeDir(), "locks", "previews.lock")
+		s.loadPersisted()
+	}
+	return s
+}
+
+func (s *PreviewStore) loadPersisted() {
+	if s.persistPath == "" {
+		return
+	}
+	var raw []byte
+	err := store.WithFlock(s.lockPath, false, func() error {
+		data, rErr := os.ReadFile(s.persistPath)
+		if rErr != nil {
+			if os.IsNotExist(rErr) {
+				return nil
+			}
+			return rErr
+		}
+		raw = data
+		return nil
+	})
+	if err != nil || len(bytes.TrimSpace(raw)) == 0 {
+		return
+	}
+
+	var doc previewRegistryDoc
+	if err := toml.Unmarshal(raw, &doc); err != nil {
+		return
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, item := range doc.Items {
+		tok := strings.TrimSpace(item.Token)
+		if !isSafeHexToken(tok) {
+			continue
+		}
+		if _, dup := s.byTok[tok]; dup {
+			continue
+		}
+		item.Token = tok
+		item.WorkspaceID = strings.TrimSpace(item.WorkspaceID)
+		item.Title = strings.TrimSpace(item.Title)
+		if item.Title == "" {
+			item.Title = "Untitled HTML Artifact"
+		}
+		item.FilePath = strings.TrimSpace(item.FilePath)
+		item.SavedPath = item.FilePath
+		item.URL = "/preview/" + tok
+		if item.FilePath != "" {
+			if diskHTML, rErr := os.ReadFile(item.FilePath); rErr == nil {
+				item.HTML = string(diskHTML)
+			}
+		}
+		if item.HTML == "" {
+			continue
+		}
+		if len(s.order) >= maxPreviewEntries {
+			oldest := s.order[0]
+			s.order = s.order[1:]
+			if evicted, ok := s.byTok[oldest]; ok && evicted.FilePath != "" {
+				delete(s.byPath, evicted.FilePath)
+			}
+			delete(s.byTok, oldest)
+		}
+		s.byTok[tok] = item
+		s.order = append(s.order, tok)
+		if item.FilePath != "" {
+			s.byPath[item.FilePath] = tok
+		}
+	}
+}
+
+func (s *PreviewStore) persistLocked() {
+	if s.persistPath == "" {
+		return
+	}
+	items := make([]PreviewItem, 0, len(s.order))
+	for _, tok := range s.order {
+		item, ok := s.byTok[tok]
+		if !ok {
+			continue
+		}
+		persisted := PreviewItem{
+			Token:       item.Token,
+			WorkspaceID: item.WorkspaceID,
+			Title:       item.Title,
+			FilePath:    item.FilePath,
+			CreatedAt:   item.CreatedAt,
+		}
+		if persisted.FilePath == "" || len(item.HTML) <= maxPersistedInlineHTMLBytes {
+			if len(item.HTML) <= maxPersistedInlineHTMLBytes {
+				persisted.HTML = item.HTML
+			}
+		}
+		items = append(items, persisted)
+	}
+	encoded, err := toml.Marshal(previewRegistryDoc{Items: items})
+	if err != nil {
+		return
+	}
+	_ = store.WithFlock(s.lockPath, true, func() error {
+		return store.AtomicWriteFile(s.persistPath, encoded, 0o600)
+	})
 }
 
 func (s *PreviewStore) Register(wsID, title, rawHTML, filePath string) PreviewItem {
@@ -57,6 +182,7 @@ func (s *PreviewStore) Register(wsID, title, rawHTML, filePath string) PreviewIt
 	if cleanTitle == "" {
 		cleanTitle = "Untitled HTML Artifact"
 	}
+	cleanWS := strings.TrimSpace(wsID)
 	cleanPath := strings.TrimSpace(filePath)
 	now := s.now().UTC()
 
@@ -66,11 +192,18 @@ func (s *PreviewStore) Register(wsID, title, rawHTML, filePath string) PreviewIt
 	if cleanPath != "" {
 		if existingTok, ok := s.byPath[cleanPath]; ok {
 			if existing, has := s.byTok[existingTok]; has {
+				changed := existing.Title != cleanTitle || existing.HTML != rawHTML || existing.WorkspaceID != cleanWS
 				existing.Title = cleanTitle
 				existing.HTML = rawHTML
-				existing.WorkspaceID = strings.TrimSpace(wsID)
-				existing.CreatedAt = now
-				s.byTok[existingTok] = existing
+				existing.WorkspaceID = cleanWS
+				existing.FilePath = cleanPath
+				existing.SavedPath = cleanPath
+				existing.URL = "/preview/" + existingTok
+				if changed {
+					existing.CreatedAt = now
+					s.byTok[existingTok] = existing
+					s.persistLocked()
+				}
 				return existing
 			}
 		}
@@ -79,10 +212,11 @@ func (s *PreviewStore) Register(wsID, title, rawHTML, filePath string) PreviewIt
 	tok := generatePreviewToken()
 	item := PreviewItem{
 		Token:       tok,
-		WorkspaceID: strings.TrimSpace(wsID),
+		WorkspaceID: cleanWS,
 		Title:       cleanTitle,
 		HTML:        rawHTML,
 		FilePath:    cleanPath,
+		SavedPath:   cleanPath,
 		URL:         "/preview/" + tok,
 		CreatedAt:   now,
 	}
@@ -101,7 +235,23 @@ func (s *PreviewStore) Register(wsID, title, rawHTML, filePath string) PreviewIt
 	if cleanPath != "" {
 		s.byPath[cleanPath] = tok
 	}
+	s.persistLocked()
 	return item
+}
+
+func (s *PreviewStore) FindByFilePath(filePath string) (PreviewItem, bool) {
+	cleanPath := strings.TrimSpace(filePath)
+	if cleanPath == "" {
+		return PreviewItem{}, false
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	tok, ok := s.byPath[cleanPath]
+	if !ok {
+		return PreviewItem{}, false
+	}
+	item, has := s.byTok[tok]
+	return item, has
 }
 
 func (s *PreviewStore) Get(token string) (PreviewItem, bool) {
@@ -111,7 +261,15 @@ func (s *PreviewStore) Get(token string) (PreviewItem, bool) {
 	s.mu.RLock()
 	item, ok := s.byTok[token]
 	s.mu.RUnlock()
-	return item, ok
+	if !ok {
+		return PreviewItem{}, false
+	}
+	if item.FilePath != "" {
+		if diskRaw, err := os.ReadFile(item.FilePath); err == nil && len(diskRaw) > 0 {
+			item.HTML = string(diskRaw)
+		}
+	}
+	return item, true
 }
 
 func (s *PreviewStore) List(wsID string) []PreviewItem {
@@ -124,6 +282,8 @@ func (s *PreviewStore) List(wsID string) []PreviewItem {
 		}
 		cp := item
 		cp.HTML = ""
+		cp.SavedPath = cp.FilePath
+		cp.URL = "/preview/" + cp.Token
 		out = append(out, cp)
 	}
 	s.mu.RUnlock()
@@ -248,20 +408,64 @@ func (s *PreviewStore) ServePreview(w http.ResponseWriter, token string) {
 
 func wrapSrcDocWithCSP(rawHTML string) string {
 	metaTag := fmt.Sprintf(`<meta http-equiv="Content-Security-Policy" content="%s">`, html.EscapeString(PreviewShellCSP))
-	lower := strings.ToLower(rawHTML)
-	if idx := strings.Index(lower, "<head>"); idx >= 0 {
-		insertAt := idx + len("<head>")
-		return rawHTML[:insertAt] + "\n" + metaTag + "\n" + rawHTML[insertAt:]
+	if endIdx, ok := findOpeningHTMLTagEnd(rawHTML, "head"); ok {
+		return rawHTML[:endIdx] + "\n" + metaTag + "\n" + rawHTML[endIdx:]
+	}
+	if endIdx, ok := findOpeningHTMLTagEnd(rawHTML, "html"); ok {
+		return rawHTML[:endIdx] + "\n<head><meta charset=\"utf-8\">" + metaTag + "</head>\n" + rawHTML[endIdx:]
 	}
 	return "<!DOCTYPE html><html><head><meta charset=\"utf-8\">" + metaTag + "</head><body>\n" + rawHTML + "\n</body></html>"
 }
 
-func generatePreviewToken() string {
-	buf := make([]byte, 16)
-	if _, err := rand.Read(buf); err != nil {
-		return fmt.Sprintf("%032x", previewFallbackSeq.Add(1))
+// findOpeningHTMLTagEnd 定位形如 <tag> 或 <tag attr="val"> 的开标签闭合 '>' 下标后一位，
+// 严格校验标签名边界（例如匹配 <head ...> 但绝不误匹配 <header>）并感知单双引号属性值中的 '>'。
+func findOpeningHTMLTagEnd(doc, tagName string) (int, bool) {
+	lower := strings.ToLower(doc)
+	needle := "<" + strings.ToLower(tagName)
+	searchFrom := 0
+	for searchFrom < len(lower) {
+		rel := strings.Index(lower[searchFrom:], needle)
+		if rel < 0 {
+			return 0, false
+		}
+		tagStart := searchFrom + rel
+		afterName := tagStart + len(needle)
+		if afterName >= len(lower) {
+			return 0, false
+		}
+		boundary := lower[afterName]
+		if boundary != '>' && boundary != ' ' && boundary != '\t' && boundary != '\n' && boundary != '\r' && boundary != '/' {
+			searchFrom = afterName
+			continue
+		}
+		var quote byte
+		for i := afterName; i < len(doc); i++ {
+			ch := doc[i]
+			if quote != 0 {
+				if ch == quote {
+					quote = 0
+				}
+				continue
+			}
+			if ch == '"' || ch == '\'' {
+				quote = ch
+				continue
+			}
+			if ch == '>' {
+				return i + 1, true
+			}
+		}
+		return 0, false
 	}
-	return hex.EncodeToString(buf)
+	return 0, false
+}
+
+func generatePreviewToken() string {
+	tok := store.RandomHex(16)
+	if isSafeHexToken(tok) {
+		return tok
+	}
+	return fmt.Sprintf("%032x", previewFallbackSeq.Add(1))
 }
 
 func isSafeHexToken(tok string) bool {

@@ -12,12 +12,17 @@ import (
 	"path/filepath"
 	"strings"
 	"syscall"
+	"time"
 
 	"gorness.dev/gorness/internal/config"
+	"gorness.dev/gorness/internal/store"
 	"gorness.dev/gorness/internal/tools"
 )
 
-const maxSafeOpenCopyBytes = 64 * 1024 * 1024 // 64 MiB
+const (
+	maxSafeOpenCopyBytes = 64 * 1024 * 1024 // 64 MiB
+	openCopyRetention    = 24 * time.Hour
+)
 
 type OpenAction string
 
@@ -55,21 +60,32 @@ var allowlistedSafeDocExts = map[string]bool{
 // ExternalOpener 安全打开外部文件：
 //  1. 解析规范路径并阻断逃逸出工作区或进入 ~/.gorness 机密区的符号链接；
 //  2. 白名单文档扩展名通过 O_NOFOLLOW 打开文件描述符，核验 f.Stat() 与 os.Lstat() 的 Dev/Ino 一致（防软链掉包 TOCTOU），
-//     复制为 0400 只读副本放入 <vault>/runtime/open-copies/ 后再交由 Opener 打开；
+//     复制为 0400 只读副本放入 <vault>/runtime/open-copies/（并自动清理 >24h 历史副本）后再交由 Opener 打开；
 //  3. 非白名单文件（脚本、可执行包等）绝不直接启动，一律转为 Finder 定位展示（open -R）。
 type ExternalOpener struct {
 	paths  config.VaultPaths
 	opener OpenerFunc
+	now    func() time.Time
 }
 
 func NewExternalOpener(paths config.VaultPaths, opener OpenerFunc) *ExternalOpener {
+	return NewExternalOpenerWithClock(paths, opener, time.Now)
+}
+
+func NewExternalOpenerWithClock(paths config.VaultPaths, opener OpenerFunc, nowFn func() time.Time) *ExternalOpener {
 	if opener == nil {
 		opener = defaultMacOSOpener
 	}
-	return &ExternalOpener{
+	if nowFn == nil {
+		nowFn = time.Now
+	}
+	o := &ExternalOpener{
 		paths:  paths,
 		opener: opener,
+		now:    nowFn,
 	}
+	_ = o.PruneExpiredCopies()
+	return o
 }
 
 func defaultMacOSOpener(ctx context.Context, args []string) error {
@@ -81,6 +97,45 @@ func defaultMacOSOpener(ctx context.Context, args []string) error {
 	return nil
 }
 
+// PruneExpiredCopies 清理 <vault>/runtime/open-copies/ 中超过 24 小时的只读副本。
+func (o *ExternalOpener) PruneExpiredCopies() int {
+	if o == nil || strings.TrimSpace(o.paths.Root) == "" {
+		return 0
+	}
+	copiesDir := filepath.Join(o.paths.RuntimeDir(), "open-copies")
+	st, err := os.Lstat(copiesDir)
+	if err != nil || st.Mode()&os.ModeSymlink != 0 || !st.IsDir() {
+		return 0
+	}
+	return pruneOpenCopiesDir(copiesDir, o.now().UTC())
+}
+
+func pruneOpenCopiesDir(copiesDir string, now time.Time) int {
+	entries, err := os.ReadDir(copiesDir)
+	if err != nil {
+		return 0
+	}
+	cutoff := now.Add(-openCopyRetention)
+	removed := 0
+	for _, ent := range entries {
+		if ent.IsDir() {
+			continue
+		}
+		info, iErr := ent.Info()
+		if iErr != nil {
+			continue
+		}
+		if info.ModTime().Before(cutoff) {
+			full := filepath.Join(copiesDir, ent.Name())
+			_ = os.Chmod(full, 0o600)
+			if os.Remove(full) == nil {
+				removed++
+			}
+		}
+	}
+	return removed
+}
+
 func (o *ExternalOpener) Open(ctx context.Context, wsRoot, rawTarget string) (OpenResult, error) {
 	if ctx == nil {
 		ctx = context.Background()
@@ -89,6 +144,8 @@ func (o *ExternalOpener) Open(ctx context.Context, wsRoot, rawTarget string) (Op
 	if trimmed == "" || strings.ContainsRune(trimmed, 0) {
 		return OpenResult{}, fmt.Errorf("%w: empty or invalid path", ErrForbiddenOpenPath)
 	}
+
+	_ = o.PruneExpiredCopies()
 
 	canonTarget, err := o.resolveAllowedTarget(wsRoot, trimmed)
 	if err != nil {
@@ -154,6 +211,7 @@ func (o *ExternalOpener) Open(ctx context.Context, wsRoot, rawTarget string) (Op
 	if err != nil {
 		return OpenResult{}, err
 	}
+	pruneOpenCopiesDir(copiesDir, o.now().UTC())
 
 	sumInput := append([]byte(canonTarget+"\x00"), data...)
 	sum := sha256.Sum256(sumInput)
@@ -162,7 +220,7 @@ func (o *ExternalOpener) Open(ctx context.Context, wsRoot, rawTarget string) (Op
 	stem := sanitizeCopyStem(strings.TrimSuffix(filepath.Base(canonTarget), filepath.Ext(canonTarget)))
 	destPath := filepath.Join(copiesDir, fmt.Sprintf("%s-%s%s", digest, stem, ext))
 
-	if err := writeReadOnly0400Copy(copiesDir, destPath, data); err != nil {
+	if err := writeReadOnly0400Copy(destPath, data); err != nil {
 		return OpenResult{}, err
 	}
 
@@ -181,8 +239,8 @@ func (o *ExternalOpener) Open(ctx context.Context, wsRoot, rawTarget string) (Op
 func (o *ExternalOpener) resolveAllowedTarget(wsRoot, target string) (string, error) {
 	canonVault := ""
 	if strings.TrimSpace(o.paths.Root) != "" {
-		if v, err := filepath.EvalSymlinks(o.paths.Root); err == nil {
-			canonVault = filepath.Clean(v)
+		if v, err := config.CanonicalPath(o.paths.Root); err == nil && v != "" {
+			canonVault = v
 		} else {
 			canonVault = filepath.Clean(o.paths.Root)
 		}
@@ -196,10 +254,9 @@ func (o *ExternalOpener) resolveAllowedTarget(wsRoot, target string) (string, er
 		canonAbs, _, inWS, rErr := pg.ResolveInWorkspace(target)
 		if rErr != nil {
 			if errors.Is(rErr, tools.ErrVaultSecretBlocked) {
-				if resolved, eErr := filepath.EvalSymlinks(target); eErr == nil {
-					cleanResolved := filepath.Clean(resolved)
-					if isSafeVaultArtifactPath(canonVault, cleanResolved) {
-						return cleanResolved, nil
+				if resolved, eErr := config.CanonicalPath(target); eErr == nil {
+					if isSafeVaultArtifactPath(canonVault, resolved) {
+						return resolved, nil
 					}
 				}
 			}
@@ -212,11 +269,13 @@ func (o *ExternalOpener) resolveAllowedTarget(wsRoot, target string) (string, er
 	}
 
 	// 无工作区上下文时仅允许打开 ~/.gorness/workspaces/<wsID>/artifacts/* 或 runtime/logs/overflow-*.log
-	resolved, err := filepath.EvalSymlinks(target)
+	resolved, err := config.CanonicalPath(target)
 	if err != nil {
 		return "", err
 	}
-	resolved = filepath.Clean(resolved)
+	if _, stErr := os.Lstat(resolved); stErr != nil {
+		return "", stErr
+	}
 	if isSafeVaultArtifactPath(canonVault, resolved) || isSafeVaultOverflowLog(canonVault, resolved) {
 		return resolved, nil
 	}
@@ -227,20 +286,24 @@ func isSafeVaultArtifactPath(canonVault, absPath string) bool {
 	if canonVault == "" || absPath == "" {
 		return false
 	}
-	wsRoot := filepath.Join(canonVault, "workspaces") + string(filepath.Separator)
+	wsRoot := filepath.Join(canonVault, "workspaces")
 	clean := filepath.Clean(absPath)
-	if !strings.HasPrefix(clean, wsRoot) {
+	if !config.IsStrictlyWithinRoot(clean, wsRoot) {
 		return false
 	}
-	rel := strings.TrimPrefix(clean, wsRoot)
+	rel, err := filepath.Rel(wsRoot, clean)
+	if err != nil {
+		return false
+	}
 	parts := strings.Split(filepath.ToSlash(rel), "/")
 	if len(parts) != 3 || parts[1] != "artifacts" {
 		return false
 	}
-	for _, seg := range []string{parts[0], parts[2]} {
-		if seg == "" || seg == "." || seg == ".." || strings.ContainsAny(seg, `/\`) {
-			return false
-		}
+	if store.ValidateSafeID(parts[0]) != nil {
+		return false
+	}
+	if parts[2] == "" || parts[2] == "." || parts[2] == ".." || strings.ContainsAny(parts[2], `/\`) {
+		return false
 	}
 	return true
 }
@@ -250,8 +313,12 @@ func isSafeVaultOverflowLog(canonVault, absPath string) bool {
 		return false
 	}
 	logsDir := filepath.Join(canonVault, "runtime", "logs")
-	base := filepath.Base(absPath)
-	return filepath.Dir(absPath) == logsDir && strings.HasPrefix(base, "overflow-") && strings.HasSuffix(base, ".log")
+	clean := filepath.Clean(absPath)
+	if !config.IsStrictlyWithinRoot(clean, logsDir) {
+		return false
+	}
+	base := filepath.Base(clean)
+	return filepath.Dir(clean) == logsDir && strings.HasPrefix(base, "overflow-") && strings.HasSuffix(base, ".log")
 }
 
 func (o *ExternalOpener) ensureSafeCopiesDir() (string, error) {
@@ -270,7 +337,7 @@ func (o *ExternalOpener) ensureSafeCopiesDir() (string, error) {
 	return copiesDir, nil
 }
 
-func writeReadOnly0400Copy(copiesDir, destPath string, data []byte) error {
+func writeReadOnly0400Copy(destPath string, data []byte) error {
 	if st, err := os.Lstat(destPath); err == nil {
 		if st.Mode()&os.ModeSymlink != 0 || st.IsDir() {
 			return fmt.Errorf("%w: refusing to replace non-regular open copy %s", ErrTOCTOUDetected, destPath)
@@ -278,43 +345,9 @@ func writeReadOnly0400Copy(copiesDir, destPath string, data []byte) error {
 		_ = os.Chmod(destPath, 0o600)
 		_ = os.Remove(destPath)
 	}
-
-	tmp, err := os.CreateTemp(copiesDir, ".open-copy-*.tmp")
-	if err != nil {
-		return fmt.Errorf("create temp copy: %w", err)
-	}
-	tmpName := tmp.Name()
-	renamed := false
-	defer func() {
-		if !renamed {
-			_ = os.Chmod(tmpName, 0o600)
-			_ = os.Remove(tmpName)
-		}
-	}()
-
-	for rem := data; len(rem) > 0; {
-		n, wErr := tmp.Write(rem)
-		if wErr != nil {
-			_ = tmp.Close()
-			return wErr
-		}
-		rem = rem[n:]
-	}
-	if err := tmp.Chmod(0o400); err != nil {
-		_ = tmp.Close()
+	if err := store.AtomicWriteFile(destPath, data, 0o400); err != nil {
 		return err
 	}
-	if err := tmp.Sync(); err != nil {
-		_ = tmp.Close()
-		return err
-	}
-	if err := tmp.Close(); err != nil {
-		return err
-	}
-	if err := os.Rename(tmpName, destPath); err != nil {
-		return err
-	}
-	renamed = true
 	return os.Chmod(destPath, 0o400)
 }
 

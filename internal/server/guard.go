@@ -4,12 +4,13 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 )
 
-// LoopbackGuard 强制执行本机回环同源守卫与零 CORS 铁律：
-// 1. 校验 Host 头防 DNS Rebinding（仅允许 127.0.0.1 / localhost / [::1]）；
-// 2. 拦截 Sec-Fetch-Site: cross-site 与 Origin: null（沙箱 iframe 透明源）；
+// LoopbackGuard 强制执行本机回环同源守卫、Unix Domain Socket 放行与零 CORS 铁律：
+// 1. 校验 Host 头防 DNS Rebinding（TCP 仅允许 127.0.0.1 / localhost / [::1]；本机 UDS 额外兼容无端口/unix 主机名）；
+// 2. 拦截非同源 Sec-Fetch-Site（cross-site / same-site）、CORS 预检请求与 Origin: null（沙箱 iframe 透明源）；
 // 3. 校验非空 Origin 与 Referer 必须匹配当前服务的 http://<loopback>:<port>；
 // 4. 全站响应严禁输出任何 Access-Control-Allow-* 跨域头。
 func LoopbackGuard(next http.Handler) http.Handler {
@@ -18,22 +19,33 @@ func LoopbackGuard(next http.Handler) http.Handler {
 		w.Header().Set("X-Content-Type-Options", "nosniff")
 		w.Header().Set("Referrer-Policy", "same-origin")
 
+		isUDS := isUnixDomainSocketPeer(r.RemoteAddr)
+		hasBrowserFetchMeta := strings.TrimSpace(r.Header.Get("Origin")) != "" ||
+			strings.TrimSpace(r.Header.Get("Referer")) != "" ||
+			strings.TrimSpace(r.Header.Get("Sec-Fetch-Site")) != ""
+
 		_, reqPort, hostOK := parseLoopbackHostPort(r.Host)
+		if !hostOK && isUDS && !hasBrowserFetchMeta && isAllowedUDSHost(r.Host) {
+			reqPort = "80"
+			hostOK = true
+		}
 		if !hostOK {
 			rejectForbidden(w, "forbidden host header")
 			return
 		}
 
-		if strings.EqualFold(strings.TrimSpace(r.Header.Get("Sec-Fetch-Site")), "cross-site") {
+		if sfs := strings.ToLower(strings.TrimSpace(r.Header.Get("Sec-Fetch-Site"))); sfs != "" && sfs != "same-origin" && sfs != "none" {
 			rejectForbidden(w, "forbidden cross-site request")
 			return
 		}
 
+		hasOrigin := false
 		for _, rawOrigin := range r.Header.Values("Origin") {
 			trimmed := strings.TrimSpace(rawOrigin)
 			if trimmed == "" {
 				continue
 			}
+			hasOrigin = true
 			if !isSameLoopbackOriginHeader(trimmed, reqPort) {
 				rejectForbidden(w, "forbidden cross-origin request")
 				return
@@ -52,6 +64,10 @@ func LoopbackGuard(next http.Handler) http.Handler {
 		}
 
 		if r.Method == http.MethodOptions {
+			if strings.TrimSpace(r.Header.Get("Access-Control-Request-Method")) != "" && !hasOrigin {
+				rejectForbidden(w, "forbidden cors preflight")
+				return
+			}
 			stripCORSHeaders(w.Header())
 			w.WriteHeader(http.StatusNoContent)
 			return
@@ -107,27 +123,66 @@ func rejectForbidden(w http.ResponseWriter, msg string) {
 	_, _ = w.Write([]byte(`{"error":"` + msg + `"}`))
 }
 
+func isUnixDomainSocketPeer(remoteAddr string) bool {
+	trimmed := strings.TrimSpace(remoteAddr)
+	if trimmed == "" || trimmed == "@" || strings.HasPrefix(trimmed, "/") {
+		return true
+	}
+	return false
+}
+
+func isAllowedUDSHost(rawHost string) bool {
+	trimmed := strings.ToLower(strings.TrimSpace(rawHost))
+	if trimmed == "" {
+		return true
+	}
+	if h, p, err := net.SplitHostPort(trimmed); err == nil {
+		if !isValidPortNumber(p) {
+			return false
+		}
+		trimmed = strings.ToLower(strings.TrimSpace(h))
+	}
+	switch trimmed {
+	case "unix", "localhost", "127.0.0.1", "::1", "[::1]", "gorness", "daemon.sock":
+		return true
+	default:
+		return false
+	}
+}
+
 func parseLoopbackHostPort(rawHost string) (host, port string, ok bool) {
 	trimmed := strings.TrimSpace(rawHost)
 	if trimmed == "" {
 		return "", "", false
 	}
 
+	if strings.HasPrefix(trimmed, "[") && strings.HasSuffix(trimmed, "]") {
+		inner := trimmed[1 : len(trimmed)-1]
+		if !isLoopbackHostname(inner) {
+			return "", "", false
+		}
+		return normalizeLoopbackHost(inner), "80", true
+	}
+
 	if h, p, err := net.SplitHostPort(trimmed); err == nil {
-		if !isLoopbackHostname(h) || p == "" {
+		if !isLoopbackHostname(h) || !isValidPortNumber(p) {
 			return "", "", false
 		}
 		return normalizeLoopbackHost(h), p, true
 	}
 
-	unbracketed := trimmed
-	if strings.HasPrefix(trimmed, "[") && strings.HasSuffix(trimmed, "]") {
-		unbracketed = trimmed[1 : len(trimmed)-1]
-	}
-	if !isLoopbackHostname(unbracketed) {
+	if !isLoopbackHostname(trimmed) {
 		return "", "", false
 	}
-	return normalizeLoopbackHost(unbracketed), "80", true
+	return normalizeLoopbackHost(trimmed), "80", true
+}
+
+func isValidPortNumber(rawPort string) bool {
+	if rawPort == "" {
+		return false
+	}
+	n, err := strconv.Atoi(rawPort)
+	return err == nil && n >= 1 && n <= 65535
 }
 
 func isSameLoopbackOriginHeader(rawOrigin, expectedPort string) bool {
