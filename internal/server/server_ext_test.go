@@ -667,3 +667,168 @@ func TestMemoryFourLayersSkillCandidatesTimersOutboxFleetDeleteAndRunStream(t *t
 		t.Fatalf("expected 404 after deleting mission %s, got %d", startedMission.ID, stGetDeleted)
 	}
 }
+
+func TestConfigHooksGetAndUpsertWithValidation(t *testing.T) {
+	srv, vaultDir, cleanup := newTestStack(t, nil, nil)
+	defer cleanup()
+
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+	client := ts.Client()
+
+	// 1. Initial GET /api/config/hooks should succeed and return default/empty hooks.
+	stGetInit, rawGetInit, _ := doJSONReq(t, client, ts.URL, http.MethodGet, "/api/config/hooks", nil)
+	if stGetInit != http.StatusOK {
+		t.Fatalf("GET /api/config/hooks status=%d: %s", stGetInit, string(rawGetInit))
+	}
+	var getInitResp struct {
+		Hooks config.HooksConfig `json:"hooks"`
+	}
+	if err := json.Unmarshal(rawGetInit, &getInitResp); err != nil {
+		t.Fatalf("decode initial hooks response: %v", err)
+	}
+
+	// 2. PUT /api/config/hooks with invalid payload:
+	// 2a. Malformed / type-mismatched JSON body
+	stBadJSON, rawBadJSON, _ := doJSONReq(t, client, ts.URL, http.MethodPut, "/api/config/hooks", map[string]any{
+		"pre_tool_use": "not-an-array",
+	})
+	if stBadJSON != http.StatusBadRequest {
+		t.Fatalf("expected 400 on malformed json, got %d: %s", stBadJSON, string(rawBadJSON))
+	}
+
+	// 2b. Hook with empty command (pre-write ValidateCandidate must reject it)
+	stEmptyCmd, rawEmptyCmd, _ := doJSONReq(t, client, ts.URL, http.MethodPut, "/api/config/hooks", map[string]any{
+		"pre_tool_use": []map[string]any{
+			{
+				"id":      "invalid-hook",
+				"command": "   ",
+			},
+		},
+	})
+	if stEmptyCmd != http.StatusBadRequest {
+		t.Fatalf("expected 400 on empty command hook, got %d: %s", stEmptyCmd, string(rawEmptyCmd))
+	}
+
+	// Verify disk hooks.toml was NOT written with invalid data
+	diskHooksPre, err := os.ReadFile(filepath.Join(vaultDir, "hooks.toml"))
+	if err == nil && strings.Contains(string(diskHooksPre), "invalid-hook") {
+		t.Fatalf("disk hooks.toml was modified on failed validation: %s", string(diskHooksPre))
+	}
+
+	// 3. PUT /api/config/hooks with valid lifecycle hooks
+	validPayload := map[string]any{
+		"pre_tool_use": []map[string]any{
+			{
+				"id":          "audit-shell",
+				"matcher":     "run_command",
+				"tools":       []string{"run_command"},
+				"command":     "cat >/dev/null",
+				"timeout_sec": 15,
+			},
+		},
+		"post_tool_use": []map[string]any{
+			{
+				"id":          "log-output",
+				"matcher":     "*",
+				"command":     "echo post-tool",
+				"timeout_sec": 5,
+			},
+		},
+		"turn_stopping": []map[string]any{
+			{
+				"id":          "notify-stop",
+				"command":     "echo stopping",
+				"timeout_sec": 10,
+			},
+		},
+	}
+	stPut, rawPut, _ := doJSONReq(t, client, ts.URL, http.MethodPut, "/api/config/hooks", validPayload)
+	if stPut != http.StatusOK {
+		t.Fatalf("PUT /api/config/hooks status=%d: %s", stPut, string(rawPut))
+	}
+
+	var putResp struct {
+		Hooks    config.HooksConfig `json:"hooks"`
+		Config   *config.Snapshot   `json:"config"`
+		Snapshot *config.Snapshot   `json:"snapshot"`
+	}
+	if err := json.Unmarshal(rawPut, &putResp); err != nil {
+		t.Fatalf("decode put hooks response: %v", err)
+	}
+
+	if len(putResp.Hooks.PreToolUse) != 1 || putResp.Hooks.PreToolUse[0].ID != "audit-shell" {
+		t.Fatalf("expected pre_tool_use with id audit-shell, got %+v", putResp.Hooks.PreToolUse)
+	}
+	if putResp.Hooks.PreToolUse[0].Command != "cat >/dev/null" || putResp.Hooks.PreToolUse[0].TimeoutSec != 15 {
+		t.Fatalf("unexpected pre_tool_use spec: %+v", putResp.Hooks.PreToolUse[0])
+	}
+	if len(putResp.Hooks.PostToolUse) != 1 || putResp.Hooks.PostToolUse[0].ID != "log-output" {
+		t.Fatalf("expected post_tool_use with id log-output, got %+v", putResp.Hooks.PostToolUse)
+	}
+	if len(putResp.Hooks.TurnStopping) != 1 || putResp.Hooks.TurnStopping[0].ID != "notify-stop" {
+		t.Fatalf("expected turn_stopping with id notify-stop, got %+v", putResp.Hooks.TurnStopping)
+	}
+	if putResp.Config == nil || len(putResp.Config.Hooks.PreToolUse) != 1 {
+		t.Fatalf("expected config snapshot with updated hooks, got %+v", putResp.Config)
+	}
+
+	// 4. Verify disk hooks.toml file
+	diskHooks, err := os.ReadFile(filepath.Join(vaultDir, "hooks.toml"))
+	if err != nil {
+		t.Fatalf("read disk hooks.toml: %v", err)
+	}
+	if !strings.Contains(string(diskHooks), "audit-shell") || !strings.Contains(string(diskHooks), "cat >/dev/null") {
+		t.Fatalf("disk hooks.toml does not contain saved hooks:\n%s", string(diskHooks))
+	}
+
+	// 5. Subsequent GET /api/config/hooks should reflect the newly saved hooks
+	stGet, rawGet, _ := doJSONReq(t, client, ts.URL, http.MethodGet, "/api/config/hooks", nil)
+	if stGet != http.StatusOK {
+		t.Fatalf("GET /api/config/hooks status=%d: %s", stGet, string(rawGet))
+	}
+	var getResp struct {
+		Hooks config.HooksConfig `json:"hooks"`
+	}
+	if err := json.Unmarshal(rawGet, &getResp); err != nil {
+		t.Fatalf("decode get hooks response: %v", err)
+	}
+	if len(getResp.Hooks.PreToolUse) != 1 || getResp.Hooks.PreToolUse[0].ID != "audit-shell" {
+		t.Fatalf("expected 1 pre_tool_use hook after put, got %+v", getResp.Hooks.PreToolUse)
+	}
+	if len(getResp.Hooks.PostToolUse) != 1 || getResp.Hooks.PostToolUse[0].ID != "log-output" {
+		t.Fatalf("expected 1 post_tool_use hook after put, got %+v", getResp.Hooks.PostToolUse)
+	}
+	if len(getResp.Hooks.TurnStopping) != 1 || getResp.Hooks.TurnStopping[0].ID != "notify-stop" {
+		t.Fatalf("expected 1 turn_stopping hook after put, got %+v", getResp.Hooks.TurnStopping)
+	}
+
+	// Also verify direct unmarshal as config.HooksConfig
+	var directHooks config.HooksConfig
+	if err := json.Unmarshal(rawGet, &directHooks); err != nil {
+		t.Fatalf("decode direct hooks config: %v", err)
+	}
+	if len(directHooks.PreToolUse) != 1 || directHooks.PreToolUse[0].ID != "audit-shell" {
+		t.Fatalf("expected direct unmarshal pre_tool_use to have audit-shell, got %+v", directHooks.PreToolUse)
+	}
+
+	// 6. PUT /api/config/hooks clearing hooks
+	emptyPayload := map[string]any{
+		"pre_tool_use":  []any{},
+		"post_tool_use": []any{},
+		"turn_stopping": []any{},
+	}
+	stClear, rawClear, _ := doJSONReq(t, client, ts.URL, http.MethodPut, "/api/config/hooks", emptyPayload)
+	if stClear != http.StatusOK {
+		t.Fatalf("PUT /api/config/hooks clear status=%d: %s", stClear, string(rawClear))
+	}
+	var clearResp struct {
+		Hooks config.HooksConfig `json:"hooks"`
+	}
+	if err := json.Unmarshal(rawClear, &clearResp); err != nil {
+		t.Fatalf("decode clear hooks response: %v", err)
+	}
+	if !clearResp.Hooks.IsEmpty() {
+		t.Fatalf("expected hooks to be empty after clearing, got %+v", clearResp.Hooks)
+	}
+}

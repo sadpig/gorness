@@ -168,6 +168,8 @@ func (s *Server) buildMux() http.Handler {
 	mux.HandleFunc("POST /api/config/workflows", s.handleUpsertWorkflow)
 	mux.HandleFunc("DELETE /api/config/workflows/{id}", s.handleDeleteWorkflow)
 	mux.HandleFunc("PUT /api/config/rules", s.handleUpsertRules)
+	mux.HandleFunc("GET /api/config/hooks", s.handleGetHooks)
+	mux.HandleFunc("PUT /api/config/hooks", s.handleUpsertHooks)
 	mux.HandleFunc("POST /api/config/mcp", s.handleUpsertMCP)
 	mux.HandleFunc("DELETE /api/config/mcp/{id}", s.handleDeleteMCP)
 	mux.HandleFunc("POST /api/config/secrets", s.handleSetSecret)

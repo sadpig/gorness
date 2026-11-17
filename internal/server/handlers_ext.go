@@ -932,3 +932,88 @@ func (s *Server) restoreRedactedConfigFileContent(normRel string, existingRaw, i
 	}
 	return restored
 }
+
+// ============================================================================
+// 6. Lifecycle Command Hooks (/api/config/hooks)
+// ============================================================================
+
+func (s *Server) handleGetHooks(w http.ResponseWriter, _ *http.Request) {
+	if s.cfg == nil {
+		writeJSONError(w, http.StatusServiceUnavailable, "config manager unavailable")
+		return
+	}
+	snap := s.cfg.Current()
+	var hooks config.HooksConfig
+	if snap != nil {
+		hooks = snap.Hooks.Clone()
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"hooks":         hooks,
+		"pre_tool_use":  hooks.PreToolUse,
+		"post_tool_use": hooks.PostToolUse,
+		"turn_stopping": hooks.TurnStopping,
+	})
+}
+
+func (s *Server) handleUpsertHooks(w http.ResponseWriter, r *http.Request) {
+	if s.cfg == nil {
+		writeJSONError(w, http.StatusServiceUnavailable, "config manager unavailable")
+		return
+	}
+	var patch struct {
+		PreToolUse   *[]config.HookCommandSpec `json:"pre_tool_use"`
+		PostToolUse  *[]config.HookCommandSpec `json:"post_tool_use"`
+		TurnStopping *[]config.HookCommandSpec `json:"turn_stopping"`
+		Hooks        *config.HooksConfig       `json:"hooks"`
+	}
+	if err := decodeJSONBody(r, &patch); err != nil {
+		writeJSONError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	var hooks config.HooksConfig
+	if patch.Hooks != nil {
+		hooks = patch.Hooks.Clone()
+	}
+	if patch.PreToolUse != nil {
+		hooks.PreToolUse = *patch.PreToolUse
+	}
+	if patch.PostToolUse != nil {
+		hooks.PostToolUse = *patch.PostToolUse
+	}
+	if patch.TurnStopping != nil {
+		hooks.TurnStopping = *patch.TurnStopping
+	}
+
+	encoded, err := toml.Marshal(hooks)
+	if err != nil {
+		writeJSONError(w, http.StatusBadRequest, fmt.Sprintf("marshal hooks.toml: %v", err))
+		return
+	}
+
+	s.configMu.Lock()
+	defer s.configMu.Unlock()
+
+	if _, err := s.cfg.ValidateCandidate(map[string][]byte{"hooks.toml": encoded}); err != nil {
+		writeJSONError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if err := store.AtomicWriteFile(s.cfg.Paths().HooksFile(), encoded, 0o600); err != nil {
+		writeJSONError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	snap, err := s.cfg.Reload()
+	if err != nil {
+		writeJSONError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	s.lastDiag.Store(nil)
+	writeJSON(w, http.StatusOK, map[string]any{
+		"hooks":         snap.Hooks,
+		"config":        sanitizeConfigSnapshot(snap),
+		"snapshot":      sanitizeConfigSnapshot(snap),
+		"pre_tool_use":  snap.Hooks.PreToolUse,
+		"post_tool_use": snap.Hooks.PostToolUse,
+		"turn_stopping": snap.Hooks.TurnStopping,
+	})
+}
