@@ -293,6 +293,9 @@ func (m *Manager) ForWorkspace(wsRoot string, trustedHashes map[string]string) (
 		}
 		if wsCfg.Language != "" {
 			snap.Global.Language = wsCfg.Language
+			if wsCfg.UILang == "" {
+				snap.Global.UILang = ""
+			}
 		}
 		if wsCfg.UITheme != "" {
 			snap.Global.UITheme = wsCfg.UITheme
@@ -300,6 +303,7 @@ func (m *Manager) ForWorkspace(wsRoot string, trustedHashes map[string]string) (
 		if wsCfg.UILang != "" {
 			snap.Global.UILang = wsCfg.UILang
 		}
+		normalizeGlobalLanguage(&snap.Global)
 		if wsCfg.MaxSteps > 0 {
 			snap.Global.MaxSteps = wsCfg.MaxSteps
 		}
@@ -581,11 +585,14 @@ func registerProviderLiteralSecret(resolver *DefaultSecretResolver, p ProviderCo
 
 func (m *Manager) loadGlobalSnapshot() (*Snapshot, error) {
 	globalCfg := defaultGlobalConfig()
+	globalCfg.Language = ""
+	globalCfg.UILang = ""
 	if raw, err := os.ReadFile(m.paths.ConfigFile()); err != nil {
 		return nil, &fileLoadError{File: m.paths.ConfigFile(), Err: err}
 	} else if err := toml.Unmarshal(raw, &globalCfg); err != nil {
 		return nil, &fileLoadError{File: m.paths.ConfigFile(), Err: err}
 	}
+	normalizeGlobalLanguage(&globalCfg)
 
 	rawProviders, err := os.ReadFile(m.paths.ProvidersFile())
 	if err != nil {
@@ -729,6 +736,8 @@ func (m *Manager) ValidateCandidate(overlay map[string][]byte) (*Snapshot, error
 	}
 
 	globalCfg := defaultGlobalConfig()
+	globalCfg.Language = ""
+	globalCfg.UILang = ""
 	if raw, ok, err := readCandidateFile("config.toml", m.paths.ConfigFile()); err != nil {
 		return nil, err
 	} else if ok {
@@ -736,6 +745,7 @@ func (m *Manager) ValidateCandidate(overlay map[string][]byte) (*Snapshot, error
 			return nil, &fileLoadError{File: m.paths.ConfigFile(), Err: err}
 		}
 	}
+	normalizeGlobalLanguage(&globalCfg)
 
 	providers := make(map[string]ProviderConfig)
 	if raw, ok, err := readCandidateFile("providers.toml", m.paths.ProvidersFile()); err != nil {
@@ -1316,6 +1326,7 @@ func defaultGlobalConfig() GlobalConfig {
 		Port:               3456,
 		Theme:              "auto",
 		Language:           "zh",
+		UILang:             "zh",
 		DefaultProvider:    "anthropic",
 		DefaultModel:       "claude-sonnet-5-5",
 		DefaultEffort:      "high",
@@ -1328,11 +1339,30 @@ func defaultGlobalConfig() GlobalConfig {
 	}
 }
 
+func normalizeGlobalLanguage(cfg *GlobalConfig) {
+	if cfg == nil {
+		return
+	}
+	uiLang := strings.ToLower(strings.TrimSpace(cfg.UILang))
+	lang := strings.ToLower(strings.TrimSpace(cfg.Language))
+	if uiLang == "en" || (uiLang == "" && lang == "en") {
+		cfg.UILang = "en"
+	} else {
+		cfg.UILang = "zh"
+	}
+	if lang == "en" {
+		cfg.Language = "en"
+	} else {
+		cfg.Language = cfg.UILang
+	}
+}
+
 const defaultConfigTOML = `# Gorness Global Configuration (全局主配置 / Global Settings)
 host = "127.0.0.1"
 port = 3456
 theme = "auto"                # auto | light | dark
 language = "zh"               # zh | en
+ui_lang = "zh"                # zh | en
 default_provider = "anthropic"
 default_model = "claude-sonnet-5-5"
 default_effort = "high"       # low | medium | high | xhigh | max

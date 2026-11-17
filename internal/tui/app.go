@@ -579,7 +579,7 @@ func (m *Model) handleKey(k tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case "ctrl+n":
-		return m, m.createNewSessionCmd("New Session", false)
+		return m, m.createNewSessionCmd("新会话", false)
 
 	case "ctrl+r":
 		roles := m.availableAgentRoles()
@@ -595,9 +595,9 @@ func (m *Model) handleKey(k tea.KeyMsg) (tea.Model, tea.Cmd) {
 			}
 		}
 		m.agentRole = nextRole
-		m.statusNotice = "Role -> " + m.agentRole
+		m.statusNotice = "角色 Role -> " + m.agentRole
 		if m.activeSessionID != "" {
-			return m, m.patchSessionCmd(m.activeSessionID, map[string]any{"agent_role": m.agentRole}, "Role -> "+m.agentRole)
+			return m, m.patchSessionCmd(m.activeSessionID, map[string]any{"agent_role": m.agentRole}, "角色 Role -> "+m.agentRole)
 		}
 		return m, nil
 
@@ -809,40 +809,40 @@ func (m *Model) dispatchComposerInput(prompt string) (tea.Model, tea.Cmd) {
 			}
 			title := strings.TrimSpace(strings.Join(titleParts, " "))
 			if title == "" {
-				title = "New Session"
+				title = "新会话"
 			}
 			return m, m.createNewSessionCmd(title, isolateGit)
 
 		case "/role":
 			if arg != "" {
 				m.agentRole = arg
-				m.statusNotice = "Role -> " + arg
+				m.statusNotice = "角色 Role -> " + arg
 				if m.activeSessionID != "" {
-					return m, m.patchSessionCmd(m.activeSessionID, map[string]any{"agent_role": arg}, "Role -> "+arg)
+					return m, m.patchSessionCmd(m.activeSessionID, map[string]any{"agent_role": arg}, "角色 Role -> "+arg)
 				}
 			}
 			return m, nil
 
 		case "/perm":
 			if arg != "" && m.activeWsID != "" {
-				return m, m.patchWorkspaceCmd(m.activeWsID, map[string]any{"perm_mode": arg}, "Workspace perm -> "+arg)
+				return m, m.patchWorkspaceCmd(m.activeWsID, map[string]any{"perm_mode": arg}, "工作区权限 Perm -> "+arg)
 			}
 			return m, nil
 
 		case "/compact":
 			if m.activeSessionID == "" {
-				m.statusNotice = "No active session to compact"
+				m.statusNotice = "当前无活动会话可压缩"
 				return m, nil
 			}
 			return m, m.postSessionActionCmd(
 				fmt.Sprintf("/api/sessions/%s/compact", url.PathEscape(m.activeSessionID)),
 				map[string]any{},
-				"Session compacted",
+				"会话已完成增量压缩",
 			)
 
 		case "/fork":
 			if m.activeSessionID == "" {
-				m.statusNotice = "No active session to fork"
+				m.statusNotice = "当前无活动会话可分叉"
 				return m, nil
 			}
 			return m, m.forkSessionCmd(arg)
@@ -852,7 +852,7 @@ func (m *Model) dispatchComposerInput(prompt string) (tea.Model, tea.Cmd) {
 
 		case "/delete":
 			if m.activeSessionID == "" {
-				m.statusNotice = "No active session to delete"
+				m.statusNotice = "当前无活动会话可删除"
 				return m, nil
 			}
 			force := false
@@ -865,14 +865,14 @@ func (m *Model) dispatchComposerInput(prompt string) (tea.Model, tea.Cmd) {
 
 		case "/archive":
 			if m.activeSessionID == "" {
-				m.statusNotice = "No active session to archive"
+				m.statusNotice = "当前无活动会话可归档"
 				return m, nil
 			}
 			return m, m.archiveSessionCmd(m.activeSessionID)
 
 		case "/land":
 			if m.activeSessionID == "" {
-				m.statusNotice = "No active session to land"
+				m.statusNotice = "当前无活动会话可合入"
 				return m, nil
 			}
 			return m, m.landSessionCmd(m.activeSessionID, arg)
@@ -888,7 +888,7 @@ func (m *Model) dispatchComposerInput(prompt string) (tea.Model, tea.Cmd) {
 	if runID := m.activeRunIDForSession(); runID != "" {
 		return m, m.postActionCmd(fmt.Sprintf("/api/runs/%s/steer", url.PathEscape(runID)), map[string]any{
 			"instruction": prompt,
-		}, "Injected mid-run Steer")
+		}, "已注入运行中 Steer 指令")
 	}
 
 	if m.activeSessionID == "" {
@@ -911,7 +911,7 @@ func (m *Model) View() string {
 		bodyH = 8
 	}
 
-	wsLabel := "no-workspace"
+	wsLabel := "未挂载工作区"
 	for _, ws := range m.boot.Workspaces {
 		if ws.ID == m.activeWsID {
 			wsLabel = config.EscapeBidi(ws.Name)
@@ -924,16 +924,16 @@ func (m *Model) View() string {
 	}
 	modelBadge := m.resolveRoleBadge()
 	topBar := headerStyle.Width(m.width).Render(
-		fmt.Sprintf("Gorness TUI  ·  %s%s  ·  role:%s (%s)  ·  approvals:%d",
+		fmt.Sprintf("Gorness 终端工作台  ·  %s%s  ·  角色:%s (%s)  ·  待审批:%d",
 			wsLabel, wtBadge, config.EscapeBidi(m.agentRole), config.EscapeBidi(modelBadge), len(m.boot.PendingApprovals)),
 	)
 
 	// Left Sidebar (filtered to active workspace)
 	visible := m.visibleSessions()
 	var sbLines []string
-	sbHeader := "Sessions"
+	sbHeader := "会话列表 (Sessions)"
 	if m.focus == focusSidebar {
-		sbHeader = "▶ Sessions"
+		sbHeader = "▶ 会话列表 (Sessions)"
 	}
 	sbLines = append(sbLines, lipgloss.NewStyle().Bold(true).Render(sbHeader))
 	for i, s := range visible {
@@ -1064,10 +1064,10 @@ func (m *Model) View() string {
 
 	// Fleet & Always-On Footer Status Bar
 	fleetSummary := m.formatFleetStatusBar()
-	aoSummary := fmt.Sprintf("Always-On: %d queued · %d deferred", m.boot.AlwaysOn.QueuedCount, m.boot.AlwaysOn.DeferredCount)
+	aoSummary := fmt.Sprintf("常驻 Always-On: %d queued · %d deferred", m.boot.AlwaysOn.QueuedCount, m.boot.AlwaysOn.DeferredCount)
 	notice := m.statusNotice
 	if notice == "" {
-		notice = "Tab:focus · Ctrl+W:workspaces · Ctrl+N:new · Ctrl+R:role · Ctrl+X:stop · Ctrl+C:quit"
+		notice = "Tab:焦点切换 · Ctrl+W:工作区 · Ctrl+N:新建会话 · Ctrl+R:切换角色 · Ctrl+X:停止 · Ctrl+C:退出"
 	}
 	footer := statusBarStyle.Width(m.width).Render(
 		truncateRunes(fmt.Sprintf("%s  |  %s  |  %s", fleetSummary, aoSummary, config.EscapeBidi(notice)), m.width-2),
@@ -1078,9 +1078,9 @@ func (m *Model) View() string {
 
 func (m *Model) renderWorkspaceSwitcher(maxW int) string {
 	var lines []string
-	lines = append(lines, "⇄ Switch Workspace (↑/↓:select · Enter:switch · Esc:close)")
+	lines = append(lines, "⇄ 切换工作区 Switch Workspace (↑/↓:选择 · Enter:切换 · Esc:关闭)")
 	if len(m.boot.Workspaces) == 0 {
-		lines = append(lines, mutedStyle.Render("  (no workspaces registered)"))
+		lines = append(lines, mutedStyle.Render("  (暂无已注册的工作区)"))
 	} else {
 		for i, ws := range m.boot.Workspaces {
 			cur := "  "
@@ -1156,21 +1156,21 @@ func (m *Model) syncApprovalScrollToCursor(appr core.PendingApproval) {
 
 func (m *Model) renderInlineApproval(appr core.PendingApproval, maxW int, maxViewportLines int) string {
 	settled := time.Since(m.surfacedLocal[appr.ID]) >= core.SettleWindow
-	stateTag := "500ms settling..."
+	stateTag := "500ms 防误触冷却中..."
 	if m.editingApprovalFeedback {
-		stateTag = "typing feedback — Enter/Esc:done"
+		stateTag = "正在输入反馈 — Enter/Esc:完成"
 	} else if settled {
-		stateTag = "y:approve selected · r:remember · m:approve+remember · f:feedback · d:deny · space:toggle hunk"
+		stateTag = "y:approve selected 批准勾选 · r:记住 · m:批准并记住 · f:反馈 · d:拒绝 · space:切换块"
 	}
 
 	var lines []string
-	lines = append(lines, fmt.Sprintf("⚠ Approval Required: %s [%s] (%s)",
+	lines = append(lines, fmt.Sprintf("⚠ 需要审批 Approval Required: %s [%s] (%s)",
 		config.EscapeBidi(appr.ToolName), config.EscapeBidi(appr.ReasonCode), stateTag))
 	if reason := strings.TrimSpace(appr.Reason); reason != "" {
-		lines = append(lines, "  Reason: "+truncateRunes(collapseNewlines(config.EscapeBidi(reason)), maxW-12))
+		lines = append(lines, "  原因 Reason: "+truncateRunes(collapseNewlines(config.EscapeBidi(reason)), maxW-16))
 	}
 	if compactArgs := compactJSONArgs(appr.Args); compactArgs != "" && compactArgs != "{}" {
-		lines = append(lines, "  Args:   "+truncateRunes(collapseNewlines(config.EscapeBidi(compactArgs)), maxW-12))
+		lines = append(lines, "  参数 Args:   "+truncateRunes(collapseNewlines(config.EscapeBidi(compactArgs)), maxW-16))
 	}
 
 	remBox := "[ ]"
@@ -1184,9 +1184,9 @@ func (m *Model) renderInlineApproval(appr core.PendingApproval, maxW int, maxVie
 	} else if strings.TrimSpace(fbText) != "" {
 		fbDisplay = config.EscapeBidi(fbText)
 	} else {
-		fbDisplay = mutedStyle.Render("(press f to add feedback)")
+		fbDisplay = mutedStyle.Render("(按 f 填写审批反馈)")
 	}
-	lines = append(lines, fmt.Sprintf("  Remember: %s  ·  Feedback: %s", remBox, fbDisplay))
+	lines = append(lines, fmt.Sprintf("  记住规则 Remember: %s  ·  反馈 Feedback: %s", remBox, fbDisplay))
 
 	if len(appr.Hunks) > 0 {
 		diffLines, _ := m.buildApprovalDiffLines(appr, maxW)
@@ -1882,10 +1882,10 @@ func (m *Model) formatFleetStatusBar() string {
 		if wf == "" {
 			wf = string(active.Topology)
 		}
-		return fmt.Sprintf("Fleet: %d live (%s %d/%d nodes · $%.2f)",
+		return fmt.Sprintf("舰队 Fleet: %d live (%s %d/%d nodes · $%.2f)",
 			runningMissions, wf, doneNodes, len(active.Nodes), active.TotalCostUSD)
 	}
-	return fmt.Sprintf("Fleet: %d live", runningMissions)
+	return fmt.Sprintf("舰队 Fleet: %d live", runningMissions)
 }
 
 func (m *Model) visibleSessions() []*store.SessionMeta {

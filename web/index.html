@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Gorness Studio — Apple HIG Zero-DB Agent Workbench</title>
+  <title>Gorness Studio — macOS 纯 Go 零数据库智能体工作台</title>
   <link rel="stylesheet" href="/styles.css">
 </head>
 <body>
@@ -20,11 +20,11 @@
           <strong>Gorness</strong>
           <span class="brand-sub" data-i18n="brandSub">macOS 纯 Go · 零数据库工作台</span>
         </div>
-        <span id="health-pill" class="status-pill ok" title="Daemon Event Stream">127.0.0.1</span>
+        <span id="health-pill" class="status-pill ok" title="守护进程事件流">127.0.0.1</span>
       </div>
 
       <div class="topbar-center">
-        <div class="segmented-control" role="tablist" aria-label="Center Mode">
+        <div class="segmented-control" role="tablist" aria-label="主工作区模式">
           <button id="mode-chat-btn" class="seg-btn active" type="button" data-mode="chat" data-i18n="modeChat">对话工作台</button>
           <button id="mode-fleet-btn" class="seg-btn" type="button" data-mode="fleet">
             <span data-i18n="modeFleet">多智能体编排画布</span>
@@ -34,7 +34,7 @@
       </div>
 
       <div class="topbar-right">
-        <button id="alwayson-drawer-btn" class="toolbar-btn" type="button" title="Always-On Inbox · Timers · Deferred · Outbox · Dreamer">
+        <button id="alwayson-drawer-btn" class="toolbar-btn" type="button" title="常驻休眠唤醒中枢 · 收件箱 · 定时器 · 延后审批 · 发件箱 · Dreamer">
           <span class="pulse-dot idle" id="alwayson-dot"></span>
           <span data-i18n="alwaysOnBtn">常驻中枢</span>
           <span id="alwayson-count" class="pill-count hidden">0</span>
@@ -51,7 +51,7 @@
     <!-- Main Resizable Three-Pane Workbench -->
     <div class="workbench-grid" id="workbench-grid">
       <!-- LEFT PANE: Global Search, Attention Queue, Workspaces & Sessions -->
-      <aside class="left-pane" id="left-pane" aria-label="Workspaces and Sessions">
+      <aside class="left-pane" id="left-pane" aria-label="工作区与会话">
         <div class="pane-section search-box-wrap" id="search-box-wrap">
           <input
             id="global-search-input"
@@ -107,14 +107,14 @@
         <section id="chat-mode-view" class="mode-view">
           <div class="session-bar">
             <div class="session-title-group">
-              <input id="session-title-input" class="session-title-input" type="text" value="New Session" aria-label="Session Title">
+              <input id="session-title-input" class="session-title-input" type="text" value="新会话" aria-label="会话标题">
               <span id="session-seq-badge" class="meta-chip mono">seq #0</span>
               <span id="session-cost-badge" class="meta-chip mono">0 tok · $0.0000</span>
 
               <!-- Isolated Session Git Worktree Pill (Diff & Land) -->
               <div id="session-worktree-pill" class="worktree-pill hidden">
                 <span class="mono" id="session-wt-branch">⎇ worktree</span>
-                <button id="session-wt-diff-btn" class="ghost-xs-btn" type="button" data-i18n="wtDiffBtn">Diff</button>
+                <button id="session-wt-diff-btn" class="ghost-xs-btn" type="button" data-i18n="wtDiffBtn">差异对比 (Diff)</button>
                 <button id="session-wt-land-open-btn" class="primary-xs-btn" type="button" data-i18n="wtLandBtn">合入 Land</button>
               </div>
             </div>
@@ -145,7 +145,7 @@
 
               <!-- ONE Consolidated Session Actions Menu -->
               <div class="session-menu-wrap" id="session-menu-wrap">
-                <button id="session-actions-menu-btn" class="ghost-xs-btn mono" type="button" aria-haspopup="menu" title="Session Actions">⋯</button>
+                <button id="session-actions-menu-btn" class="ghost-xs-btn mono" type="button" aria-haspopup="menu" title="会话操作菜单">⋯</button>
                 <div id="session-actions-menu" class="dropdown-menu hidden" role="menu">
                   <button class="dropdown-item" type="button" data-session-action="new-worktree" data-i18n="actNewWorktreeSession">🌿 新建隔离 Worktree 会话</button>
                   <div class="dropdown-sep"></div>
@@ -200,7 +200,7 @@
           <div class="fleet-toolbar">
             <div class="fleet-toolbar-left">
               <select id="mission-select" class="mac-select wide"></select>
-              <span id="mission-status-pill" class="status-pill">idle</span>
+              <span id="mission-status-pill" class="status-pill">空闲</span>
               <span id="mission-cost-pill" class="meta-chip mono">$0.0000</span>
             </div>
             <div class="fleet-toolbar-right">
@@ -283,10 +283,10 @@
               <div class="canvas-legend">
                 <span id="fleet-goal-banner" class="fleet-goal-text" data-i18n="fleetEmptyGoal">选择或启动任意异构模型多智能体拓扑</span>
                 <span class="legend-pills">
-                  <span class="legend-item"><i class="lg-dot idle"></i> idle</span>
-                  <span class="legend-item"><i class="lg-dot running"></i> running</span>
-                  <span class="legend-item"><i class="lg-dot merging"></i> refinery</span>
-                  <span class="legend-item"><i class="lg-dot completed"></i> landed</span>
+                  <span class="legend-item"><i class="lg-dot idle"></i> 空闲 (idle)</span>
+                  <span class="legend-item"><i class="lg-dot running"></i> 运行中 (running)</span>
+                  <span class="legend-item"><i class="lg-dot merging"></i> 合并门控 (refinery)</span>
+                  <span class="legend-item"><i class="lg-dot completed"></i> 已合入 (landed)</span>
                 </span>
               </div>
               <div class="svg-stage-wrap">
@@ -321,7 +321,7 @@
               <div class="fleet-panel">
                 <div class="panel-head">
                   <strong data-i18n="blackboardTitle">Markdown 共享黑板 (tasks/*.md &amp; notes/*.md)</strong>
-                  <span id="blackboard-counts" class="meta-chip mono">0 tasks · 0 notes</span>
+                  <span id="blackboard-counts" class="meta-chip mono">0 任务 · 0 笔记</span>
                 </div>
                 <div id="blackboard-tasks-list" class="blackboard-list"></div>
                 <div id="blackboard-notes-list" class="blackboard-notes"></div>
@@ -334,7 +334,7 @@
       <div class="splitter" id="right-splitter" role="separator" aria-orientation="vertical"></div>
 
       <!-- RIGHT PANE: 4 Session/Workspace-Scoped Inspector Tabs (Files | Snapshots | Artifacts | Context & Skills) -->
-      <aside class="right-pane" id="right-pane" aria-label="Inspector">
+      <aside class="right-pane" id="right-pane" aria-label="工作区检视器">
         <nav class="inspector-tabs" role="tablist">
           <button class="insp-tab active" type="button" data-tab="files" data-i18n="tabFiles">文件</button>
           <button class="insp-tab" type="button" data-tab="snapshots" data-i18n="tabSnapshots">时光机</button>
@@ -346,7 +346,7 @@
         <section id="insp-panel-files" class="insp-panel">
           <div class="insp-toolbar">
             <input id="file-filter-input" class="mac-input" type="search" data-i18n-placeholder="filterFilesPh" placeholder="过滤项目文件…">
-            <button id="refresh-files-btn" class="ghost-xs-btn" type="button" title="Refresh">↻</button>
+            <button id="refresh-files-btn" class="ghost-xs-btn" type="button" title="刷新文件列表">↻</button>
           </div>
           <div id="workspace-files-list" class="files-list"></div>
           <div id="file-viewer-card" class="file-viewer-card hidden">
@@ -386,8 +386,8 @@
           </div>
           <div class="csp-shield-note mono">sandbox="allow-scripts" · zero same-origin · connect-src 'none'</div>
           <div id="custom-preview-composer" class="mini-card-form hidden">
-            <input id="custom-preview-title" class="mac-input" type="text" placeholder="Artifact Title">
-            <textarea id="custom-preview-html" class="vault-editor mono short" placeholder="<h1>Hello Sandbox</h1>"></textarea>
+            <input id="custom-preview-title" class="mac-input" type="text" placeholder="预览产物标题">
+            <textarea id="custom-preview-html" class="vault-editor mono short" placeholder="<h1>沙箱预览内容</h1>"></textarea>
             <button id="mint-preview-btn" class="primary-xs-btn" type="button" data-i18n="mintPreviewBtn">生成隔离预览</button>
           </div>
           <article id="inspector-md-preview" class="md-preview-box hidden"></article>
@@ -396,7 +396,7 @@
             class="inspector-preview-frame"
             sandbox="allow-scripts"
             referrerpolicy="no-referrer"
-            title="Isolated HTML Artifact Preview"
+            title="隔离 HTML 产物沙箱预览"
           ></iframe>
         </section>
 
@@ -411,7 +411,7 @@
   <!-- ======================================================================== -->
   <!-- ONE Canonical Settings Modal (#config-mode-view · ⌘, · All 9 Pages)      -->
   <!-- ======================================================================== -->
-  <div id="config-mode-view" class="modal-backdrop hidden" role="dialog" aria-modal="true" aria-label="Settings Center">
+  <div id="config-mode-view" class="modal-backdrop hidden" role="dialog" aria-modal="true" aria-label="系统设置中心">
     <div class="modal-sheet settings-dialog-sheet">
       <aside class="settings-dialog-sidebar" role="tablist">
         <div class="settings-sidebar-brand">
@@ -476,7 +476,7 @@
           </div>
           <div class="row-actions">
             <button id="reload-config-btn" class="ghost-xs-btn" type="button" data-i18n="refreshConfigBtn">↻ 刷新快照</button>
-            <button class="close-modal-btn" type="button" data-close="config-mode-view" title="Close (Esc)">✕</button>
+            <button class="close-modal-btn" type="button" data-close="config-mode-view" title="关闭 (Esc)">✕</button>
           </div>
         </div>
         <div id="config-studio-content" class="config-studio-scroll"></div>
@@ -487,17 +487,17 @@
   <!-- ======================================================================== -->
   <!-- Always-On Slide-Over Drawer (Inbox · Timers · Deferred · Outbox · Dream) -->
   <!-- ======================================================================== -->
-  <div id="alwayson-drawer" class="drawer-backdrop hidden" role="dialog" aria-modal="true" aria-label="Always-On Hub">
+  <div id="alwayson-drawer" class="drawer-backdrop hidden" role="dialog" aria-modal="true" aria-label="常驻休眠唤醒中枢">
     <aside class="drawer-sheet">
       <div class="drawer-head">
         <div>
           <h3 data-i18n="alwaysOnTitle">Always-On 休眠唤醒中枢</h3>
-          <span id="ao-summary-sub" class="tiny-muted mono">0 queued · 0 running · 0 deferred</span>
+          <span id="ao-summary-sub" class="tiny-muted mono">0 排队 · 0 运行中 · 0 待决</span>
         </div>
         <div class="row-actions">
           <button id="refresh-alwayson-btn" class="ghost-xs-btn" type="button">↻</button>
           <button id="trigger-dream-btn" class="primary-xs-btn" type="button" data-i18n="runDreamBtn">✨ 立即运行 Dreamer</button>
-          <button class="close-modal-btn" type="button" data-close="alwayson-drawer" title="Close (Esc)">✕</button>
+          <button class="close-modal-btn" type="button" data-close="alwayson-drawer" title="关闭 (Esc)">✕</button>
         </div>
       </div>
 
@@ -537,7 +537,7 @@
             </label>
             <label>
               <span data-i18n="wsNameLabel">显示名称（可选）</span>
-              <input id="ws-name-input" class="mac-input" type="text" placeholder="My Service">
+              <input id="ws-name-input" class="mac-input" type="text" placeholder="例如：核心后端服务">
             </label>
           </div>
         </details>
@@ -560,7 +560,7 @@
       <div class="modal-form">
         <div class="subhead-row">
           <code id="wt-modal-meta" class="mono tiny-muted"></code>
-          <span id="wt-modal-dirty-pill" class="status-pill">clean</span>
+          <span id="wt-modal-dirty-pill" class="status-pill">干净</span>
         </div>
         <pre id="wt-modal-diff" class="diff-viewer mono" style="max-height:300px;"></pre>
         <label class="cfg-field-label">

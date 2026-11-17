@@ -13,7 +13,7 @@ const I18N = {
     projectsHeader: "工作区与会话",
     addProjectBtn: "+ 项目",
     newSessionBtn: "+ 会话",
-    wtDiffBtn: "Diff",
+    wtDiffBtn: "差异对比 (Diff)",
     wtLandBtn: "合入 Land",
     roleLabel: "角色",
     modelSelectLabel: "模型",
@@ -411,8 +411,8 @@ const ROLE_META = {
 const SPECIALIST_ROLE_PRESETS = [
   {
     id: "security-auditor",
-    name: "Security Auditor",
-    description: "Read-only adversarial security & supply-chain reviewer",
+    name: "安全审计专家 (Security Auditor)",
+    description: "只读对抗性安全与供应链代码审查专家",
     effort: "max",
     read_only: true,
     allowed_tools: ["read_file", "list_files", "grep_search"],
@@ -420,8 +420,8 @@ const SPECIALIST_ROLE_PRESETS = [
   },
   {
     id: "test-architect",
-    name: "Test Architect",
-    description: "TDD edge-case & concurrency race test specialist",
+    name: "测试架构专家 (Test Architect)",
+    description: "TDD 边界条件与高并发竞态测试专家",
     effort: "high",
     read_only: false,
     allowed_tools: ["read_file", "write_file", "edit_file", "list_files", "grep_search", "run_command"],
@@ -429,8 +429,8 @@ const SPECIALIST_ROLE_PRESETS = [
   },
   {
     id: "perf-profiler",
-    name: "Performance Profiler",
-    description: "Latency, memory allocation & lock contention specialist",
+    name: "性能剖析专家 (Performance Profiler)",
+    description: "低延迟、内存分配与锁竞争优化专家",
     effort: "high",
     read_only: true,
     allowed_tools: ["read_file", "list_files", "grep_search", "run_command"],
@@ -470,7 +470,7 @@ const SAFE_DOMAIN_PRESETS = ["api.anthropic.com", "api.openai.com", "generativel
 // ============================================================================
 
 const state = {
-  lang: localStorage.getItem("gorness.lang") || "zh",
+  lang: localStorage.getItem("gorness.lang") === "en" ? "en" : "zh",
   theme: localStorage.getItem("gorness.theme") || "auto",
   centerMode: "chat",
   inspectorTab: "files",
@@ -1018,7 +1018,7 @@ function updateHealthPill(connected, activeRuns = 0) {
     return;
   }
   pill.className = activeRuns > 0 ? "status-pill running" : "status-pill ok";
-  pill.textContent = activeRuns > 0 ? `127.0.0.1 · ${activeRuns} live` : "127.0.0.1";
+  pill.textContent = activeRuns > 0 ? tr(`127.0.0.1 · ${activeRuns} 运行中`, `127.0.0.1 · ${activeRuns} live`) : "127.0.0.1";
 }
 
 function renderReloadBanner(diagText) {
@@ -1218,7 +1218,7 @@ function renderWorkspaceTree() {
             <div class="session-item ${isSelected ? "selected" : ""}" data-session-id="${esc(s.id)}" data-ws-id="${esc(ws.id)}">
               <div class="session-item-main">
                 <div class="session-item-title">
-                  ${isRunning ? '<span class="pulse-dot live"></span> ' : ""}${esc(s.title || "Untitled")}
+                  ${isRunning ? '<span class="pulse-dot live"></span> ' : ""}${esc(s.title || tr("未命名会话", "Untitled"))}
                 </div>
                 <div class="session-item-sub mono">
                   <span>${esc(s.agent_role || "coder")}</span>
@@ -1226,7 +1226,7 @@ function renderWorkspaceTree() {
                   <span>$${Number(s.estimated_usd || 0).toFixed(3)}</span>
                 </div>
               </div>
-              <button class="session-pin-btn ${s.pinned ? "pinned" : ""}" type="button" data-pin-session="${esc(s.id)}" title="Pin">★</button>
+              <button class="session-pin-btn ${s.pinned ? "pinned" : ""}" type="button" data-pin-session="${esc(s.id)}" title="${tr("置顶会话", "Pin")}">★</button>
             </div>
           `;
         })
@@ -1328,14 +1328,14 @@ function syncSessionHeaderControls() {
   const wtBranch = $("session-wt-branch");
 
   if (!meta) {
-    if (titleEl) titleEl.value = "New Session";
+    if (titleEl) titleEl.value = tr("新会话", "New Session");
     if (seqEl) seqEl.textContent = "seq #0";
     if (costEl) costEl.textContent = "0 tok · $0.0000";
     wtPill?.classList.add("hidden");
     return;
   }
 
-  if (titleEl) titleEl.value = meta.title || "Untitled";
+  if (titleEl) titleEl.value = meta.title || tr("未命名会话", "Untitled");
   if (seqEl) seqEl.textContent = `seq #${meta.head_seq || 0}`;
   const tok = Number(meta.input_tokens || 0) + Number(meta.output_tokens || 0);
   if (costEl) costEl.textContent = `${tok} tok · $${Number(meta.estimated_usd || 0).toFixed(4)}`;
@@ -1408,7 +1408,7 @@ async function createNewSession(isolateGit = false) {
       method: "POST",
       body: {
         workspace_id: state.activeWorkspaceId,
-        title: isolateGit ? "Worktree Isolated Session" : "New Session",
+        title: isolateGit ? tr("Worktree 隔离会话", "Worktree Isolated Session") : tr("新会话", "New Session"),
         agent_role: role,
         model_override: ($("model-override-input")?.value || "").trim(),
         isolate_git: Boolean(isolateGit)
@@ -1436,7 +1436,7 @@ async function openSessionWorktreeModal() {
     const res = await apiFetch(`/api/sessions/${encodeURIComponent(state.activeSessionId)}/diff`);
     if (metaEl) metaEl.textContent = `${res.branch || "gorness/session"} · ${res.worktree_path || ""}`;
     if (dirtyEl) {
-      dirtyEl.textContent = res.dirty ? "dirty" : "clean";
+      dirtyEl.textContent = res.dirty ? tr("有变更 (dirty)", "dirty") : tr("干净 (clean)", "clean");
       dirtyEl.className = `status-pill ${res.dirty ? "warn" : "ok"}`;
     }
     if (diffEl) {
@@ -1876,11 +1876,11 @@ function renderContextInspector() {
     <div class="ctx-card">
       <div class="subhead-row">
         <strong>📁 ${esc(ws.name)}</strong>
-        <span class="status-pill ${trustCount > 0 ? "ok" : ""}">${trustCount > 0 ? `${trustCount} trusted` : "standard"}</span>
+        <span class="status-pill ${trustCount > 0 ? "ok" : ""}">${trustCount > 0 ? tr(`已信任 ${trustCount} 项`, `${trustCount} trusted`) : tr("标准策略", "standard")}</span>
       </div>
       <code class="mono tiny-muted" style="word-break:break-all;">${esc(ws.root_path)}</code>
       <div class="subhead-row">
-        <span class="tiny-muted">Gate: <code>${esc(ws.permission_mode || "auto")}</code> · Sandbox: <code>${esc(ws.sandbox_mode || "workspace-write")}</code></span>
+        <span class="tiny-muted">${tr("门控", "Gate")}: <code>${esc(ws.permission_mode || "auto")}</code> · ${tr("沙箱", "Sandbox")}: <code>${esc(ws.sandbox_mode || "workspace-write")}</code></span>
         <div class="row-actions">
           <button class="ghost-xs-btn" type="button" id="ctx-trust-ws-btn">${tr("信任 .gorness", "Trust .gorness")}</button>
           <button class="ghost-xs-btn" type="button" id="ctx-open-perm-btn">${tr("权限设置 ↗", "Permissions ↗")}</button>
@@ -1995,7 +1995,7 @@ function renderSubagentDelegationCard(toolBlock, pairedResult) {
   const isDone = Boolean(pairedResult);
   const isErr = Boolean(pairedResult?.is_error);
   const statusClass = isErr ? "err" : isDone ? "completed" : "running";
-  const statusText = isErr ? "failed" : isDone ? "done" : "running";
+  const statusText = isErr ? tr("失败", "failed") : isDone ? tr("已完成", "done") : tr("运行中", "running");
 
   return `
     <details class="subagent-card ${isErr ? "is-error" : ""}" ${!isDone ? "open" : ""}>
@@ -2014,7 +2014,7 @@ function renderSubagentDelegationCard(toolBlock, pairedResult) {
             ? `<div class="tool-block ${isErr ? "is-error" : ""}">
                 <div class="tool-block-head mono">
                   <span>↳ ${esc(subRole)} ${tr("返回结果", "Result")}</span>
-                  <span>${isErr ? "error" : "ok"}</span>
+                  <span>${isErr ? tr("错误", "error") : tr("完成", "ok")}</span>
                 </div>
                 <pre>${esc(pairedResult.text || "")}</pre>
               </div>`
@@ -2037,7 +2037,7 @@ function renderForkedChildSubagentCard(childSess) {
         </span>
         <span class="row-actions">
           <span class="meta-chip mono">fork @#${childSess.forked_at_seq || 0}</span>
-          <span class="status-pill ${isRunning ? "running" : "ok"}">${isRunning ? "running" : `seq #${childSess.head_seq || 0}`}</span>
+          <span class="status-pill ${isRunning ? "running" : "ok"}">${isRunning ? tr("运行中", "running") : `seq #${childSess.head_seq || 0}`}</span>
         </span>
       </summary>
       <div class="subagent-body">
@@ -2122,7 +2122,7 @@ function renderChatHistory() {
           if (b.tool_call_id && subagentResultByCallID.has(b.tool_call_id)) {
             return "";
           }
-          return `<div class="tool-block ${b.is_error ? "is-error" : ""}"><div class="tool-block-head mono"><span>↳ ${esc(b.tool_name || "result")}</span><span>${b.is_error ? "error" : "ok"}</span></div><pre>${esc(b.text || "")}</pre></div>`;
+          return `<div class="tool-block ${b.is_error ? "is-error" : ""}"><div class="tool-block-head mono"><span>↳ ${esc(b.tool_name || tr("结果", "result"))}</span><span>${b.is_error ? tr("错误", "error") : tr("完成", "ok")}</span></div><pre>${esc(b.text || "")}</pre></div>`;
         }
         return "";
       })
@@ -2147,8 +2147,8 @@ function renderChatHistory() {
           <span class="msg-role-badge">${esc(ent.role)}${ent.agent_role ? ` · ${esc(ent.agent_role)}` : ""}${ent.model_id ? ` (${esc(ent.model_id)})` : ""}</span>
           <div class="row-actions">
             <span class="mono">#${ent.seq}</span>
-            <button class="ghost-xs-btn" type="button" data-fork-seq="${ent.seq}" title="Fork">⑂</button>
-            <button class="ghost-xs-btn" type="button" data-rewind-seq="${ent.seq}" title="Rewind">↺</button>
+            <button class="ghost-xs-btn" type="button" data-fork-seq="${ent.seq}" title="${esc(t("forkHere"))}">⑂</button>
+            <button class="ghost-xs-btn" type="button" data-rewind-seq="${ent.seq}" title="${esc(t("rewindHere"))}">↺</button>
           </div>
         </div>
         ${blocksHTML}
@@ -2196,7 +2196,7 @@ function renderLiveStreamingCard() {
   host.innerHTML = `
     <article class="msg-card role-assistant">
       <div class="msg-head">
-        <span class="msg-role-badge"><span class="pulse-dot live"></span> streaming…</span>
+        <span class="msg-role-badge"><span class="pulse-dot live"></span> ${tr("流式生成中…", "streaming…")}</span>
       </div>
       ${thinkHTML}
       ${toolsHTML}
@@ -2532,12 +2532,12 @@ function updateComposerPalette() {
     items = state.workspaceFiles
       .filter((f) => f.toLowerCase().includes(query))
       .slice(0, 12)
-      .map((f) => ({ insert: `@${f} `, label: `@${f}`, hint: "file" }));
+      .map((f) => ({ insert: `@${f} `, label: `@${f}`, hint: tr("文件", "file") }));
   } else if (trig === "$") {
     items = state.workspaceSkills
       .filter((s) => s.name.toLowerCase().includes(query))
       .slice(0, 12)
-      .map((s) => ({ insert: `$${s.name} `, label: `$${s.name}`, hint: s.description || "skill" }));
+      .map((s) => ({ insert: `$${s.name} `, label: `$${s.name}`, hint: s.description || tr("技能", "skill") }));
   } else if (trig === "/") {
     const cmds = [
       { name: "/compact", desc: tr("锚定增量压缩会话", "Anchored iterative compaction") },
@@ -2624,7 +2624,7 @@ function scheduleDraftSave() {
         body: { draft: draftVal }
       });
       const ind = $("draft-saved-indicator");
-      if (ind) ind.textContent = "draft saved";
+      if (ind) ind.textContent = tr("草稿已保存", "draft saved");
     } catch {}
   }, 450);
 }
@@ -2752,7 +2752,7 @@ function renderApprovalCards() {
       if (now >= settleMs) {
         const lbl = $(`settle-label-${appr.id}`);
         if (lbl) {
-          lbl.textContent = "ready";
+          lbl.textContent = tr("可审批", "ready");
           lbl.className = "status-pill ok";
         }
         $$(`[data-card-appr="${CSS.escape(appr.id)}"] .appr-act-btn`).forEach((b) => {
@@ -2895,7 +2895,7 @@ function renderFleetStudio() {
 
   if (!snap) {
     if (statusPill) {
-      statusPill.textContent = "idle";
+      statusPill.textContent = tr("空闲", "idle");
       statusPill.className = "status-pill";
     }
     if (costPill) costPill.textContent = "$0.0000";
@@ -3100,13 +3100,13 @@ function renderBlackboard(snap) {
 
   const tasks = snap?.tasks || [];
   const notes = snap?.notes || [];
-  if (countsEl) countsEl.textContent = `${tasks.length} tasks · ${notes.length} notes`;
+  if (countsEl) countsEl.textContent = tr(`${tasks.length} 任务 · ${notes.length} 笔记`, `${tasks.length} tasks · ${notes.length} notes`);
 
   tasksEl.innerHTML = tasks
     .map(
       (tk) => `
       <div class="bb-task-row">
-        <span><strong>${esc(tk.title || tk.id)}</strong> <span class="tiny-muted mono">(${esc(tk.owner_node_id || tk.owner || "unclaimed")})</span></span>
+        <span><strong>${esc(tk.title || tk.id)}</strong> <span class="tiny-muted mono">(${esc(tk.owner_node_id || tk.owner || tr("待认领", "unclaimed"))})</span></span>
         <span class="status-pill ${esc(tk.status)}">${esc(tk.status)}</span>
       </div>
     `
@@ -3117,7 +3117,7 @@ function renderBlackboard(snap) {
     .map(
       (nt) => `
       <div class="bb-note-card">
-        <div class="mono"><strong>${esc(nt.title || nt.node_id || nt.author || nt.name || "note")}</strong></div>
+        <div class="mono"><strong>${esc(nt.title || nt.node_id || nt.author || nt.name || tr("笔记", "note"))}</strong></div>
         <div class="tiny-muted">${esc((nt.body || "").slice(0, 220))}</div>
       </div>
     `
@@ -3250,7 +3250,10 @@ function renderAlwaysOn() {
   if ($("ao-summary-sub")) {
     const qCnt = inbox.filter((i) => i.status === "queued").length;
     const rCnt = inbox.filter((i) => i.status === "running").length;
-    $("ao-summary-sub").textContent = `${qCnt} queued · ${rCnt} running · ${deferred.length} deferred · ${timers.length} timers`;
+    $("ao-summary-sub").textContent = tr(
+      `${qCnt} 排队 · ${rCnt} 运行中 · ${deferred.length} 待决 · ${timers.length} 定时器`,
+      `${qCnt} queued · ${rCnt} running · ${deferred.length} deferred · ${timers.length} timers`
+    );
   }
 
   const host = $("alwayson-drawer-body");
@@ -3337,8 +3340,8 @@ function renderAlwaysOn() {
           <label class="cfg-field-label">
             <span>${tr("类型 (Kind)", "Kind")}</span>
             <select id="ao-timer-kind" class="mac-select">
-              <option value="cron" ${timerEdit.kind === "cron" ? "selected" : ""}>cron</option>
-              <option value="once" ${timerEdit.kind === "once" ? "selected" : ""}>once (delay sec)</option>
+              <option value="cron" ${timerEdit.kind === "cron" ? "selected" : ""}>${tr("cron (周期计划)", "cron")}</option>
+              <option value="once" ${timerEdit.kind === "once" ? "selected" : ""}>${tr("once (单次延迟秒数)", "once (delay sec)")}</option>
             </select>
           </label>
           <label class="cfg-field-label">
@@ -3439,10 +3442,10 @@ function renderAlwaysOn() {
                   return `
                     <div class="ao-item">
                       <div class="subhead-row">
-                        <strong>${esc(o.title || "Notification")}</strong>
+                        <strong>${esc(o.title || tr("系统通知", "Notification"))}</strong>
                         <div class="row-actions">
-                          <span class="status-pill ${isAcked ? "" : "ok"}">${isAcked ? "acked" : "new"}</span>
-                          ${!isAcked && o.id ? `<button class="ghost-xs-btn" type="button" data-ao-ack-id="${esc(o.id)}">Ack</button>` : ""}
+                          <span class="status-pill ${isAcked ? "" : "ok"}">${isAcked ? tr("已读", "acked") : tr("新通知", "new")}</span>
+                          ${!isAcked && o.id ? `<button class="ghost-xs-btn" type="button" data-ao-ack-id="${esc(o.id)}">${tr("已读 (Ack)", "Ack")}</button>` : ""}
                         </div>
                       </div>
                       <div class="tiny-muted">${esc(o.body || "")}</div>
@@ -3691,16 +3694,16 @@ function renderConfigStudio() {
 function renderGeneralSettingsPage() {
   const g = state.config.global || {};
   const permModes = [
-    { v: "auto", l: "Auto" },
-    { v: "accept_edits", l: "Accept Edits" },
-    { v: "ask", l: "Ask" },
-    { v: "plan", l: "Plan" },
-    { v: "yolo", l: "Yolo" }
+    { v: "auto", l: tr("自动门控 (Auto)", "Auto") },
+    { v: "accept_edits", l: tr("接受编辑 (Accept Edits)", "Accept Edits") },
+    { v: "ask", l: tr("逐次询问 (Ask)", "Ask") },
+    { v: "plan", l: tr("只读规划 (Plan)", "Plan") },
+    { v: "yolo", l: tr("全放行 (Yolo)", "Yolo") }
   ];
   const sbModes = [
-    { v: "workspace-write", l: "workspace-write (Seatbelt)" },
-    { v: "read-only", l: "read-only" },
-    { v: "off", l: "off" }
+    { v: "workspace-write", l: tr("仅写工作区 (Seatbelt)", "workspace-write (Seatbelt)") },
+    { v: "read-only", l: tr("只读沙箱 (read-only)", "read-only") },
+    { v: "off", l: tr("关闭沙箱 (off)", "off") }
   ];
 
   return `
@@ -3710,7 +3713,7 @@ function renderGeneralSettingsPage() {
           <h3 class="cfg-section-title">🖥️ ${tr("本地守护进程与透明文件仓状态", "Local Daemon & Zero-DB Vault Status")}</h3>
           <p class="cfg-section-desc">${tr("纯本机 127.0.0.1 回环服务，零外部数据库依赖，所有设置即时热加载。", "Loopback-only 127.0.0.1 daemon · zero SQLite/Postgres · instant fsnotify reload.")}</p>
         </div>
-        <span class="status-pill ${state.health.connected ? "ok" : "warn"}">${state.health.connected ? "SSE Connected" : "Reconnecting"}</span>
+        <span class="status-pill ${state.health.connected ? "ok" : "warn"}">${state.health.connected ? tr("SSE 已连接", "SSE Connected") : tr("重连中", "Reconnecting")}</span>
       </div>
       <div class="three-col">
         <div class="ctx-card">
@@ -4131,10 +4134,10 @@ function renderProvidersSettingsPage() {
         <table class="editable-table">
           <thead>
             <tr>
-              <th>Model ID</th>
+              <th>${tr("模型 ID (Model ID)", "Model ID")}</th>
               <th>${tr("名称", "Name")}</th>
-              <th>Context</th>
-              <th>USD / 1M (in/out)</th>
+              <th>${tr("上下文窗口 (Context)", "Context")}</th>
+              <th>${tr("每百万 Token 价格 (入/出 USD)", "USD / 1M (in/out)")}</th>
               <th></th>
             </tr>
           </thead>
@@ -4497,11 +4500,11 @@ function renderWorkflowsSettingsPage() {
         <table class="editable-table">
           <thead>
             <tr>
-              <th>Node ID</th>
+              <th>${tr("节点 ID (Node ID)", "Node ID")}</th>
               <th>${tr("名称", "Label")}</th>
               <th>${tr("角色", "Agent Role")}</th>
               <th>${tr("独立模型覆盖 (role_models[id])", "Node Model Override")}</th>
-              <th>Worktree</th>
+              <th>${tr("Worktree 隔离", "Worktree")}</th>
               <th></th>
             </tr>
           </thead>
@@ -4565,10 +4568,10 @@ function renderPermissionsSettingsPage() {
             </div>
             <div class="row-actions">
               <select id="ws-perm-override-sel" class="mac-select">
-                ${["auto", "accept_edits", "ask", "plan", "yolo"].map((m) => `<option value="${m}" ${(activeWs.permission_mode || "auto") === m ? "selected" : ""}>Gate: ${m}</option>`).join("")}
+                ${["auto", "accept_edits", "ask", "plan", "yolo"].map((m) => `<option value="${m}" ${(activeWs.permission_mode || "auto") === m ? "selected" : ""}>${tr("门控", "Gate")}: ${m}</option>`).join("")}
               </select>
               <select id="ws-sb-override-sel" class="mac-select">
-                ${["workspace-write", "read-only", "off"].map((m) => `<option value="${m}" ${(activeWs.sandbox_mode || "workspace-write") === m ? "selected" : ""}>Sandbox: ${m}</option>`).join("")}
+                ${["workspace-write", "read-only", "off"].map((m) => `<option value="${m}" ${(activeWs.sandbox_mode || "workspace-write") === m ? "selected" : ""}>${tr("沙箱", "Sandbox")}: ${m}</option>`).join("")}
               </select>
             </div>
           </div>
@@ -4737,7 +4740,7 @@ function renderMCPSettingsPage() {
                 <div class="row-actions">
                   <strong class="mono">${esc(id)}</strong>
                   <span class="meta-chip mono">${esc(sv.transport || "stdio")}</span>
-                  <span class="status-pill ${sv.enabled ? "ok" : ""}">${sv.enabled ? "enabled" : "disabled"}</span>
+                  <span class="status-pill ${sv.enabled ? "ok" : ""}">${sv.enabled ? tr("已启用", "enabled") : tr("已停用", "disabled")}</span>
                 </div>
                 <div class="mono tiny-muted" style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${esc(summary)}</div>
               </div>

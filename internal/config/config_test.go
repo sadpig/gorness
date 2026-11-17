@@ -885,9 +885,15 @@ command = "gofmt -s -w ."
 	if candSnap.Global.UITheme != "dark" || candSnap.Global.UILang != "en" {
 		t.Fatalf("expected UITheme=dark UILang=en in candidate snapshot, got %+v", candSnap.Global)
 	}
-	// Disk snapshot must remain untouched by ValidateCandidate!
-	if mgr.Current().Global.UITheme != "" {
-		t.Fatalf("ValidateCandidate mutated live manager state: %+v", mgr.Current().Global)
+	// Disk snapshot must remain untouched by ValidateCandidate, and default UILang is "zh"!
+	if mgr.Current().Global.UITheme != "" || mgr.Current().Global.UILang != "zh" {
+		t.Fatalf("ValidateCandidate mutated live manager state or default UILang != zh: %+v", mgr.Current().Global)
+	}
+	candDefaultLang, err := mgr.ValidateCandidate(map[string][]byte{
+		"config.toml": []byte("host = \"127.0.0.1\"\nport = 3456\ndefault_provider = \"anthropic\"\ndefault_model = \"claude-sonnet-5-5\"\n"),
+	})
+	if err != nil || candDefaultLang.Global.UILang != "zh" || candDefaultLang.Global.Language != "zh" {
+		t.Fatalf("expected omitted ui_lang/language to default to zh, got snap=%+v err=%v", candDefaultLang, err)
 	}
 
 	if _, err := mgr.ValidateCandidate(map[string][]byte{"illegal.json": []byte(`{}`)}); err == nil {

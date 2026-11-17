@@ -40,59 +40,59 @@ extern void goOpenVaultInFinder(void);
 	NSMenuItem *appMenuItem = [[NSMenuItem alloc] init];
 	[menubar addItem:appMenuItem];
 	NSMenu *appMenu = [[NSMenu alloc] initWithTitle:@"Gorness"];
-	[appMenu addItemWithTitle:@"About Gorness" action:@selector(orderFrontStandardAboutPanel:) keyEquivalent:@""];
+	[appMenu addItemWithTitle:@"关于 Gorness" action:@selector(orderFrontStandardAboutPanel:) keyEquivalent:@""];
 	[appMenu addItem:[NSMenuItem separatorItem]];
-	NSMenuItem *settingsItem = [[NSMenuItem alloc] initWithTitle:@"Settings & Config Matrix…" action:@selector(openSettings:) keyEquivalent:@","];
+	NSMenuItem *settingsItem = [[NSMenuItem alloc] initWithTitle:@"设置与角色模型矩阵…" action:@selector(openSettings:) keyEquivalent:@","];
 	[settingsItem setTarget:self];
 	[appMenu addItem:settingsItem];
 	[appMenu addItem:[NSMenuItem separatorItem]];
-	NSMenuItem *openProj = [[NSMenuItem alloc] initWithTitle:@"Add Project Folder…" action:@selector(addProjectFolder:) keyEquivalent:@"o"];
+	NSMenuItem *openProj = [[NSMenuItem alloc] initWithTitle:@"添加项目文件夹…" action:@selector(addProjectFolder:) keyEquivalent:@"o"];
 	[openProj setTarget:self];
 	[appMenu addItem:openProj];
-	NSMenuItem *openVault = [[NSMenuItem alloc] initWithTitle:@"Reveal ~/.gorness in Finder" action:@selector(revealVault:) keyEquivalent:@"G"];
+	NSMenuItem *openVault = [[NSMenuItem alloc] initWithTitle:@"在 Finder 中显示 ~/.gorness" action:@selector(revealVault:) keyEquivalent:@"G"];
 	[openVault setKeyEquivalentModifierMask:(NSEventModifierFlagCommand | NSEventModifierFlagShift)];
 	[openVault setTarget:self];
 	[appMenu addItem:openVault];
 	[appMenu addItem:[NSMenuItem separatorItem]];
-	[appMenu addItemWithTitle:@"Hide Gorness" action:@selector(hide:) keyEquivalent:@"h"];
-	NSMenuItem *hideOthers = [[NSMenuItem alloc] initWithTitle:@"Hide Others" action:@selector(hideOtherApplications:) keyEquivalent:@"h"];
+	[appMenu addItemWithTitle:@"隐藏 Gorness" action:@selector(hide:) keyEquivalent:@"h"];
+	NSMenuItem *hideOthers = [[NSMenuItem alloc] initWithTitle:@"隐藏其他" action:@selector(hideOtherApplications:) keyEquivalent:@"h"];
 	[hideOthers setKeyEquivalentModifierMask:(NSEventModifierFlagCommand | NSEventModifierFlagOption)];
 	[appMenu addItem:hideOthers];
-	[appMenu addItemWithTitle:@"Show All" action:@selector(unhideAllApplications:) keyEquivalent:@""];
+	[appMenu addItemWithTitle:@"全部显示" action:@selector(unhideAllApplications:) keyEquivalent:@""];
 	[appMenu addItem:[NSMenuItem separatorItem]];
-	[appMenu addItemWithTitle:@"Quit Gorness" action:@selector(terminate:) keyEquivalent:@"q"];
+	[appMenu addItemWithTitle:@"退出 Gorness" action:@selector(terminate:) keyEquivalent:@"q"];
 	[appMenuItem setSubmenu:appMenu];
 
 	// Edit Menu (essential for Cmd+C/V/X/A/Z in WKWebView inputs)
 	NSMenuItem *editMenuItem = [[NSMenuItem alloc] init];
 	[menubar addItem:editMenuItem];
-	NSMenu *editMenu = [[NSMenu alloc] initWithTitle:@"Edit"];
-	[editMenu addItemWithTitle:@"Undo" action:NSSelectorFromString(@"undo:") keyEquivalent:@"z"];
-	NSMenuItem *redoItem = [[NSMenuItem alloc] initWithTitle:@"Redo" action:NSSelectorFromString(@"redo:") keyEquivalent:@"Z"];
+	NSMenu *editMenu = [[NSMenu alloc] initWithTitle:@"编辑"];
+	[editMenu addItemWithTitle:@"撤销" action:NSSelectorFromString(@"undo:") keyEquivalent:@"z"];
+	NSMenuItem *redoItem = [[NSMenuItem alloc] initWithTitle:@"重做" action:NSSelectorFromString(@"redo:") keyEquivalent:@"Z"];
 	[redoItem setKeyEquivalentModifierMask:(NSEventModifierFlagCommand | NSEventModifierFlagShift)];
 	[editMenu addItem:redoItem];
 	[editMenu addItem:[NSMenuItem separatorItem]];
-	[editMenu addItemWithTitle:@"Cut" action:@selector(cut:) keyEquivalent:@"x"];
-	[editMenu addItemWithTitle:@"Copy" action:@selector(copy:) keyEquivalent:@"c"];
-	[editMenu addItemWithTitle:@"Paste" action:@selector(paste:) keyEquivalent:@"v"];
-	[editMenu addItemWithTitle:@"Select All" action:@selector(selectAll:) keyEquivalent:@"a"];
+	[editMenu addItemWithTitle:@"剪切" action:@selector(cut:) keyEquivalent:@"x"];
+	[editMenu addItemWithTitle:@"拷贝" action:@selector(copy:) keyEquivalent:@"c"];
+	[editMenu addItemWithTitle:@"粘贴" action:@selector(paste:) keyEquivalent:@"v"];
+	[editMenu addItemWithTitle:@"全选" action:@selector(selectAll:) keyEquivalent:@"a"];
 	[editMenuItem setSubmenu:editMenu];
 
 	// View Menu
 	NSMenuItem *viewMenuItem = [[NSMenuItem alloc] init];
 	[menubar addItem:viewMenuItem];
-	NSMenu *viewMenu = [[NSMenu alloc] initWithTitle:@"View"];
-	NSMenuItem *reloadItem = [[NSMenuItem alloc] initWithTitle:@"Reload Workbench" action:@selector(reloadWorkbench:) keyEquivalent:@"r"];
+	NSMenu *viewMenu = [[NSMenu alloc] initWithTitle:@"视图"];
+	NSMenuItem *reloadItem = [[NSMenuItem alloc] initWithTitle:@"重新加载工作台" action:@selector(reloadWorkbench:) keyEquivalent:@"r"];
 	[reloadItem setTarget:self];
 	[viewMenu addItem:reloadItem];
 	[viewMenu addItem:[NSMenuItem separatorItem]];
-	NSMenuItem *zoomActual = [[NSMenuItem alloc] initWithTitle:@"Actual Size" action:@selector(resetZoom:) keyEquivalent:@"0"];
+	NSMenuItem *zoomActual = [[NSMenuItem alloc] initWithTitle:@"实际大小" action:@selector(resetZoom:) keyEquivalent:@"0"];
 	[zoomActual setTarget:self];
 	[viewMenu addItem:zoomActual];
-	NSMenuItem *zoomIn = [[NSMenuItem alloc] initWithTitle:@"Zoom In" action:@selector(zoomIn:) keyEquivalent:@"="];
+	NSMenuItem *zoomIn = [[NSMenuItem alloc] initWithTitle:@"放大" action:@selector(zoomIn:) keyEquivalent:@"="];
 	[zoomIn setTarget:self];
 	[viewMenu addItem:zoomIn];
-	NSMenuItem *zoomOut = [[NSMenuItem alloc] initWithTitle:@"Zoom Out" action:@selector(zoomOut:) keyEquivalent:@"-"];
+	NSMenuItem *zoomOut = [[NSMenuItem alloc] initWithTitle:@"缩小" action:@selector(zoomOut:) keyEquivalent:@"-"];
 	[zoomOut setTarget:self];
 	[viewMenu addItem:zoomOut];
 	[viewMenuItem setSubmenu:viewMenu];
@@ -100,9 +100,9 @@ extern void goOpenVaultInFinder(void);
 	// Window Menu
 	NSMenuItem *winMenuItem = [[NSMenuItem alloc] init];
 	[menubar addItem:winMenuItem];
-	NSMenu *winMenu = [[NSMenu alloc] initWithTitle:@"Window"];
-	[winMenu addItemWithTitle:@"Minimize" action:@selector(performMiniaturize:) keyEquivalent:@"m"];
-	[winMenu addItemWithTitle:@"Close Window" action:@selector(performClose:) keyEquivalent:@"w"];
+	NSMenu *winMenu = [[NSMenu alloc] initWithTitle:@"窗口"];
+	[winMenu addItemWithTitle:@"最小化" action:@selector(performMiniaturize:) keyEquivalent:@"m"];
+	[winMenu addItemWithTitle:@"关闭窗口" action:@selector(performClose:) keyEquivalent:@"w"];
 	[winMenuItem setSubmenu:winMenu];
 	[NSApp setWindowsMenu:winMenu];
 
@@ -115,29 +115,29 @@ extern void goOpenVaultInFinder(void);
 	self.statusItem.button.font = [NSFont monospacedSystemFontOfSize:12.5 weight:NSFontWeightBold];
 
 	NSMenu *menu = [[NSMenu alloc] init];
-	self.attentionMenuItem = [[NSMenuItem alloc] initWithTitle:@"All Clear (0 pending)" action:@selector(showMainWindow:) keyEquivalent:@""];
+	self.attentionMenuItem = [[NSMenuItem alloc] initWithTitle:@"全部就绪 (0 待处理)" action:@selector(showMainWindow:) keyEquivalent:@""];
 	[self.attentionMenuItem setTarget:self];
 	[menu addItem:self.attentionMenuItem];
 	[menu addItem:[NSMenuItem separatorItem]];
 
-	NSMenuItem *showItem = [[NSMenuItem alloc] initWithTitle:@"Open Gorness Studio" action:@selector(showMainWindow:) keyEquivalent:@""];
+	NSMenuItem *showItem = [[NSMenuItem alloc] initWithTitle:@"打开 Gorness 工作台" action:@selector(showMainWindow:) keyEquivalent:@""];
 	[showItem setTarget:self];
 	[menu addItem:showItem];
 
-	NSMenuItem *statusSettingsItem = [[NSMenuItem alloc] initWithTitle:@"Settings & Config Matrix…" action:@selector(openSettings:) keyEquivalent:@""];
+	NSMenuItem *statusSettingsItem = [[NSMenuItem alloc] initWithTitle:@"设置与角色模型矩阵…" action:@selector(openSettings:) keyEquivalent:@""];
 	[statusSettingsItem setTarget:self];
 	[menu addItem:statusSettingsItem];
 
-	NSMenuItem *addItem = [[NSMenuItem alloc] initWithTitle:@"Add Project Folder…" action:@selector(addProjectFolder:) keyEquivalent:@""];
+	NSMenuItem *addItem = [[NSMenuItem alloc] initWithTitle:@"添加项目文件夹…" action:@selector(addProjectFolder:) keyEquivalent:@""];
 	[addItem setTarget:self];
 	[menu addItem:addItem];
 
-	NSMenuItem *vaultItem = [[NSMenuItem alloc] initWithTitle:@"Open ~/.gorness Config" action:@selector(revealVault:) keyEquivalent:@""];
+	NSMenuItem *vaultItem = [[NSMenuItem alloc] initWithTitle:@"打开 ~/.gorness 配置目录" action:@selector(revealVault:) keyEquivalent:@""];
 	[vaultItem setTarget:self];
 	[menu addItem:vaultItem];
 
 	[menu addItem:[NSMenuItem separatorItem]];
-	[menu addItemWithTitle:@"Quit Gorness" action:@selector(terminate:) keyEquivalent:@""];
+	[menu addItemWithTitle:@"退出 Gorness" action:@selector(terminate:) keyEquivalent:@""];
 	self.statusItem.menu = menu;
 }
 
@@ -148,12 +148,12 @@ extern void goOpenVaultInFinder(void);
 	if (count > 0) {
 		self.statusItem.button.title = [NSString stringWithFormat:@"G·%d", count];
 		if (self.attentionMenuItem != nil) {
-			self.attentionMenuItem.title = [NSString stringWithFormat:@"Attention Required: %d pending", count];
+			self.attentionMenuItem.title = [NSString stringWithFormat:@"待处理审批: %d 项", count];
 		}
 	} else {
 		self.statusItem.button.title = @"G·";
 		if (self.attentionMenuItem != nil) {
-			self.attentionMenuItem.title = @"All Clear (0 pending)";
+			self.attentionMenuItem.title = @"全部就绪 (0 待处理)";
 		}
 	}
 }
@@ -283,8 +283,8 @@ extern void goOpenVaultInFinder(void);
 	[panel setCanChooseFiles:NO];
 	[panel setCanChooseDirectories:YES];
 	[panel setAllowsMultipleSelection:NO];
-	[panel setPrompt:@"Add Project"];
-	[panel setMessage:@"Select a project repository folder to mount in Gorness"];
+	[panel setPrompt:@"挂载项目"];
+	[panel setMessage:@"选择要挂载到 Gorness 的本地代码仓库文件夹"];
 	if ([panel runModal] == NSModalResponseOK) {
 		NSURL *chosen = [[panel URLs] firstObject];
 		if (chosen != nil && [chosen path] != nil) {
@@ -364,7 +364,7 @@ extern void goOpenVaultInFinder(void);
 	NSRect pFrame = NSMakeRect(0, 0, 980, 700);
 	NSWindowStyleMask style = NSWindowStyleMaskTitled | NSWindowStyleMaskClosable | NSWindowStyleMaskMiniaturizable | NSWindowStyleMaskResizable;
 	NSWindow *childWin = [[NSWindow alloc] initWithContentRect:pFrame styleMask:style backing:NSBackingStoreBuffered defer:NO];
-	[childWin setTitle:@"Gorness Isolated Preview"];
+	[childWin setTitle:@"Gorness 隔离沙箱预览"];
 	[childWin setReleasedWhenClosed:NO];
 	[childWin setDelegate:self];
 	[childWin center];
@@ -386,7 +386,7 @@ void runCocoaDesktop(const char *baseURL, const char *errMsg) {
 		if (errMsg != NULL && strlen(errMsg) > 0) {
 			NSAlert *alert = [[NSAlert alloc] init];
 			[alert setAlertStyle:NSAlertStyleCritical];
-			[alert setMessageText:@"Gorness Engine Failed to Start"];
+			[alert setMessageText:@"Gorness 引擎启动失败"];
 			[alert setInformativeText:[NSString stringWithUTF8String:errMsg]];
 			[alert runModal];
 			return;
