@@ -380,7 +380,9 @@
             <button id="collapse-all-files-btn" class="ghost-xs-btn" type="button" title="全部折叠" data-i18n="collapseAllFiles">折叠</button>
             <button id="refresh-files-btn" class="ghost-xs-btn" type="button" title="刷新文件树">↻</button>
           </div>
-          <div id="workspace-files-list" class="files-list tree-view" role="tree" aria-label="工作区文件树"></div>
+          <div id="inspector-tree-view" class="inspector-tree-view-wrap" style="display:flex;flex-direction:column;flex:1;min-height:0;">
+            <div id="workspace-files-list" class="files-list tree-view" role="tree" aria-label="工作区文件树"></div>
+          </div>
           <div id="file-viewer-card" class="file-viewer-card hidden">
             <div class="file-viewer-head">
               <div class="row-actions" style="min-width:0;flex:1;">

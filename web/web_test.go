@@ -117,6 +117,7 @@ func TestEmbeddedAssetsSingleSettingsHomeAndUIDeduplication(t *testing.T) {
 		`id="session-actions-menu"`,
 		`id="expand-all-files-btn"`,
 		`id="collapse-all-files-btn"`,
+		`id="inspector-tree-view"`,
 		`id="cite-file-in-chat-btn"`,
 		`id="close-file-viewer-btn"`,
 		`data-session-action="new-worktree"`,
@@ -504,7 +505,8 @@ globalThis.fetch = async (input, init = {}) => {
   if (input === "/api/config/providers/fetch-models") {
     return new Response(JSON.stringify({
       source: "remote",
-      models: [
+      models: ["claude-opus-4-6", "claude-sonnet-5-5"],
+      model_specs: [
         { id: "claude-opus-4-6", name: "Claude Opus 4.6", context_window: 200000, max_output_tokens: 32000, supports_thinking: true },
         { id: "claude-sonnet-5-5", name: "Claude Sonnet 5.5", context_window: 200000, max_output_tokens: 16384, supports_thinking: true }
       ]
@@ -549,8 +551,8 @@ assert.match(chatHTML, /Web audit clean/, "paired subagent result must render in
 
 // D. Verify all 8 visual Settings pages render clean form controls, custom MCP servers, lifecycle hooks, and per-node role_models[nd.id]!
 const pageChecks = [
-  ["general", /id="cfg-ui-theme-select"[\s\S]*id="cfg-ui-lang-select"[\s\S]*data-global-num-select="auto_compact_threshold_percent"[\s\S]*data-global-num-select="max_tool_concurrency"[\s\S]*data-global-num-select="subagent_max_steps"[\s\S]*data-global-num-select="command_timeout_seconds"[\s\S]*data-global-bool-select="auto_generate_title"[\s\S]*data-global-num-select="dreamer_idle_minutes"[\s\S]*data-global-num-select="witness_timeout_seconds"[\s\S]*id="gen-max-runs"/],
-  ["matrix", /data-matrix-subtab="core"[\s\S]*id="cfg-global-provider"[\s\S]*data-agent-model-select="coder"[\s\S]*data-agent-effort-select="coder"/],
+  ["general", /id="cfg-ui-theme-select"[\s\S]*id="cfg-ui-lang-select"[\s\S]*id="cfg-default-model"[\s\S]*data-global-num-select="auto_compact_threshold_percent"[\s\S]*data-global-num-select="max_tool_concurrency"[\s\S]*data-global-num-select="subagent_max_steps"[\s\S]*data-global-num-select="command_timeout_seconds"[\s\S]*data-global-bool-select="auto_generate_title"[\s\S]*data-global-num-select="dreamer_idle_minutes"[\s\S]*data-global-num-select="witness_timeout_seconds"[\s\S]*id="gen-max-runs"/],
+  ["matrix", /data-matrix-subtab="core"[\s\S]*id="cfg-global-provider"[\s\S]*data-agent-fallback-model="coder"[\s\S]*data-agent-model="coder"[\s\S]*data-agent-model-select="coder"[\s\S]*data-agent-effort-select="coder"/],
   ["providers", /id="keychain-key-input"[\s\S]*id="prov-edit-baseurl"[\s\S]*id="fetch-provider-models-btn"[\s\S]*id="delete-provider-btn"/],
   ["agents", /id="ag-edit-id"[\s\S]*id="ag-edit-model"[\s\S]*id="ag-edit-sysprompt"/],
   ["workflows", /id="wf-edit-id"[\s\S]*id="wf-edit-topology"[\s\S]*id="wf-flow-preview-bar"[\s\S]*data-wf-node-field="model_override"/],

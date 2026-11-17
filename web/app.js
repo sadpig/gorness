@@ -4107,6 +4107,18 @@ function renderGeneralSettingsPage() {
         </div>
         <div class="inset-row">
           <div class="settings-row-info">
+            <strong>${tr("默认推理模型 (default_model)", "Default Reasoning Model")}</strong>
+            <span>${tr("从已配置的供应商模型目录中选择全局默认模型", "Select global default model from enabled provider catalogs")}</span>
+          </div>
+          <select id="cfg-default-model" class="mac-select wide mono">
+            ${renderModelCatalogOptgroupsHTML(
+              g.default_provider && g.default_model ? `${g.default_provider}/${g.default_model}` : g.default_model || "",
+              null
+            )}
+          </select>
+        </div>
+        <div class="inset-row">
+          <div class="settings-row-info">
             <strong>${tr("默认权限门控 (permission_mode)", "Default Permission Mode")}</strong>
             <span>${tr("新会话默认工具执行与文件编辑门控级别", "Default gate mode for new sessions")}</span>
           </div>
@@ -4336,7 +4348,7 @@ function renderMatrixSettingsPage() {
                   <summary class="tiny-muted" style="cursor:pointer;">${tr("降级链", "Fallbacks")} (${fallbacks.length})</summary>
                   <div class="chips-wrap" style="margin-top:4px;">
                     ${fbChips || `<span class="tiny-muted">${tr("无", "None")}</span>`}
-                    <select class="mac-select mono" style="max-width:160px;" data-add-fallback="${esc(aId)}" title="${tr("添加备选降级模型", "Add fallback model")}">
+                    <select class="mac-select mono" style="max-width:160px;" data-add-fallback="${esc(aId)}" data-agent-fallback-model="${esc(aId)}" title="${tr("添加备选降级模型", "Add fallback model")}">
                       <option value="">${tr("+ 备选…", "+ Add…")}</option>
                       ${addFbOpts}
                     </select>
@@ -4353,7 +4365,7 @@ function renderMatrixSettingsPage() {
           </label>
 
           <label class="cfg-field-label">
-            <select class="mac-select matrix-select mono" data-agent-model-select="${esc(aId)}" title="${esc(curModel)}">
+            <select class="mac-select matrix-select mono" data-agent-model="${esc(aId)}" data-agent-model-select="${esc(aId)}" title="${esc(curModel)}">
               ${modelList.map((m) => `<option value="${esc(m.id)}" ${m.id === curModel ? "selected" : ""}>${esc(m.name)} (${esc(m.id)})</option>`).join("")}
             </select>
           </label>
@@ -5932,7 +5944,8 @@ async function fetchProviderModels() {
         headers: d.headers || {}
       }
     });
-    if (Array.isArray(res?.models)) models = res.models;
+    if (Array.isArray(res?.model_specs) && res.model_specs.length > 0) models = res.model_specs;
+    else if (Array.isArray(res?.models)) models = res.models;
     else if (res?.models && typeof res.models === "object") {
       models = Object.entries(res.models).map(([id, spec]) => Object.assign({ id }, spec));
     }
@@ -5944,15 +5957,30 @@ async function fetchProviderModels() {
     source = "preset_fallback";
     warning = err?.message || tr("在线探测不可用，已回退至内置推荐目录", "Remote fetch unavailable; using preset catalog");
   }
-  state.fetchedProviderModels = models.map((m) => ({
-    id: m.id,
-    name: m.name || m.id,
-    context_window: Number(m.context_window || 128000),
-    max_output_tokens: Number(m.max_output_tokens || 16384),
-    supports_thinking: m.supports_thinking !== false,
-    input_cost_per_1m: Number(m.input_cost_per_1m || 0),
-    output_cost_per_1m: Number(m.output_cost_per_1m || 0)
-  }));
+  state.fetchedProviderModels = models
+    .map((m) => {
+      if (typeof m === "string") {
+        return {
+          id: m,
+          name: m,
+          context_window: 128000,
+          max_output_tokens: 16384,
+          supports_thinking: true,
+          input_cost_per_1m: 0,
+          output_cost_per_1m: 0
+        };
+      }
+      return {
+        id: m.id,
+        name: m.name || m.id,
+        context_window: Number(m.context_window || 128000),
+        max_output_tokens: Number(m.max_output_tokens || 16384),
+        supports_thinking: m.supports_thinking !== false,
+        input_cost_per_1m: Number(m.input_cost_per_1m || 0),
+        output_cost_per_1m: Number(m.output_cost_per_1m || 0)
+      };
+    })
+    .filter((m) => Boolean(m.id));
   state.fetchedModelsSource = source;
   state.fetchedModelsWarning = warning;
   state.fetchedModelsFilter = "";
@@ -6805,6 +6833,20 @@ function bindConfigStudioEvents() {
       applyLanguage(tEl.value, true);
       return;
     }
+    if (tEl.id === "cfg-default-model" && tEl.value) {
+      const val = String(tEl.value).trim();
+      const slashIdx = val.indexOf("/");
+      if (slashIdx > 0) {
+        await saveGlobalConfigPatch({
+          default_provider: val.slice(0, slashIdx),
+          default_model: val.slice(slashIdx + 1)
+        });
+      } else {
+        await saveGlobalConfigPatch({ default_model: val });
+      }
+      renderConfigStudio();
+      return;
+    }
     if (tEl.dataset.globalSelect) {
       await saveGlobalConfigPatch({ [tEl.dataset.globalSelect]: tEl.value });
       renderConfigStudio();
@@ -6844,16 +6886,16 @@ function bindConfigStudioEvents() {
       await patchAgentRole(tEl.dataset.agentProvider, { provider: tEl.value });
       return;
     }
-    if (tEl.dataset.agentModelSelect) {
-      await patchAgentRole(tEl.dataset.agentModelSelect, { model: tEl.value });
+    if (tEl.dataset.agentModelSelect || tEl.dataset.agentModel) {
+      await patchAgentRole(tEl.dataset.agentModelSelect || tEl.dataset.agentModel, { model: tEl.value });
       return;
     }
     if (tEl.dataset.agentEffortSelect) {
       await patchAgentRole(tEl.dataset.agentEffortSelect, { effort: tEl.value });
       return;
     }
-    if (tEl.dataset.addFallback && tEl.value) {
-      const aId = tEl.dataset.addFallback;
+    if ((tEl.dataset.addFallback || tEl.dataset.agentFallbackModel) && tEl.value) {
+      const aId = tEl.dataset.addFallback || tEl.dataset.agentFallbackModel;
       const cur = Array.isArray(state.config?.agents?.[aId]?.fallbacks) ? [...state.config.agents[aId].fallbacks] : [];
       if (!cur.includes(tEl.value)) cur.push(tEl.value);
       await patchAgentRole(aId, { fallbacks: cur });
