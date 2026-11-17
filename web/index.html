@@ -12,9 +12,21 @@
     <header class="topbar" role="banner">
       <div class="topbar-left">
         <div class="brand-mark" aria-hidden="true">
-          <span class="dot dot-red"></span>
-          <span class="dot dot-amber"></span>
-          <span class="dot dot-green"></span>
+          <svg class="brand-logo-svg" width="22" height="22" viewBox="0 0 24 24" fill="none">
+            <rect x="1.5" y="1.5" width="21" height="21" rx="5.5" fill="url(#gornessBrandGrad)" stroke="rgba(255,255,255,0.28)" stroke-width="1"/>
+            <ellipse cx="12" cy="12" rx="8.2" ry="3.8" transform="rotate(-28 12 12)" stroke="#38BDF8" stroke-width="1.15" stroke-opacity="0.72"/>
+            <ellipse cx="12" cy="12" rx="8.2" ry="3.8" transform="rotate(28 12 12)" stroke="#A855F7" stroke-width="1.15" stroke-opacity="0.62"/>
+            <path d="M14.6 9.4A3.5 3.5 0 1 0 15.2 12.6H12.2" stroke="#FFFFFF" stroke-width="1.85" stroke-linecap="round" stroke-linejoin="round"/>
+            <circle cx="18.6" cy="8.2" r="1.35" fill="#22D3EE"/>
+            <circle cx="5.4" cy="15.8" r="1.25" fill="#F59E0B"/>
+            <defs>
+              <linearGradient id="gornessBrandGrad" x1="2" y1="2" x2="22" y2="22" gradientUnits="userSpaceOnUse">
+                <stop offset="0%" stop-color="#1E1B4B"/>
+                <stop offset="55%" stop-color="#0F172A"/>
+                <stop offset="100%" stop-color="#0A0A14"/>
+              </linearGradient>
+            </defs>
+          </svg>
         </div>
         <div class="brand-title">
           <strong>Gorness</strong>
@@ -25,9 +37,13 @@
 
       <div class="topbar-center">
         <div class="segmented-control" role="tablist" aria-label="主工作区模式">
-          <button id="mode-chat-btn" class="seg-btn active" type="button" data-mode="chat" data-i18n="modeChat">💬 简单对话</button>
+          <button id="mode-chat-btn" class="seg-btn active" type="button" data-mode="chat">
+            <svg class="sf-icon" width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M2.5 3.5h11a1 1 0 0 1 1 1v6a1 1 0 0 1-1 1H6l-3.5 2.5v-2.5a1 1 0 0 1-1-1v-6a1 1 0 0 1 1-1Z"/></svg>
+            <span data-i18n="modeChat">简单对话</span>
+          </button>
           <button id="mode-fleet-btn" class="seg-btn" type="button" data-mode="fleet">
-            <span data-i18n="modeFleet">🛸 舰队协同</span>
+            <svg class="sf-icon" width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="8" cy="3.2" r="1.7"/><circle cx="3.2" cy="12.5" r="1.7"/><circle cx="12.8" cy="12.5" r="1.7"/><path d="M6.8 4.6 4.2 11M9.2 4.6l2.6 6.4M4.9 12.5h6.2"/></svg>
+            <span data-i18n="modeFleet">舰队协同</span>
             <span id="fleet-live-badge" class="pill-count hidden">0</span>
           </button>
         </div>
@@ -78,18 +94,18 @@
 
         <div id="workspace-tree" class="workspace-tree"></div>
 
-        <!-- ~/.gorness/ Zero-DB Vault Indicator Footer + Unique Bottom-Left Config Button -->
+        <!-- Unique Bottom-Left Apple System Settings Button -->
         <footer class="vault-footer">
-          <div class="vault-meta">
-            <div class="vault-title">
-              <span class="vault-dot"></span>
-              <code id="vault-path-label">~/.gorness</code>
-            </div>
-            <button id="open-config-studio-btn" class="toolbar-btn" type="button" title="打开系统设置中心 (⌘,)">
-              <span data-i18n="settingsBtn">⚙ 配置矩阵</span>
-              <kbd class="kbd-inline">⌘,</kbd>
-            </button>
-          </div>
+          <button id="open-config-studio-btn" class="toolbar-btn settings-footer-btn" type="button" title="打开系统设置中心 (⌘,)">
+            <span class="settings-footer-btn-left">
+              <svg class="sf-icon" width="15" height="15" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.45" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                <circle cx="8" cy="8" r="2.2"/>
+                <path d="M8 1.6v1.6M8 12.8v1.6M1.6 8h1.6M12.8 8h1.6M3.5 3.5l1.1 1.1M11.4 11.4l1.1 1.1M12.5 3.5l-1.1 1.1M4.6 11.4l-1.1 1.1"/>
+              </svg>
+              <span data-i18n="settingsBtn">系统设置</span>
+            </span>
+            <kbd class="kbd-inline">⌘,</kbd>
+          </button>
         </footer>
       </aside>
 
@@ -105,6 +121,11 @@
           <div class="session-bar">
             <div class="session-title-group">
               <input id="session-title-input" class="session-title-input" type="text" value="新会话" aria-label="会话标题">
+              <button id="session-context-meter" class="context-meter-pill mono" type="button" title="上下文窗口水位（点击执行 /compact 锚定压缩）">
+                <span id="session-context-bar">[░░░░░░]</span>
+                <span id="session-context-pct">0%</span>
+              </button>
+              <span id="session-git-pill" class="meta-chip git-status-pill mono hidden">⎇ main</span>
               <span id="session-seq-badge" class="meta-chip mono">seq #0</span>
               <span id="session-cost-badge" class="meta-chip mono">0 tok · $0.0000</span>
 
@@ -117,43 +138,20 @@
             </div>
 
             <div class="session-controls">
-              <label class="inline-select-label">
-                <span data-i18n="roleLabel">角色</span>
-                <select id="agent-role-select" class="mac-select"></select>
-              </label>
-
-              <label class="inline-select-label">
-                <span data-i18n="modelSelectLabel">模型</span>
-                <select id="model-override-input" class="mac-select mono"></select>
-              </label>
-
-              <label class="inline-select-label">
-                <span data-i18n="permLabel">权限</span>
-                <select id="perm-mode-select" class="mac-select">
-                  <option value="auto" data-i18n="permAutoOpt">自动安全门控 (Auto)</option>
-                  <option value="accept_edits" data-i18n="permAcceptEditsOpt">自动接受编辑 (Accept Edits)</option>
-                  <option value="ask" data-i18n="permAskOpt">每次询问 (Ask)</option>
-                  <option value="plan" data-i18n="permPlanOpt">只读规划 (Plan)</option>
-                  <option value="yolo" data-i18n="permYoloOpt">全放行 (Yolo)</option>
-                </select>
-              </label>
-
-              <button id="stop-run-btn" class="danger-xs-btn hidden" type="button" data-i18n="stopBtn">停止</button>
-
               <!-- ONE Consolidated Session Actions Menu -->
               <div class="session-menu-wrap" id="session-menu-wrap">
                 <button id="session-actions-menu-btn" class="ghost-xs-btn mono" type="button" aria-haspopup="menu" title="会话操作菜单">⋯</button>
                 <div id="session-actions-menu" class="dropdown-menu hidden" role="menu">
-                  <button class="dropdown-item" type="button" data-session-action="new-worktree" data-i18n="actNewWorktreeSession">🌿 新建隔离 Worktree 会话</button>
+                  <button class="dropdown-item" type="button" data-session-action="new-worktree" data-i18n="actNewWorktreeSession">新建隔离 Worktree 会话</button>
                   <div class="dropdown-sep"></div>
-                  <button class="dropdown-item" type="button" data-session-action="compact" data-i18n="actCompact">🗜️ 锚定增量压缩 (/compact)</button>
-                  <button class="dropdown-item" type="button" data-session-action="export-html" data-i18n="actExportHTML">📄 导出 HTML 归档</button>
-                  <button class="dropdown-item" type="button" data-session-action="export-md" data-i18n="actExportMD">📝 导出 Markdown 记录</button>
-                  <button class="dropdown-item" type="button" data-session-action="publish-html" data-i18n="actPublishPreview">🔬 生成沙箱预览产物</button>
+                  <button class="dropdown-item" type="button" data-session-action="compact" data-i18n="actCompact">锚定增量压缩 (/compact)</button>
+                  <button class="dropdown-item" type="button" data-session-action="export-html" data-i18n="actExportHTML">导出 HTML 归档</button>
+                  <button class="dropdown-item" type="button" data-session-action="export-md" data-i18n="actExportMD">导出 Markdown 记录</button>
+                  <button class="dropdown-item" type="button" data-session-action="publish-html" data-i18n="actPublishPreview">生成沙箱预览产物</button>
                   <div class="dropdown-sep"></div>
-                  <button class="dropdown-item" type="button" data-session-action="move" data-i18n="actMoveWorkspace">📂 迁移至其他项目…</button>
-                  <button class="dropdown-item" type="button" data-session-action="archive" data-i18n="actArchive">📦 归档会话</button>
-                  <button class="dropdown-item danger" type="button" data-session-action="delete" data-i18n="actDelete">🗑️ 删除会话</button>
+                  <button class="dropdown-item" type="button" data-session-action="move" data-i18n="actMoveWorkspace">迁移至其他项目…</button>
+                  <button class="dropdown-item" type="button" data-session-action="archive" data-i18n="actArchive">归档会话</button>
+                  <button class="dropdown-item danger" type="button" data-session-action="delete" data-i18n="actDelete">删除会话</button>
                 </div>
               </div>
             </div>
@@ -168,7 +166,7 @@
             <div id="chat-live-stream"></div>
           </div>
 
-          <!-- Composer with Keyboard-Navigable @file / $skill / /command Palette -->
+          <!-- Composer with Role/Model/Gate Selectors & Keyboard-Navigable @file/@git / $skill / /command Palette -->
           <div class="composer-shell" id="composer-shell">
             <div id="composer-palette" class="composer-palette hidden" role="listbox"></div>
             <textarea
@@ -176,17 +174,41 @@
               class="composer-textarea"
               rows="3"
               data-i18n-placeholder="composerPlaceholder"
-              placeholder="输入任务指令… 输入 @ 引用文件，$ 激活技能，/ 调用命令（Shift+Enter 换行，Enter 发送 / 运行中注入 Steer）"
+              placeholder="输入任务指令… 输入 @ 引用文件或 @git，$ 激活技能，/ 调用命令（Shift+Enter 换行，Enter 发送 / 运行中注入 Steer）"
             ></textarea>
             <div class="composer-footer">
-              <div class="composer-hints">
-                <span class="kbd-hint"><code>@</code> <span data-i18n="hintFile">文件</span></span>
-                <span class="kbd-hint"><code>$</code> <span data-i18n="hintSkill">技能</span></span>
-                <span class="kbd-hint"><code>/</code> <span data-i18n="hintCmd">命令</span></span>
-                <span id="draft-saved-indicator" class="draft-indicator"></span>
+              <div class="composer-controls-left">
+                <label class="inline-select-label">
+                  <span data-i18n="roleLabel">角色</span>
+                  <select id="agent-role-select" class="mac-select composer-select"></select>
+                </label>
+
+                <label class="inline-select-label">
+                  <span data-i18n="modelSelectLabel">模型</span>
+                  <select id="model-override-input" class="mac-select composer-select mono"></select>
+                </label>
+
+                <label class="inline-select-label">
+                  <span data-i18n="permLabel">权限</span>
+                  <select id="perm-mode-select" class="mac-select composer-select">
+                    <option value="auto" data-i18n="permAutoOpt">自动安全门控 (Auto)</option>
+                    <option value="accept_edits" data-i18n="permAcceptEditsOpt">自动接受编辑 (Accept Edits)</option>
+                    <option value="ask" data-i18n="permAskOpt">每次询问 (Ask)</option>
+                    <option value="plan" data-i18n="permPlanOpt">只读规划 (Plan)</option>
+                    <option value="yolo" data-i18n="permYoloOpt">全放行 (Yolo)</option>
+                  </select>
+                </label>
+
+                <div class="composer-hints">
+                  <span class="kbd-hint"><code>@</code> <span data-i18n="hintFile">文件 / @git</span></span>
+                  <span class="kbd-hint"><code>$</code> <span data-i18n="hintSkill">技能</span></span>
+                  <span class="kbd-hint"><code>/</code> <span data-i18n="hintCmd">命令</span></span>
+                </div>
               </div>
               <div class="composer-actions">
-                <button id="switch-to-fleet-btn" class="ghost-sm-btn" type="button" data-i18n="switchToFleetBtn">🛸 切换舰队协同</button>
+                <span id="draft-saved-indicator" class="draft-indicator"></span>
+                <button id="switch-to-fleet-btn" class="ghost-sm-btn" type="button" data-i18n="switchToFleetBtn">切换舰队协同</button>
+                <button id="stop-run-btn" class="danger-xs-btn hidden" type="button" data-i18n="stopBtn">停止</button>
                 <button id="send-or-steer-btn" class="primary-sm-btn" type="button" data-i18n="sendBtn">发送对话</button>
               </div>
             </div>
@@ -350,20 +372,26 @@
           <button class="insp-tab" type="button" data-tab="context" data-i18n="tabContext">上下文与技能</button>
         </nav>
 
-        <!-- Tab 1: Workspace Files & Safe Copy-Opener -->
+        <!-- Tab 1: Workspace Files & Safe Copy-Opener (Nested Folder Tree) -->
         <section id="insp-panel-files" class="insp-panel">
-          <div class="insp-toolbar">
+          <div class="insp-toolbar tree-toolbar">
             <input id="file-filter-input" class="mac-input" type="search" data-i18n-placeholder="filterFilesPh" placeholder="过滤项目文件…">
-            <button id="refresh-files-btn" class="ghost-xs-btn" type="button" title="刷新文件列表">↻</button>
+            <button id="expand-all-files-btn" class="ghost-xs-btn" type="button" title="全部展开" data-i18n="expandAllFiles">展开</button>
+            <button id="collapse-all-files-btn" class="ghost-xs-btn" type="button" title="全部折叠" data-i18n="collapseAllFiles">折叠</button>
+            <button id="refresh-files-btn" class="ghost-xs-btn" type="button" title="刷新文件树">↻</button>
           </div>
-          <div id="workspace-files-list" class="files-list"></div>
+          <div id="workspace-files-list" class="files-list tree-view" role="tree" aria-label="工作区文件树"></div>
           <div id="file-viewer-card" class="file-viewer-card hidden">
             <div class="file-viewer-head">
-              <div class="row-actions" style="min-width:0;">
+              <div class="row-actions" style="min-width:0;flex:1;">
                 <code id="file-viewer-path" style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap;"></code>
                 <span id="file-truncated-badge" class="status-pill warn hidden" data-i18n="truncatedBadge">已截断 256KB</span>
               </div>
-              <button id="safe-open-file-btn" class="ghost-xs-btn" type="button" data-i18n="safeOpenBtn">安全打开 / Finder</button>
+              <div class="row-actions" style="flex-shrink:0;">
+                <button id="cite-file-in-chat-btn" class="ghost-xs-btn" type="button" data-i18n="citeFileBtn">@ 引用</button>
+                <button id="safe-open-file-btn" class="ghost-xs-btn" type="button" data-i18n="safeOpenBtn">安全打开 / Finder</button>
+                <button id="close-file-viewer-btn" class="ghost-xs-btn" type="button" title="关闭预览">✕</button>
+              </div>
             </div>
             <pre id="file-viewer-code" class="code-preview mono"></pre>
           </div>
@@ -388,7 +416,7 @@
               <button id="new-html-snippet-btn" class="ghost-xs-btn" type="button" data-i18n="renderSnippetBtn">+ HTML 沙箱片段</button>
               <div class="row-actions">
                 <button id="safe-open-artifact-btn" class="ghost-xs-btn hidden" type="button" data-i18n="safeOpenBtn">安全打开</button>
-                <a id="open-preview-standalone" class="ghost-xs-btn link-btn" href="#" target="_blank" rel="noopener noreferrer" data-i18n="openStandalone">独立窗口 ↗</a>
+                <a id="open-preview-standalone" class="ghost-xs-btn link-btn hidden" href="#" target="_blank" rel="noopener noreferrer" data-i18n="openStandalone">独立窗口 ↗</a>
               </div>
             </div>
           </div>
@@ -417,57 +445,65 @@
   </div>
 
   <!-- ======================================================================== -->
-  <!-- ONE Canonical Settings Modal (#config-mode-view · ⌘, · All 9 Pages)      -->
+  <!-- ONE Canonical Settings Modal (#config-mode-view · ⌘, · All 8 Pages)      -->
   <!-- ======================================================================== -->
   <div id="config-mode-view" class="modal-backdrop hidden" role="dialog" aria-modal="true" aria-label="系统设置中心">
     <div class="modal-sheet settings-dialog-sheet">
       <aside class="settings-dialog-sidebar" role="tablist">
         <div class="settings-sidebar-brand">
           <div class="brand-mark" aria-hidden="true">
-            <span class="dot dot-red"></span>
-            <span class="dot dot-amber"></span>
-            <span class="dot dot-green"></span>
+            <svg width="20" height="20" viewBox="0 0 24 24" fill="none">
+              <rect width="24" height="24" rx="6" fill="url(#gorness-grad-cfg)"/>
+              <path d="M12 5L18 8.5V15.5L12 19L6 15.5V8.5L12 5Z" stroke="white" stroke-width="1.6" stroke-linejoin="round"/>
+              <circle cx="12" cy="12" r="2.2" fill="white"/>
+              <defs>
+                <linearGradient id="gorness-grad-cfg" x1="0" y1="0" x2="24" y2="24" gradientUnits="userSpaceOnUse">
+                  <stop stop-color="#0A84FF"/>
+                  <stop offset="1" stop-color="#5E5CE6"/>
+                </linearGradient>
+              </defs>
+            </svg>
           </div>
           <strong data-i18n="settingsCenterTitle">Gorness 设置中心</strong>
         </div>
 
         <div class="settings-sidebar-group-label" data-i18n="cfgGroupSystem">系统与外观</div>
         <button class="settings-nav-btn" type="button" data-cfg-page="general">
-          <span class="settings-tile">⚙️</span>
+          <span class="settings-tile"><svg width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><circle cx="8" cy="8" r="2.3"/><path d="M8 2v1.5M8 12.5V14M2 8h1.5M12.5 8H14M3.8 3.8l1.1 1.1M11.1 11.1l1.1 1.1M12.2 3.8l-1.1 1.1M4.9 11.1l-1.1 1.1"/></svg></span>
           <span data-i18n="cfgPageGeneral">通用与外观</span>
         </button>
 
         <div class="settings-sidebar-group-label" data-i18n="cfgGroupModels">模型与智能体</div>
         <button class="settings-nav-btn active" type="button" data-cfg-page="matrix">
-          <span class="settings-tile">🧩</span>
+          <span class="settings-tile"><svg width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><rect x="2" y="2" width="5" height="5" rx="1"/><rect x="9" y="2" width="5" height="5" rx="1"/><rect x="2" y="9" width="5" height="5" rx="1"/><rect x="9" y="9" width="5" height="5" rx="1"/></svg></span>
           <span data-i18n="cfgPageMatrix">角色模型矩阵</span>
         </button>
         <button class="settings-nav-btn" type="button" data-cfg-page="providers">
-          <span class="settings-tile">🔑</span>
+          <span class="settings-tile"><svg width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><circle cx="5.5" cy="8.5" r="3"/><path d="M8.2 7.2L14 2.5m-1.5 1.2l1.5 1.8m-3.2-.4l1.4 1.6"/></svg></span>
           <span data-i18n="cfgPageProviders">供应商与钥匙串</span>
         </button>
         <button class="settings-nav-btn" type="button" data-cfg-page="agents">
-          <span class="settings-tile">🤖</span>
+          <span class="settings-tile"><svg width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><rect x="3" y="4" width="10" height="9" rx="2.5"/><path d="M8 2v2M6 8.5h.01M10 8.5h.01M6 11h4"/></svg></span>
           <span data-i18n="cfgPageAgents">智能体专家定义</span>
         </button>
 
         <div class="settings-sidebar-group-label" data-i18n="cfgGroupOrch">编排、安全与扩展</div>
         <button class="settings-nav-btn" type="button" data-cfg-page="workflows">
-          <span class="settings-tile">🕸️</span>
+          <span class="settings-tile"><svg width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><circle cx="4" cy="4" r="2"/><circle cx="12" cy="4" r="2"/><circle cx="8" cy="12" r="2"/><path d="M6 4h4M5 5.8L7 10.2M11 5.8L9 10.2"/></svg></span>
           <span data-i18n="cfgPageWorkflows">多智能体工作流</span>
         </button>
         <button class="settings-nav-btn" type="button" data-cfg-page="permissions">
-          <span class="settings-tile">🛡️</span>
+          <span class="settings-tile"><svg width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M8 1.8l5 2v4.2c0 3.2-2.2 5.4-5 6.2-2.8-.8-5-3-5-6.2V3.8l5-2z"/></svg></span>
           <span data-i18n="cfgPagePermissions">权限、信任与钩子</span>
         </button>
         <button class="settings-nav-btn" type="button" data-cfg-page="mcp">
-          <span class="settings-tile">🔌</span>
+          <span class="settings-tile"><svg width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M6 2v4M10 2v4M4 6h8v3a4 4 0 0 1-8 0V6zM8 13v2"/></svg></span>
           <span data-i18n="cfgPageMCP">MCP 扩展服务</span>
         </button>
 
         <div class="settings-sidebar-group-label" data-i18n="cfgGroupVault">记忆与经验</div>
         <button class="settings-nav-btn" type="button" data-cfg-page="memory">
-          <span class="settings-tile">🧠</span>
+          <span class="settings-tile"><svg width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M8 3a4 4 0 0 0-4 4c0 1.5.8 2.8 2 3.4V12h4v-1.6c1.2-.6 2-1.9 2-3.4a4 4 0 0 0-4-4zM6.5 14h3"/></svg></span>
           <span data-i18n="cfgPageMemory">四层记忆与候选技能</span>
         </button>
       </aside>

@@ -4,10 +4,10 @@
 const I18N = {
   zh: {
     brandSub: "macOS 纯 Go · 零数据库工作台",
-    modeChat: "💬 简单对话",
-    modeFleet: "🛸 舰队协同",
+    modeChat: "简单对话",
+    modeFleet: "舰队协同",
     alwaysOnBtn: "常驻中枢",
-    settingsBtn: "⚙ 配置矩阵",
+    settingsBtn: "系统设置",
     searchPlaceholder: "跨项目搜索会话、笔记与产物 (⌘K)...",
     needsAttention: "待审批事项",
     projectsHeader: "工作区与会话",
@@ -34,11 +34,11 @@ const I18N = {
     actArchive: "📦 归档 / 取消归档会话",
     actDelete: "🗑️ 删除会话",
     composerPlaceholder: "输入任务指令… 输入 @ 引用文件，$ 激活技能，/ 调用命令（Shift+Enter 换行，Enter 发送 / 运行中注入 Steer）",
-    hintFile: "文件",
+    hintFile: "文件 / @git",
     hintSkill: "技能",
     hintCmd: "命令",
     sendBtn: "发送对话",
-    switchToFleetBtn: "🛸 切换舰队协同",
+    switchToFleetBtn: "切换舰队协同",
     backToChatBtn: "💬 返回简单对话",
     fleetAdvancedSummary: "高级运行参数（可选）",
     steerBtn: "注入 Steer",
@@ -71,6 +71,9 @@ const I18N = {
     tabArtifacts: "产物预览",
     tabContext: "上下文与技能",
     filterFilesPh: "过滤项目文件…",
+    expandAllFiles: "展开",
+    collapseAllFiles: "折叠",
+    citeFileBtn: "@ 引用",
     truncatedBadge: "已截断 256KB",
     safeOpenBtn: "安全打开 / Finder",
     restoreFilesToggle: "回退时按 SHA-256 快照还原工作区文件",
@@ -124,10 +127,10 @@ const I18N = {
   },
   en: {
     brandSub: "macOS Pure Go · Zero-DB Agent Workbench",
-    modeChat: "💬 Simple Chat",
-    modeFleet: "🛸 Fleet Collaboration",
+    modeChat: "Simple Chat",
+    modeFleet: "Fleet Collaboration",
     alwaysOnBtn: "Always-On Hub",
-    settingsBtn: "⚙ Config Matrix",
+    settingsBtn: "System Settings",
     searchPlaceholder: "Search sessions, notes & artifacts across projects (⌘K)...",
     needsAttention: "Needs Attention",
     projectsHeader: "Workspaces & Sessions",
@@ -154,11 +157,11 @@ const I18N = {
     actArchive: "📦 Toggle Archive Session",
     actDelete: "🗑️ Delete Session",
     composerPlaceholder: "Ask Gorness… Type @ for files, $ for skills, / for commands (Shift+Enter newline, Enter send/steer)",
-    hintFile: "file",
+    hintFile: "file / @git",
     hintSkill: "skill",
     hintCmd: "command",
     sendBtn: "Send Message",
-    switchToFleetBtn: "🛸 Switch to Fleet",
+    switchToFleetBtn: "Switch to Fleet",
     backToChatBtn: "💬 Back to Chat",
     fleetAdvancedSummary: "Advanced Parameters (Optional)",
     steerBtn: "Inject Steer",
@@ -191,6 +194,9 @@ const I18N = {
     tabArtifacts: "Artifacts",
     tabContext: "Context & Skills",
     filterFilesPh: "Filter workspace files…",
+    expandAllFiles: "Expand",
+    collapseAllFiles: "Collapse",
+    citeFileBtn: "@ Cite",
     truncatedBadge: "Truncated 256KB",
     safeOpenBtn: "Safe Open / Reveal",
     restoreFilesToggle: "Restore workspace files from SHA-256 blobs on rewind",
@@ -494,6 +500,11 @@ const state = {
 
   editingProviderId: "",
   editingProviderDraft: null,
+  fetchedProviderModels: [],
+  fetchedModelsSource: "",
+  fetchedModelsWarning: "",
+  fetchedModelsFilter: "",
+  selectedFetchedModels: new Set(),
   editingAgentId: "coder",
   editingAgentDraft: null,
   editingWorkflowId: "",
@@ -513,7 +524,11 @@ const state = {
   workspaces: [],
   wsSuggestions: [],
   activeWorkspaceId: "",
+  workspaceGit: null,
   workspaceFiles: [],
+  workspaceTreeEntries: [],
+  expandedTreeDirs: new Set(),
+  selectedFilePath: "",
   workspaceSkills: [],
   workspaceArtifacts: [],
   previews: [],
@@ -955,8 +970,6 @@ async function loadBootstrap() {
     state.activeRunsBySession[r.session_id] = r;
   });
 
-  const vaultLabel = $("vault-path-label");
-  if (vaultLabel) vaultLabel.textContent = state.vaultRoot;
   updateHealthPill(true, (data.active_runs || []).length);
 
   renderReloadBanner(data.diagnostic || "");
@@ -1325,6 +1338,49 @@ async function selectWorkspace(wsId) {
   }
 }
 
+function getActiveSessionContextWindow() {
+  const meta = state.activeSessionMeta;
+  const roleId = meta?.agent_role || $("agent-role-select")?.value || "coder";
+  const modelRef = (meta?.model_override || $("model-override-input")?.value || state.config?.agents?.[roleId]?.model || state.config?.global?.default_model || "").trim();
+  if (modelRef && modelRef.includes("/")) {
+    const [provId, ...rest] = modelRef.split("/");
+    const modelId = rest.join("/");
+    const provModels = state.config?.providers?.[provId]?.models || PROVIDER_PRESETS[provId]?.models || {};
+    const cw = Number(provModels?.[modelId]?.context_window || 0);
+    if (cw > 0) return cw;
+  }
+  return 200000;
+}
+
+function updateSessionContextMeter() {
+  const meterEl = $("session-context-meter");
+  if (!meterEl) return;
+  const meta = state.activeSessionMeta;
+  const usedTokens = meta ? Number(meta.input_tokens || 0) + Number(meta.output_tokens || 0) : 0;
+  const ctxWindow = getActiveSessionContextWindow();
+  const pct = Math.min(100, Math.round((usedTokens / Math.max(1, ctxWindow)) * 100));
+  const filled = Math.min(6, Math.max(usedTokens > 0 ? 1 : 0, Math.round((pct / 100) * 6)));
+  const bar = "▓".repeat(filled) + "░".repeat(6 - filled);
+  meterEl.textContent = `[${bar}] ${pct}%`;
+  meterEl.className = `context-meter-pill mono${pct > 85 ? " danger" : pct > 75 ? " warn" : ""}`;
+  meterEl.title = tr(
+    `上下文容量：${usedTokens.toLocaleString()} / ${ctxWindow.toLocaleString()} tok (${pct}%) · 点击执行 /compact 压缩`,
+    `Context: ${usedTokens.toLocaleString()} / ${ctxWindow.toLocaleString()} tok (${pct}%) · Click to /compact`
+  );
+}
+
+function updateSessionGitPill() {
+  const gitPill = $("session-git-pill");
+  if (!gitPill) return;
+  const meta = state.activeSessionMeta;
+  if (meta?.worktree_path || !state.workspaceGit || !state.workspaceGit.branch) {
+    gitPill.classList.add("hidden");
+    return;
+  }
+  gitPill.classList.remove("hidden");
+  gitPill.textContent = `⎇ ${state.workspaceGit.branch}${state.workspaceGit.dirty ? "*" : ""}`;
+}
+
 function syncSessionHeaderControls() {
   const meta = state.activeSessionMeta;
   const titleEl = $("session-title-input");
@@ -1333,10 +1389,16 @@ function syncSessionHeaderControls() {
   const wtPill = $("session-worktree-pill");
   const wtBranch = $("session-wt-branch");
 
+  updateSessionContextMeter();
+  updateSessionGitPill();
+
   if (!meta) {
     if (titleEl) titleEl.value = tr("新会话", "New Session");
     if (seqEl) seqEl.textContent = "seq #0";
     if (costEl) costEl.textContent = "0 tok · $0.0000";
+    if ($("perm-mode-select")) {
+      $("perm-mode-select").value = state.config?.permissions?.mode || "auto";
+    }
     wtPill?.classList.add("hidden");
     return;
   }
@@ -1348,6 +1410,9 @@ function syncSessionHeaderControls() {
 
   if (meta.agent_role && $("agent-role-select")) {
     $("agent-role-select").value = meta.agent_role;
+  }
+  if ($("perm-mode-select")) {
+    $("perm-mode-select").value = meta.permission_mode || state.config?.permissions?.mode || "auto";
   }
   if ($("model-override-input")) {
     const ov = meta.model_override || "";
@@ -1410,12 +1475,14 @@ async function createNewSession(isolateGit = false) {
   }
   try {
     const role = $("agent-role-select")?.value || "coder";
+    const permMode = $("perm-mode-select")?.value || "auto";
     const created = await apiFetch("/api/sessions", {
       method: "POST",
       body: {
         workspace_id: state.activeWorkspaceId,
         title: isolateGit ? tr("Worktree 隔离会话", "Worktree Isolated Session") : tr("新会话", "New Session"),
         agent_role: role,
+        permission_mode: permMode,
         model_override: ($("model-override-input")?.value || "").trim(),
         isolate_git: Boolean(isolateGit)
       }
@@ -1698,18 +1765,153 @@ function renderSnapshotsInspector() {
 // Right Inspector: Files, Artifacts (Markdown + HTML Sandbox) & Context
 // ============================================================================
 
+function normalizeWorkspaceFileEntries(rawList) {
+  const entries = [];
+  (rawList || []).forEach((item) => {
+    if (!item) return;
+    if (typeof item === "string") {
+      const clean = item.replace(/^\/+|\/+$/g, "");
+      if (!clean) return;
+      const parts = clean.split("/");
+      entries.push({
+        path: clean,
+        name: parts[parts.length - 1],
+        is_dir: false,
+        size: 0
+      });
+      return;
+    }
+    const rel = String(item.path || item.rel_path || item.name || "").replace(/^\/+|\/+$/g, "");
+    if (!rel) return;
+    const parts = rel.split("/");
+    entries.push({
+      path: rel,
+      name: item.name || parts[parts.length - 1],
+      is_dir: Boolean(item.is_dir || item.isDir || item.type === "dir" || item.kind === "dir"),
+      size: Number(item.size || 0)
+    });
+  });
+  return entries;
+}
+
+function buildWorkspaceFileTree(rawEntries) {
+  const entries = normalizeWorkspaceFileEntries(rawEntries);
+  const rootMap = new Map();
+
+  const ensureDirNode = (map, dirName, dirPath) => {
+    let node = map.get(dirName);
+    if (!node) {
+      node = { name: dirName, path: dirPath, is_dir: true, size: 0, _childMap: new Map(), children: [] };
+      map.set(dirName, node);
+    } else if (!node.is_dir) {
+      node.is_dir = true;
+      if (!node._childMap) node._childMap = new Map();
+    }
+    return node;
+  };
+
+  entries.forEach((ent) => {
+    const parts = ent.path.split("/").filter(Boolean);
+    if (parts.length === 0) return;
+    let curMap = rootMap;
+    let curPath = "";
+    for (let i = 0; i < parts.length; i++) {
+      const seg = parts[i];
+      curPath = curPath ? `${curPath}/${seg}` : seg;
+      const isLast = i === parts.length - 1;
+      if (!isLast || ent.is_dir) {
+        const dirNode = ensureDirNode(curMap, seg, curPath);
+        curMap = dirNode._childMap;
+      } else {
+        if (!curMap.has(seg)) {
+          curMap.set(seg, {
+            name: seg,
+            path: curPath,
+            is_dir: false,
+            size: ent.size || 0,
+            children: []
+          });
+        }
+      }
+    }
+  });
+
+  const finalizeNodes = (map) => {
+    const list = Array.from(map.values());
+    list.forEach((n) => {
+      if (n.is_dir && n._childMap) {
+        n.children = finalizeNodes(n._childMap);
+        delete n._childMap;
+      }
+    });
+    list.sort((a, b) => {
+      if (Boolean(a.is_dir) !== Boolean(b.is_dir)) return a.is_dir ? -1 : 1;
+      return String(a.name).localeCompare(String(b.name));
+    });
+    return list;
+  };
+
+  return finalizeNodes(rootMap);
+}
+
+function getFileIcon(name) {
+  const lower = String(name || "").toLowerCase();
+  if (lower.endsWith(".go")) return "🐹";
+  if (lower.endsWith(".js") || lower.endsWith(".ts")) return "📜";
+  if (lower.endsWith(".html") || lower.endsWith(".css")) return "🎨";
+  if (lower.endsWith(".md")) return "📝";
+  if (lower.endsWith(".toml") || lower.endsWith(".json") || lower.endsWith(".yaml") || lower.endsWith(".yml")) return "⚙️";
+  if (lower.endsWith(".sh")) return "🐚";
+  return "📄";
+}
+
+function formatFileSize(bytes) {
+  const n = Number(bytes || 0);
+  if (!n || n <= 0) return "";
+  if (n < 1024) return `${n}B`;
+  if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)}KB`;
+  return `${(n / (1024 * 1024)).toFixed(1)}MB`;
+}
+
 async function refreshWorkspaceInspector(wsId) {
   if (!wsId) return;
   try {
-    const [filesRes, skillsRes, artRes] = await Promise.all([
-      apiFetch(`/api/workspaces/${encodeURIComponent(wsId)}/files?limit=400`),
+    const treePromise = apiFetch(`/api/workspaces/${encodeURIComponent(wsId)}/tree`).catch(() => null);
+    const filesPromise = apiFetch(`/api/workspaces/${encodeURIComponent(wsId)}/files?limit=400`).catch(() => null);
+    const gitPromise = apiFetch(`/api/workspaces/${encodeURIComponent(wsId)}/git`).catch(() => null);
+    const [treeRes, filesRes, skillsRes, artRes, gitRes] = await Promise.all([
+      treePromise,
+      filesPromise,
       apiFetch(`/api/workspaces/${encodeURIComponent(wsId)}/skills`),
-      apiFetch(`/api/workspaces/${encodeURIComponent(wsId)}/artifacts`)
+      apiFetch(`/api/workspaces/${encodeURIComponent(wsId)}/artifacts`),
+      gitPromise
     ]);
-    state.workspaceFiles = filesRes.files || [];
-    state.workspaceSkills = skillsRes.skills || [];
-    state.workspaceArtifacts = artRes.artifacts || [];
-    state.previews = artRes.previews || state.previews;
+    const rawEntries =
+      treeRes?.entries ||
+      treeRes?.tree ||
+      treeRes?.files ||
+      filesRes?.entries ||
+      filesRes?.tree ||
+      filesRes?.files ||
+      [];
+    const normEntries = normalizeWorkspaceFileEntries(rawEntries);
+    state.workspaceTreeEntries = normEntries;
+    state.workspaceFiles = normEntries.filter((e) => !e.is_dir).map((e) => e.path);
+    if (!(state.expandedTreeDirs instanceof Set)) {
+      state.expandedTreeDirs = new Set();
+    }
+    if (state.expandedTreeDirs.size === 0) {
+      buildWorkspaceFileTree(normEntries)
+        .slice(0, 6)
+        .forEach((n) => {
+          if (n.is_dir) state.expandedTreeDirs.add(n.path);
+        });
+    }
+    state.workspaceGit = gitRes?.branch ? gitRes : null;
+    state.workspaceSkills = skillsRes?.skills || [];
+    state.workspaceArtifacts = artRes?.artifacts || [];
+    state.previews = artRes?.previews || state.previews;
+    updateSessionGitPill();
     renderFilesList();
     renderArtifactsInspector();
     if (state.inspectorTab === "context") {
@@ -1722,25 +1924,97 @@ function renderFilesList() {
   const host = $("workspace-files-list");
   if (!host) return;
   const q = ($("file-filter-input")?.value || "").trim().toLowerCase();
-  const filtered = state.workspaceFiles.filter((f) => !q || f.toLowerCase().includes(q));
-  if (filtered.length === 0) {
-    host.innerHTML = `<span class="tiny-muted">${tr("无匹配文件", "No matching files")}</span>`;
+  const baseEntries =
+    state.workspaceTreeEntries && state.workspaceTreeEntries.length > 0
+      ? state.workspaceTreeEntries
+      : normalizeWorkspaceFileEntries(state.workspaceFiles);
+
+  const filteredEntries = q
+    ? baseEntries.filter((e) => e.path.toLowerCase().includes(q))
+    : baseEntries;
+
+  if (filteredEntries.length === 0) {
+    host.innerHTML = `<span class="tiny-muted" style="padding:8px;">${tr("无匹配文件", "No matching files")}</span>`;
     return;
   }
-  host.innerHTML = filtered
-    .slice(0, 180)
-    .map(
-      (rel) => `
-      <div class="file-row mono" data-open-file="${escHtml(rel)}">
-        <span>${escHtml(rel)}</span>
+
+  const treeNodes = buildWorkspaceFileTree(filteredEntries);
+
+  const renderNodeHTML = (node) => {
+    if (node.is_dir) {
+      const isExpanded = Boolean(q) || state.expandedTreeDirs.has(node.path);
+      const childrenHTML = isExpanded ? (node.children || []).map(renderNodeHTML).join("") : "";
+      return `
+        <div class="tree-dir-group">
+          <div class="tree-dir-row mono" data-toggle-dir="${escHtml(node.path)}" role="treeitem" aria-expanded="${isExpanded}">
+            <div class="tree-row-left">
+              <span class="tree-chevron">${isExpanded ? "▾" : "▸"}</span>
+              <span class="tree-icon">${isExpanded ? "📂" : "📁"}</span>
+              <span class="tree-name">${escHtml(node.name)}</span>
+            </div>
+            <span class="meta-chip mono">${(node.children || []).length}</span>
+          </div>
+          ${isExpanded ? `<div class="tree-children" role="group">${childrenHTML}</div>` : ""}
+        </div>
+      `;
+    }
+    const isSel = state.selectedFilePath === node.path;
+    const sizeText = formatFileSize(node.size);
+    return `
+      <div class="file-row tree-file-row mono ${isSel ? "selected" : ""}" data-open-file="${escHtml(node.path)}" role="treeitem">
+        <div class="tree-row-left">
+          <span class="tree-icon">${getFileIcon(node.name)}</span>
+          <span class="tree-name" title="${escHtml(node.path)}">${escHtml(node.name)}</span>
+        </div>
+        <div class="tree-meta-right">
+          ${sizeText ? `<span class="tiny-muted mono" style="font-size:10px;">${escHtml(sizeText)}</span>` : ""}
+          <button class="tree-cite-btn" type="button" data-cite-file="${escHtml(node.path)}" title="${tr("引用该文件到对话框", "Cite file in chat")}">@</button>
+        </div>
       </div>
-    `
-    )
-    .join("");
+    `;
+  };
+
+  host.innerHTML = treeNodes.map(renderNodeHTML).join("");
+}
+
+function expandAllWorkspaceFolders() {
+  const baseEntries =
+    state.workspaceTreeEntries && state.workspaceTreeEntries.length > 0
+      ? state.workspaceTreeEntries
+      : normalizeWorkspaceFileEntries(state.workspaceFiles);
+  const walk = (nodes) => {
+    (nodes || []).forEach((n) => {
+      if (n.is_dir) {
+        state.expandedTreeDirs.add(n.path);
+        walk(n.children);
+      }
+    });
+  };
+  walk(buildWorkspaceFileTree(baseEntries));
+  renderFilesList();
+}
+
+function collapseAllWorkspaceFolders() {
+  state.expandedTreeDirs.clear();
+  renderFilesList();
+}
+
+function citeFileInComposer(relPath) {
+  if (!relPath) return;
+  const comp = $("composer-input");
+  if (!comp) return;
+  const token = `@${relPath} `;
+  const cur = comp.value || "";
+  if (!cur.includes(`@${relPath}`)) {
+    comp.value = cur && !cur.endsWith(" ") ? `${cur} ${token}` : `${cur}${token}`;
+  }
+  comp.focus?.();
 }
 
 async function openFilePreview(relPath) {
   if (!state.activeWorkspaceId || !relPath) return;
+  state.selectedFilePath = relPath;
+  renderFilesList();
   try {
     const res = await apiFetch(
       `/api/workspaces/${encodeURIComponent(state.activeWorkspaceId)}/file?path=${encodeURIComponent(relPath)}`
@@ -1807,6 +2081,7 @@ function renderArtifactsInspector() {
     $("inspector-md-preview")?.classList.add("hidden");
     $("inspector-preview-frame")?.classList.remove("hidden");
     $("safe-open-artifact-btn")?.classList.add("hidden");
+    $("open-preview-standalone")?.classList.add("hidden");
     if ($("open-preview-standalone")) $("open-preview-standalone").href = "#";
     return;
   }
@@ -1924,10 +2199,12 @@ function getModelsForProvider(provId) {
   Object.entries(cfgModels).forEach(([mId, mSpec]) => {
     out.set(mId, mSpec?.name || mId);
   });
-  const presetModels = PROVIDER_PRESETS[provId]?.models || {};
-  Object.entries(presetModels).forEach(([mId, mSpec]) => {
-    if (!out.has(mId)) out.set(mId, mSpec.name || mId);
-  });
+  if (out.size === 0) {
+    const presetModels = PROVIDER_PRESETS[provId]?.models || {};
+    Object.entries(presetModels).forEach(([mId, mSpec]) => {
+      if (!out.has(mId)) out.set(mId, mSpec.name || mId);
+    });
+  }
   return Array.from(out.entries()).map(([id, name]) => ({ id, name }));
 }
 
@@ -1941,12 +2218,40 @@ function getAllAvailableModelRefs() {
       list.push({
         ref: `${pId}/${m.id}`,
         provider: pId,
+        providerName: pName,
         model: m.id,
+        name: m.name,
         label: `${pName} · ${m.name} (${pId}/${m.id})`
       });
     });
   });
   return list;
+}
+
+function renderModelCatalogOptgroupsHTML(selectedValue = "", emptyOptLabel = "") {
+  const provs = state.config?.providers || {};
+  const parts = [];
+  if (emptyOptLabel !== null && emptyOptLabel !== undefined && emptyOptLabel !== false) {
+    parts.push(`<option value="" ${!selectedValue ? "selected" : ""}>${esc(emptyOptLabel)}</option>`);
+  }
+  let foundSelected = !selectedValue;
+  Object.entries(provs).forEach(([pId, pCfg]) => {
+    const pName = pCfg.name || pId;
+    const models = getModelsForProvider(pId);
+    if (models.length === 0) return;
+    const optionsHTML = models
+      .map((m) => {
+        const ref = `${pId}/${m.id}`;
+        if (ref === selectedValue) foundSelected = true;
+        return `<option value="${esc(ref)}" ${ref === selectedValue ? "selected" : ""}>${esc(m.name)} (${esc(ref)})</option>`;
+      })
+      .join("");
+    parts.push(`<optgroup label="${esc(pName)} (${esc(pId)})">${optionsHTML}</optgroup>`);
+  });
+  if (selectedValue && !foundSelected) {
+    parts.push(`<option value="${esc(selectedValue)}" selected>${esc(selectedValue)}</option>`);
+  }
+  return parts.join("");
 }
 
 function populateAgentAndModelControls() {
@@ -1970,15 +2275,7 @@ function populateAgentAndModelControls() {
   const modelSel = $("model-override-input");
   if (modelSel) {
     const prevVal = modelSel.value || state.activeSessionMeta?.model_override || "";
-    const allRefs = getAllAvailableModelRefs();
-    const opts = [`<option value="">${esc(t("autoModelOpt"))}</option>`];
-    allRefs.forEach((item) => {
-      opts.push(`<option value="${esc(item.ref)}">${esc(item.label)}</option>`);
-    });
-    if (prevVal && !allRefs.some((x) => x.ref === prevVal)) {
-      opts.push(`<option value="${esc(prevVal)}">${esc(prevVal)}</option>`);
-    }
-    modelSel.innerHTML = opts.join("");
+    modelSel.innerHTML = renderModelCatalogOptgroupsHTML(prevVal, t("autoModelOpt"));
     modelSel.value = prevVal;
   }
 }
@@ -2075,7 +2372,36 @@ function renderChatHistory() {
   if ((!state.activeEntries || state.activeEntries.length === 0) && forkedChildren.length === 0) {
     host.innerHTML =
       errorBannerCardHTML +
-      `<div class="msg-card"><div class="msg-text tiny-muted">${esc(t("emptyTimeline"))}</div></div>`;
+      `
+      <div class="onboarding-empty-state">
+        <div class="onboarding-hero-icon" aria-hidden="true">
+          <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M12 3L19 7V17L12 21L5 17V7L12 3Z"/>
+            <circle cx="12" cy="12" r="2.5"/>
+          </svg>
+        </div>
+        <h3 class="onboarding-title">${tr("开始探索与构建你的项目", "Explore & Build Your Workspace")}</h3>
+        <p class="onboarding-sub">${esc(t("emptyTimeline"))}</p>
+        <div class="onboarding-grid">
+          <button class="onboarding-card" type="button" data-onboarding-card="arch">
+            <span class="onboarding-card-title">🏗️ ${tr("解释当前项目架构", "Explain Project Architecture")}</span>
+            <span class="onboarding-card-desc">${tr("梳理核心模块职责、数据流向与关键入口文件", "Map core modules, data flows, and entry points")}</span>
+          </button>
+          <button class="onboarding-card" type="button" data-onboarding-card="git">
+            <span class="onboarding-card-title">🔍 ${tr("审查 Git 未提交变更与潜在 Bug", "Review Uncommitted Git Changes")}</span>
+            <span class="onboarding-card-desc">${tr("引用 @git 检查当前改动中的竞态、边界条件与回归风险", "Cite @git to audit current diff for bugs and edge cases")}</span>
+          </button>
+          <button class="onboarding-card" type="button" data-onboarding-card="tdd">
+            <span class="onboarding-card-title">🧪 ${tr("为核心模块编写单元测试", "Write Unit Tests for Core Modules")}</span>
+            <span class="onboarding-card-desc">${tr("按 TDD 规范补充高覆盖率单元测试并运行验证", "Generate table-driven tests and verify with test runner")}</span>
+          </button>
+          <button class="onboarding-card" type="button" data-onboarding-card="fleet">
+            <span class="onboarding-card-title">🛸 ${tr("切换多智能体舰队协同", "Switch to Multi-Agent Fleet")}</span>
+            <span class="onboarding-card-desc">${tr("启动异构模型并发探索、Worktree 隔离编码与盲审合入", "Launch heterogeneous agents with isolated Git worktrees")}</span>
+          </button>
+        </div>
+      </div>
+      `;
     return;
   }
 
@@ -2533,10 +2859,17 @@ function updateComposerPalette() {
   let items = [];
 
   if (trig === "@") {
-    items = state.workspaceFiles
+    const fileStrings = (state.workspaceFiles || [])
+      .map((f) => (typeof f === "string" ? f : f?.path || f?.rel_path || ""))
+      .filter(Boolean);
+    const gitItems = !query || "git".includes(query)
+      ? [{ insert: "@git ", label: "@git", hint: tr("当前工作区 Git 状态与未提交 Diff", "Workspace Git status & diff") }]
+      : [];
+    const fileItems = fileStrings
       .filter((f) => f.toLowerCase().includes(query))
       .slice(0, 12)
       .map((f) => ({ insert: `@${f} `, label: `@${f}`, hint: tr("文件", "file") }));
+    items = [...gitItems, ...fileItems];
   } else if (trig === "$") {
     items = state.workspaceSkills
       .filter((s) => s.name.toLowerCase().includes(query))
@@ -3711,6 +4044,14 @@ function renderGeneralSettingsPage() {
     { v: "dark", l: tr("深色模式 (Dark)", "Dark") }
   ];
 
+  const compactThresh = Number(g.auto_compact_threshold_percent ?? 85);
+  const toolConc = Number(g.max_tool_concurrency || 4);
+  const subSteps = Number(g.subagent_max_steps || 8);
+  const cmdTimeout = Number(g.command_timeout_seconds || 120);
+  const autoTitle = g.auto_generate_title !== undefined ? Boolean(g.auto_generate_title) : true;
+  const dreamerIdle = Number(g.dreamer_idle_minutes ?? 15);
+  const witnessTimeout = Number(g.witness_timeout_seconds || 180);
+
   return `
     <div class="cfg-section-card">
       <div class="cfg-section-head">
@@ -3744,38 +4085,148 @@ function renderGeneralSettingsPage() {
         </div>
       </div>
 
-      <div class="two-col">
-        <label class="cfg-field-label">
-          <span>${tr("色彩主题 (Theme)", "Color Theme")}</span>
-          <select id="cfg-ui-theme-select" class="mac-select" data-cfg-ui-theme-select="1">
+      <div class="inset-group">
+        <div class="inset-row">
+          <div class="settings-row-info">
+            <strong>${tr("色彩主题 (Theme)", "Color Theme")}</strong>
+            <span>${tr("支持自动跟随 macOS 外观或锁定浅色/深色模式", "Follow macOS system appearance or force Light / Dark")}</span>
+          </div>
+          <select id="cfg-ui-theme-select" class="mac-select wide" data-cfg-ui-theme-select="1">
             ${themeModes.map((it) => `<option value="${it.v}" ${state.theme === it.v ? "selected" : ""}>${esc(it.l)}</option>`).join("")}
           </select>
-        </label>
-        <label class="cfg-field-label">
-          <span>${tr("界面语言 (Language)", "Interface Language")}</span>
-          <select id="cfg-ui-lang-select" class="mac-select" data-cfg-ui-lang-select="1">
+        </div>
+        <div class="inset-row">
+          <div class="settings-row-info">
+            <strong>${tr("界面语言 (Language)", "Interface Language")}</strong>
+            <span>${tr("实时切换工作台与设置中心界面语言", "Switch UI language immediately")}</span>
+          </div>
+          <select id="cfg-ui-lang-select" class="mac-select wide" data-cfg-ui-lang-select="1">
             <option value="zh" ${state.lang === "zh" ? "selected" : ""}>简体中文</option>
             <option value="en" ${state.lang === "en" ? "selected" : ""}>English</option>
           </select>
-        </label>
-      </div>
-
-      <div class="two-col">
-        <label class="cfg-field-label">
-          <span>${tr("默认权限门控 (permission_mode)", "Default Permission Mode")}</span>
-          <select id="cfg-global-perm-select" class="mac-select" data-global-select="permission_mode">
+        </div>
+        <div class="inset-row">
+          <div class="settings-row-info">
+            <strong>${tr("默认权限门控 (permission_mode)", "Default Permission Mode")}</strong>
+            <span>${tr("新会话默认工具执行与文件编辑门控级别", "Default gate mode for new sessions")}</span>
+          </div>
+          <select id="cfg-global-perm-select" class="mac-select wide" data-global-select="permission_mode">
             ${permModes.map((m) => `<option value="${m.v}" ${(g.permission_mode || "auto") === m.v ? "selected" : ""}>${esc(m.l)}</option>`).join("")}
           </select>
-        </label>
-        <label class="cfg-field-label">
-          <span>${tr("默认 macOS Seatbelt 沙箱 (sandbox_mode)", "Default macOS Seatbelt Sandbox")}</span>
-          <select id="cfg-global-sandbox-select" class="mac-select" data-global-select="sandbox_mode">
+        </div>
+        <div class="inset-row">
+          <div class="settings-row-info">
+            <strong>${tr("默认 macOS Seatbelt 沙箱 (sandbox_mode)", "Default macOS Seatbelt Sandbox")}</strong>
+            <span>${tr("子进程内核级 Seatbelt 写入边界隔离模式", "Kernel-level Seatbelt sandbox boundary")}</span>
+          </div>
+          <select id="cfg-global-sandbox-select" class="mac-select wide" data-global-select="sandbox_mode">
             ${sbModes.map((m) => `<option value="${m.v}" ${(g.sandbox_mode || "workspace-write") === m.v ? "selected" : ""}>${esc(m.l)}</option>`).join("")}
           </select>
-        </label>
+        </div>
+      </div>
+    </div>
+
+    <div class="cfg-section-card">
+      <div class="cfg-section-head">
+        <div>
+          <h3 class="cfg-section-title">⚙️ ${tr("Harness 引擎与自动化策略", "Harness Engine & Automation Policy")}</h3>
+          <p class="cfg-section-desc">${tr("全量极简下拉与开关配置，实时热更新至 PUT /api/config/global。", "Zero-typing dropdowns and switches persisted immediately via PUT /api/config/global.")}</p>
+        </div>
       </div>
 
-      <div class="three-col" style="margin-top:6px;">
+      <div class="inset-group">
+        <div class="inset-row">
+          <div class="settings-row-info">
+            <strong>${tr("自动上下文压缩阈值 (auto_compact_threshold_percent)", "Auto Compact Threshold")}</strong>
+            <span>${tr("当会话上下文占用超过该比例时自动执行锚定增量压缩", "Trigger anchored compaction when context exceeds threshold")}</span>
+          </div>
+          <select id="cfg-auto-compact-threshold" class="mac-select wide" data-global-num-select="auto_compact_threshold_percent">
+            <option value="85" ${compactThresh === 85 ? "selected" : ""}>${tr("85%（推荐）", "85% (Recommended)")}</option>
+            <option value="75" ${compactThresh === 75 ? "selected" : ""}>75%</option>
+            <option value="80" ${compactThresh === 80 ? "selected" : ""}>80%</option>
+            <option value="90" ${compactThresh === 90 ? "selected" : ""}>90%</option>
+            <option value="0" ${compactThresh === 0 ? "selected" : ""}>${tr("关闭 (0)", "Off (0)")}</option>
+          </select>
+        </div>
+
+        <div class="inset-row">
+          <div class="settings-row-info">
+            <strong>${tr("单轮工具最大并发数 (max_tool_concurrency)", "Max Tool Concurrency")}</strong>
+            <span>${tr("单轮响应内只读工具并发执行上限", "Maximum parallel tool calls per turn")}</span>
+          </div>
+          <select id="cfg-max-tool-concurrency" class="mac-select wide" data-global-num-select="max_tool_concurrency">
+            <option value="4" ${toolConc === 4 ? "selected" : ""}>${tr("4（推荐）", "4 (Recommended)")}</option>
+            <option value="1" ${toolConc === 1 ? "selected" : ""}>${tr("1（串行）", "1 (Serial)")}</option>
+            <option value="2" ${toolConc === 2 ? "selected" : ""}>2</option>
+            <option value="8" ${toolConc === 8 ? "selected" : ""}>8</option>
+          </select>
+        </div>
+
+        <div class="inset-row">
+          <div class="settings-row-info">
+            <strong>${tr("子智能体最大步数 (subagent_max_steps)", "Subagent Max Steps")}</strong>
+            <span>${tr("spawn_subagent 委派子智能体的单次最大推理步数", "Maximum reasoning steps for delegated subagents")}</span>
+          </div>
+          <select id="cfg-subagent-max-steps" class="mac-select wide" data-global-num-select="subagent_max_steps">
+            <option value="8" ${subSteps === 8 ? "selected" : ""}>${tr("8 步（推荐）", "8 steps (Recommended)")}</option>
+            <option value="4" ${subSteps === 4 ? "selected" : ""}>${tr("4 步", "4 steps")}</option>
+            <option value="12" ${subSteps === 12 ? "selected" : ""}>${tr("12 步", "12 steps")}</option>
+            <option value="16" ${subSteps === 16 ? "selected" : ""}>${tr("16 步", "16 steps")}</option>
+          </select>
+        </div>
+
+        <div class="inset-row">
+          <div class="settings-row-info">
+            <strong>${tr("命令执行超时 (command_timeout_seconds)", "Command Timeout")}</strong>
+            <span>${tr("run_command 单条命令默认最长执行秒数", "Default timeout in seconds for shell commands")}</span>
+          </div>
+          <select id="cfg-command-timeout" class="mac-select wide" data-global-num-select="command_timeout_seconds">
+            <option value="120" ${cmdTimeout === 120 ? "selected" : ""}>${tr("120 秒（推荐）", "120s (Recommended)")}</option>
+            <option value="30" ${cmdTimeout === 30 ? "selected" : ""}>${tr("30 秒", "30s")}</option>
+            <option value="60" ${cmdTimeout === 60 ? "selected" : ""}>${tr("60 秒", "60s")}</option>
+            <option value="300" ${cmdTimeout === 300 ? "selected" : ""}>${tr("300 秒", "300s")}</option>
+          </select>
+        </div>
+
+        <div class="inset-row">
+          <div class="settings-row-info">
+            <strong>${tr("自动生成会话标题 (auto_generate_title)", "Auto-Generate Session Title")}</strong>
+            <span>${tr("首轮对话完成后利用轻量模型自动提炼简明标题", "Automatically summarize first prompt into session title")}</span>
+          </div>
+          <select id="cfg-auto-generate-title" class="mac-select wide" data-global-bool-select="auto_generate_title">
+            <option value="true" ${autoTitle ? "selected" : ""}>${tr("开启（推荐）", "Enabled (Recommended)")}</option>
+            <option value="false" ${!autoTitle ? "selected" : ""}>${tr("关闭", "Disabled")}</option>
+          </select>
+        </div>
+
+        <div class="inset-row">
+          <div class="settings-row-info">
+            <strong>${tr("Dreamer 空闲触发时长 (dreamer_idle_minutes)", "Dreamer Idle Trigger")}</strong>
+            <span>${tr("工作台空闲达到该时长后自动归纳记忆与候选技能", "Run background memory & skill consolidation after idle")}</span>
+          </div>
+          <select id="cfg-dreamer-idle-minutes" class="mac-select wide" data-global-num-select="dreamer_idle_minutes">
+            <option value="15" ${dreamerIdle === 15 ? "selected" : ""}>${tr("15 分钟（推荐）", "15 min (Recommended)")}</option>
+            <option value="5" ${dreamerIdle === 5 ? "selected" : ""}>${tr("5 分钟", "5 min")}</option>
+            <option value="30" ${dreamerIdle === 30 ? "selected" : ""}>${tr("30 分钟", "30 min")}</option>
+            <option value="0" ${dreamerIdle === 0 ? "selected" : ""}>${tr("关闭 (0)", "Off (0)")}</option>
+          </select>
+        </div>
+
+        <div class="inset-row">
+          <div class="settings-row-info">
+            <strong>${tr("Witness 停滞检测超时 (witness_timeout_seconds)", "Witness Stall Timeout")}</strong>
+            <span>${tr("舰队协同节点无响应超时告警与自愈检测阈值", "Fleet node stall detection timeout in seconds")}</span>
+          </div>
+          <select id="cfg-witness-timeout" class="mac-select wide" data-global-num-select="witness_timeout_seconds">
+            <option value="180" ${witnessTimeout === 180 ? "selected" : ""}>${tr("180 秒（推荐）", "180s (Recommended)")}</option>
+            <option value="60" ${witnessTimeout === 60 ? "selected" : ""}>${tr("60 秒", "60s")}</option>
+            <option value="120" ${witnessTimeout === 120 ? "selected" : ""}>${tr("120 秒", "120s")}</option>
+            <option value="300" ${witnessTimeout === 300 ? "selected" : ""}>${tr("300 秒", "300s")}</option>
+          </select>
+        </div>
+      </div>
+
+      <div class="three-col" style="margin-top:8px;">
         <label class="cfg-field-label">
           <span>${tr("最大并发运行数 (max_concurrency)", "Max Concurrent Runs")}</span>
           <input id="gen-max-runs" class="mac-input mono" type="number" min="1" max="64" value="${Number(g.max_concurrency || g.max_concurrent_runs || 8)}">
@@ -4118,10 +4569,58 @@ function renderProvidersSettingsPage() {
           <input id="prov-edit-baseurl" class="mac-input mono" type="text" value="${esc(draft.base_url)}" placeholder="https://api.openai.com/v1">
         </label>
         <label class="cfg-field-label">
-          <span>${tr("API Key 引用 (keychain:KEY / env:VAR)", "API Key Ref (keychain:KEY / env:VAR)")}</span>
-          <input id="prov-edit-apikey" class="mac-input mono" type="text" value="${esc(draft.api_key)}" placeholder="keychain:OPENAI_API_KEY">
+          <span>${tr("API Key (支持输入明文 sk-... 自动存入钥匙串，或 keychain:KEY / env:VAR)", "API Key (type raw key or keychain:KEY / env:VAR)")}</span>
+          <div class="inline-form" style="flex-wrap:nowrap;">
+            <input id="prov-edit-apikey" class="mac-input mono" type="text" value="${esc(draft.api_key)}" placeholder="keychain:OPENAI_API_KEY 或 sk-...">
+            <button id="fetch-provider-models-btn" class="primary-xs-btn" type="button" data-fetch-provider-models="${esc(draft.id || "custom")}" style="flex-shrink:0;">🔄 ${tr("获取模型列表", "Fetch Models")}</button>
+          </div>
         </label>
       </div>
+
+      ${
+        state.fetchedProviderModels && state.fetchedProviderModels.length > 0
+          ? (() => {
+              const fq = (state.fetchedModelsFilter || "").trim().toLowerCase();
+              const visibleFetched = state.fetchedProviderModels.filter(
+                (m) => !fq || String(m.id).toLowerCase().includes(fq) || String(m.name || "").toLowerCase().includes(fq)
+              );
+              return `
+                <div class="fetched-models-panel" id="fetched-models-panel">
+                  <div class="subhead-row">
+                    <div>
+                      <strong>📋 ${tr("选择要保留到模型目录的模型", "Select Models to Keep in Catalog")}</strong>
+                      <span class="meta-chip mono">${state.selectedFetchedModels.size} / ${state.fetchedProviderModels.length}</span>
+                      ${state.fetchedModelsSource ? `<span class="status-pill ok mono">${esc(state.fetchedModelsSource)}</span>` : ""}
+                    </div>
+                    <div class="row-actions">
+                      <input id="fetched-models-filter" class="mac-input mono" style="max-width:170px;" type="search" value="${esc(state.fetchedModelsFilter || "")}" placeholder="${tr("搜索模型 ID…", "Filter models…")}">
+                      <button id="select-all-fetched-models-btn" class="ghost-xs-btn" type="button">${tr("全选", "Select All")}</button>
+                      <button id="clear-all-fetched-models-btn" class="ghost-xs-btn" type="button">${tr("清空", "Clear")}</button>
+                      <button id="confirm-save-catalog-models-btn" class="primary-xs-btn" type="button">✓ ${tr("确认选入模型目录并保存", "Save Selected to Catalog")}</button>
+                    </div>
+                  </div>
+                  ${state.fetchedModelsWarning ? `<div class="tiny-muted">${esc(state.fetchedModelsWarning)}</div>` : ""}
+                  <div class="fetched-models-grid">
+                    ${visibleFetched
+                      .map((m) => {
+                        const checked = state.selectedFetchedModels.has(m.id);
+                        return `
+                          <label class="fetched-model-item ${checked ? "selected" : ""}">
+                            <div class="checkbox-row mono" style="min-width:0;flex:1;">
+                              <input type="checkbox" data-toggle-fetched-model="${esc(m.id)}" ${checked ? "checked" : ""}>
+                              <span style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="${esc(m.id)}">${esc(m.name || m.id)} <small class="tiny-muted">(${esc(m.id)})</small></span>
+                            </div>
+                            <span class="meta-chip mono">${Math.round(Number(m.context_window || 128000) / 1000)}k</span>
+                          </label>
+                        `;
+                      })
+                      .join("")}
+                  </div>
+                </div>
+              `;
+            })()
+          : ""
+      }
 
       <details class="advanced-config-disclosure">
         <summary>${tr("高级连接选项：超时与自定义 HTTP 请求头 (可选)", "Advanced: Timeout & Custom HTTP Headers (Optional)")}</summary>
@@ -4140,7 +4639,19 @@ function renderProvidersSettingsPage() {
       </details>
 
       <div class="cfg-field-label">
-        <span>${tr("模型目录 (Models Catalog)", "Models Catalog")}</span>
+        <span>📚 ${tr("已启用模型目录 (models — 全局下拉框仅展示此处保留的模型)", "Enabled Model Catalog (models)")}</span>
+        <div class="catalog-model-pills" style="margin-bottom:6px;">
+          ${
+            modelEntries.length > 0
+              ? modelEntries
+                  .map(
+                    ([mId, mSpec]) =>
+                      `<span class="chip-btn active mono">${esc(mSpec?.name || mId)} <small>(${esc(mId)})</small> <span class="chip-remove" data-del-draft-model="${esc(mId)}" title="${tr("从模型目录移除", "Remove from catalog")}">×</span></span>`
+                  )
+                  .join("")
+              : `<span class="tiny-muted">${tr("当前供应商模型目录为空，可点击上方「🔄 获取模型列表」在线拉取勾选，或在下方手动添加。", "Catalog empty — click 'Fetch Models' above or add a model ID below.")}</span>`
+          }
+        </div>
         <table class="editable-table">
           <thead>
             <tr>
@@ -4161,7 +4672,7 @@ function renderProvidersSettingsPage() {
           <input id="prov-new-model-ctx" class="mac-input mono" style="max-width:110px;" type="number" value="128000" placeholder="Context">
           <input id="prov-new-model-in" class="mac-input mono" style="max-width:85px;" type="number" step="0.01" value="0" placeholder="In $">
           <input id="prov-new-model-out" class="mac-input mono" style="max-width:85px;" type="number" step="0.01" value="0" placeholder="Out $">
-          <button id="add-draft-model-btn" class="ghost-xs-btn" type="button">${tr("+ 添加模型", "+ Add Model")}</button>
+          <button id="add-draft-model-btn" class="ghost-xs-btn" type="button">${tr("+ 手动添加模型 ID", "+ Add Model ID")}</button>
         </div>
       </div>
 
@@ -4227,13 +4738,18 @@ function renderAgentsSettingsPage() {
   const provIds = Object.keys(state.config.providers || {}).sort();
   const draft = ensureEditingAgentDraft();
   const modelsForProv = getModelsForProvider(draft.provider);
+  const agentModelList = modelsForProv.some((m) => m.id === draft.model)
+    ? modelsForProv
+    : draft.model
+      ? [{ id: draft.model, name: draft.model }, ...modelsForProv]
+      : modelsForProv;
 
   return `
     <div class="cfg-section-card">
       <div class="cfg-section-head">
         <div>
           <h3 class="cfg-section-title">🤖 ${tr("智能体专家定义 (agents/*.md — Frontmatter + System Prompt)", "Agent Definitions (agents/*.md)")}</h3>
-          <p class="cfg-section-desc">${tr("每个智能体保存为 ~/.gorness/agents/<id>.md，支持自由编辑角色 ID、任意模型名称、只读约束、工具白/黑名单与完整 System Prompt。", "Persisted in ~/.gorness/agents/<id>.md via POST/DELETE /api/config/agents.")}</p>
+          <p class="cfg-section-desc">${tr("每个智能体保存为 ~/.gorness/agents/<id>.md，支持自由编辑角色 ID、从已启用模型目录下拉选择模型、只读约束、工具白/黑名单与完整 System Prompt。", "Persisted in ~/.gorness/agents/<id>.md via POST/DELETE /api/config/agents.")}</p>
         </div>
         <button id="new-agent-draft-btn" class="primary-xs-btn" type="button">${tr("+ 新建智能体", "+ New Agent")}</button>
       </div>
@@ -4277,11 +4793,10 @@ function renderAgentsSettingsPage() {
           </select>
         </label>
         <label class="cfg-field-label">
-          <span>${tr("模型 ID (可选下拉或输入任意自定义模型)", "Model ID (select or type any model)")}</span>
-          <input id="ag-edit-model" class="mac-input mono" type="text" list="ag-model-datalist" value="${esc(draft.model)}" placeholder="claude-sonnet-5-5">
-          <datalist id="ag-model-datalist">
-            ${modelsForProv.map((m) => `<option value="${esc(m.id)}">${esc(m.name)}</option>`).join("")}
-          </datalist>
+          <span>${tr("绑定模型 (从已启用模型目录下拉选择)", "Model (select from enabled catalog)")}</span>
+          <select id="ag-edit-model" class="mac-select mono">
+            ${agentModelList.map((m) => `<option value="${esc(m.id)}" ${m.id === draft.model ? "selected" : ""}>${esc(m.name)} (${esc(m.id)})</option>`).join("")}
+          </select>
         </label>
         <label class="cfg-field-label">
           <span>${tr("推理强度 / 最大步数", "Effort & Max Steps")}</span>
@@ -4539,8 +5054,7 @@ function renderWorkflowsSettingsPage() {
           <label class="cfg-field-label">
             <span>${tr("指定模型", "Stage Model")}</span>
             <select class="mac-select mono" data-wf-node-idx="${idx}" data-wf-node-field="model_override" title="${esc(overrideVal || tr("跟随角色矩阵", "Follow Matrix"))}">
-              <option value="">${tr("跟随角色矩阵", "Follow Matrix")}</option>
-              ${allRefs.map((r) => `<option value="${esc(r.ref)}" ${overrideVal === r.ref ? "selected" : ""}>${esc(r.ref)}</option>`).join("")}
+              ${renderModelCatalogOptgroupsHTML(overrideVal, tr("跟随角色矩阵", "Follow Matrix"))}
             </select>
           </label>
         </div>
@@ -5384,6 +5898,126 @@ function syncProviderFormIntoDraft() {
   return d;
 }
 
+async function fetchProviderModels() {
+  const d = syncProviderFormIntoDraft();
+  if (!d.id) {
+    showToast(tr("请先填写供应商 ID", "Provider ID is required first"), "error");
+    return;
+  }
+  const rawApiKey = (d.api_key || "").trim();
+  if (rawApiKey && !rawApiKey.startsWith("keychain:") && !rawApiKey.startsWith("env:")) {
+    const kcKey = `${d.id.toUpperCase().replace(/[^A-Z0-9_]/g, "_")}_API_KEY`;
+    try {
+      await apiFetch("/api/config/secrets", { method: "POST", body: { key: kcKey, value: rawApiKey } });
+      d.api_key = `keychain:${kcKey}`;
+      if ($("prov-edit-apikey")) $("prov-edit-apikey").value = d.api_key;
+    } catch (_) {
+      // Keep rawApiKey for discovery request if keychain write fails in test/mock env
+    }
+  }
+  setAutoSaveIndicator("saving");
+  let models = [];
+  let source = "remote";
+  let warning = "";
+  try {
+    const res = await apiFetch("/api/config/providers/fetch-models", {
+      method: "POST",
+      body: {
+        id: d.id,
+        provider_id: d.id,
+        type: d.protocol,
+        protocol: d.protocol,
+        base_url: d.base_url,
+        api_key: rawApiKey || d.api_key,
+        headers: d.headers || {}
+      }
+    });
+    if (Array.isArray(res?.models)) models = res.models;
+    else if (res?.models && typeof res.models === "object") {
+      models = Object.entries(res.models).map(([id, spec]) => Object.assign({ id }, spec));
+    }
+    source = res?.source || "remote";
+    warning = res?.warning || "";
+  } catch (err) {
+    const presetModels = PROVIDER_PRESETS[d.id]?.models || {};
+    models = Object.entries(presetModels).map(([id, spec]) => Object.assign({ id }, spec));
+    source = "preset_fallback";
+    warning = err?.message || tr("在线探测不可用，已回退至内置推荐目录", "Remote fetch unavailable; using preset catalog");
+  }
+  state.fetchedProviderModels = models.map((m) => ({
+    id: m.id,
+    name: m.name || m.id,
+    context_window: Number(m.context_window || 128000),
+    max_output_tokens: Number(m.max_output_tokens || 16384),
+    supports_thinking: m.supports_thinking !== false,
+    input_cost_per_1m: Number(m.input_cost_per_1m || 0),
+    output_cost_per_1m: Number(m.output_cost_per_1m || 0)
+  }));
+  state.fetchedModelsSource = source;
+  state.fetchedModelsWarning = warning;
+  state.fetchedModelsFilter = "";
+  const existingIds = Object.keys(d.models || {});
+  const nextSel = new Set();
+  state.fetchedProviderModels.forEach((m) => {
+    if (existingIds.length > 0 ? Boolean(d.models?.[m.id]) : true) {
+      nextSel.add(m.id);
+    }
+  });
+  state.selectedFetchedModels = nextSel;
+  setAutoSaveIndicator("ok");
+  renderConfigStudio();
+  showToast(
+    `${tr("已获取模型列表", "Fetched model list")}: ${state.fetchedProviderModels.length} ${tr("个模型", "models")}`,
+    "ok"
+  );
+}
+
+async function confirmAndSaveCatalogModels() {
+  const d = syncProviderFormIntoDraft();
+  if (!d.id) {
+    showToast(tr("请填写供应商 ID", "Provider ID is required"), "error");
+    return;
+  }
+  const nextModels = {};
+  const existingModels = d.models || {};
+  const isModelSelected = (id) =>
+    state.selectedFetchedModels instanceof Set
+      ? state.selectedFetchedModels.has(id)
+      : Boolean(state.selectedFetchedModels?.[id]);
+  state.fetchedProviderModels.forEach((m) => {
+    if (isModelSelected(m.id)) {
+      nextModels[m.id] = existingModels[m.id] || {
+        name: m.name || m.id,
+        context_window: Number(m.context_window || 128000),
+        max_output_tokens: Number(m.max_output_tokens || 16384),
+        supports_thinking: m.supports_thinking !== false,
+        input_cost_per_1m: Number(m.input_cost_per_1m || 0),
+        output_cost_per_1m: Number(m.output_cost_per_1m || 0)
+      };
+    }
+  });
+  Object.entries(existingModels).forEach(([id, spec]) => {
+    const wasInFetched = state.fetchedProviderModels.some((fm) => fm.id === id);
+    if (!wasInFetched) nextModels[id] = spec;
+  });
+  d.models = nextModels;
+  setAutoSaveIndicator("saving");
+  try {
+    const snap = await apiFetch("/api/config/providers", { method: "POST", body: d });
+    state.config = snap;
+    state.editingProviderId = d.id;
+    state.editingProviderDraft = null;
+    state.fetchedProviderModels = [];
+    setAutoSaveIndicator("ok");
+    populateAgentAndModelControls();
+    renderConfigStudio();
+    showToast(`${tr("已确认并保存模型目录", "Confirmed & saved model catalog")}: ${Object.keys(nextModels).length}`, "ok");
+  } catch (err) {
+    setAutoSaveIndicator("err", err.message);
+    notifyError(err, tr("保存模型目录失败", "Failed to save model catalog"));
+  }
+}
+
 function syncWorkflowFormIntoDraft() {
   const d = ensureEditingWorkflowDraft();
   if ($("wf-edit-id")) d.id = $("wf-edit-id").value.trim();
@@ -5514,13 +6148,41 @@ function bindConfigStudioEvents() {
     if (selEditProv) {
       state.editingProviderId = selEditProv.dataset.selectEditProv;
       state.editingProviderDraft = null;
+      state.fetchedProviderModels = [];
       renderConfigStudio();
       return;
     }
     if (ev.target.closest("#new-provider-draft-btn")) {
       state.editingProviderId = "__new__";
       state.editingProviderDraft = null;
+      state.fetchedProviderModels = [];
       renderConfigStudio();
+      return;
+    }
+    if (ev.target.closest("#fetch-provider-models-btn") || ev.target.closest("[data-fetch-provider-models]")) {
+      await fetchProviderModels();
+      return;
+    }
+    if (ev.target.closest("#select-all-fetched-models-btn")) {
+      syncProviderFormIntoDraft();
+      if (!(state.selectedFetchedModels instanceof Set)) state.selectedFetchedModels = new Set();
+      const q = (state.fetchedModelsFilter || "").trim().toLowerCase();
+      state.fetchedProviderModels.forEach((m) => {
+        if (!q || m.id.toLowerCase().includes(q) || (m.name || "").toLowerCase().includes(q)) {
+          state.selectedFetchedModels.add(m.id);
+        }
+      });
+      renderConfigStudio();
+      return;
+    }
+    if (ev.target.closest("#clear-all-fetched-models-btn")) {
+      syncProviderFormIntoDraft();
+      state.selectedFetchedModels = new Set();
+      renderConfigStudio();
+      return;
+    }
+    if (ev.target.closest("#confirm-save-catalog-models-btn")) {
+      await confirmAndSaveCatalogModels();
       return;
     }
     if (ev.target.closest("#add-draft-model-btn")) {
@@ -5544,7 +6206,16 @@ function bindConfigStudioEvents() {
     const delModelBtn = ev.target.closest("[data-del-draft-model]");
     if (delModelBtn) {
       const d = syncProviderFormIntoDraft();
-      delete d.models[delModelBtn.dataset.delDraftModel];
+      const rmId = delModelBtn.dataset.delDraftModel;
+      delete d.models[rmId];
+      if (state.selectedFetchedModels instanceof Set) state.selectedFetchedModels.delete(rmId);
+      if (d.id && state.config?.providers?.[d.id]) {
+        try {
+          const snap = await apiFetch("/api/config/providers", { method: "POST", body: d });
+          state.config = snap;
+          populateAgentAndModelControls();
+        } catch (_) {}
+      }
       renderConfigStudio();
       return;
     }
@@ -6097,8 +6768,32 @@ function bindConfigStudioEvents() {
     }
   });
 
+  studio.addEventListener("input", (ev) => {
+    if (ev.target.id === "fetched-models-filter") {
+      syncProviderFormIntoDraft();
+      state.fetchedModelsFilter = ev.target.value || "";
+      renderConfigStudio();
+      const inp = $("fetched-models-filter");
+      if (inp) {
+        inp.focus?.();
+        try {
+          inp.setSelectionRange?.(inp.value.length, inp.value.length);
+        } catch (_) {}
+      }
+    }
+  });
+
   studio.addEventListener("change", async (ev) => {
     const tEl = ev.target;
+
+    if (tEl.dataset.toggleFetchedModel) {
+      syncProviderFormIntoDraft();
+      if (!(state.selectedFetchedModels instanceof Set)) state.selectedFetchedModels = new Set();
+      const mid = tEl.dataset.toggleFetchedModel;
+      if (tEl.checked) state.selectedFetchedModels.add(mid);
+      else state.selectedFetchedModels.delete(mid);
+      return;
+    }
 
     // General page selects
     if (tEl.id === "cfg-ui-theme-select") {
@@ -6112,6 +6807,17 @@ function bindConfigStudioEvents() {
     }
     if (tEl.dataset.globalSelect) {
       await saveGlobalConfigPatch({ [tEl.dataset.globalSelect]: tEl.value });
+      renderConfigStudio();
+      return;
+    }
+    if (tEl.dataset.globalNumSelect) {
+      await saveGlobalConfigPatch({ [tEl.dataset.globalNumSelect]: Number(tEl.value) });
+      updateSessionContextMeter();
+      renderConfigStudio();
+      return;
+    }
+    if (tEl.dataset.globalBoolSelect) {
+      await saveGlobalConfigPatch({ [tEl.dataset.globalBoolSelect]: tEl.value === "true" });
       renderConfigStudio();
       return;
     }
@@ -6154,14 +6860,18 @@ function bindConfigStudioEvents() {
       return;
     }
 
-    // Agent editor provider change refreshes datalist
+    // Agent editor provider change refreshes model select dropdown
     if (tEl.id === "ag-edit-provider" && state.editingAgentDraft) {
       state.editingAgentDraft.provider = tEl.value;
-      const dl = $("ag-model-datalist");
-      if (dl) {
-        dl.innerHTML = getModelsForProvider(tEl.value)
-          .map((m) => `<option value="${esc(m.id)}">${esc(m.name)}</option>`)
+      const models = getModelsForProvider(tEl.value);
+      const nextModel = models[0]?.id || "";
+      state.editingAgentDraft.model = nextModel;
+      const sel = $("ag-edit-model");
+      if (sel) {
+        sel.innerHTML = models
+          .map((m) => `<option value="${esc(m.id)}">${esc(m.name || m.id)} (${Math.round((m.context_window || 128000) / 1000)}K)</option>`)
           .join("");
+        sel.value = nextModel;
       }
       return;
     }
@@ -6492,10 +7202,17 @@ function bindEvents() {
   $("agent-role-select")?.addEventListener("change", async (ev) => {
     if (!state.activeSessionId) return;
     try {
-      await apiFetch(`/api/sessions/${encodeURIComponent(state.activeSessionId)}`, {
+      const updated = await apiFetch(`/api/sessions/${encodeURIComponent(state.activeSessionId)}`, {
         method: "PATCH",
         body: { agent_role: ev.target.value }
       });
+      if (updated?.id) {
+        const idx = state.sessions.findIndex((s) => s.id === updated.id);
+        if (idx >= 0) state.sessions[idx] = updated;
+        state.activeSessionMeta = updated;
+        updateSessionContextMeter();
+        renderWorkspaceTree();
+      }
     } catch (err) {
       notifyError(err);
     }
@@ -6504,13 +7221,40 @@ function bindEvents() {
   $("model-override-input")?.addEventListener("change", async (ev) => {
     if (!state.activeSessionId) return;
     try {
-      await apiFetch(`/api/sessions/${encodeURIComponent(state.activeSessionId)}`, {
+      const updated = await apiFetch(`/api/sessions/${encodeURIComponent(state.activeSessionId)}`, {
         method: "PATCH",
-        body: { model_override: ev.target.value.trim() }
+        body: { model_override: (ev.target.value || "").trim() }
       });
+      if (updated?.id) {
+        const idx = state.sessions.findIndex((s) => s.id === updated.id);
+        if (idx >= 0) state.sessions[idx] = updated;
+        state.activeSessionMeta = updated;
+        updateSessionContextMeter();
+      }
     } catch (err) {
       notifyError(err);
     }
+  });
+
+  $("perm-mode-select")?.addEventListener("change", async (ev) => {
+    if (!state.activeSessionId) return;
+    try {
+      const updated = await apiFetch(`/api/sessions/${encodeURIComponent(state.activeSessionId)}`, {
+        method: "PATCH",
+        body: { permission_mode: ev.target.value }
+      });
+      if (updated?.id) {
+        const idx = state.sessions.findIndex((s) => s.id === updated.id);
+        if (idx >= 0) state.sessions[idx] = updated;
+        state.activeSessionMeta = updated;
+      }
+    } catch (err) {
+      notifyError(err);
+    }
+  });
+
+  $("session-context-meter")?.addEventListener("click", () => {
+    compactActiveSession();
   });
 
   $("session-wt-diff-btn")?.addEventListener("click", () => openSessionWorktreeModal());
@@ -6559,6 +7303,36 @@ function bindEvents() {
 
   // Chat Timeline Actions
   $("chat-timeline")?.addEventListener("click", async (ev) => {
+    const onboardCard = ev.target.closest("[data-onboarding-card]");
+    if (onboardCard) {
+      const kind = onboardCard.dataset.onboardingCard;
+      const comp = $("composer-input");
+      if (kind === "fleet") {
+        setCenterMode("fleet");
+        return;
+      }
+      if (comp) {
+        if (kind === "arch") {
+          comp.value = tr(
+            "请梳理当前工作区的整体项目架构、核心包职责与关键调用链路，并指出最重要的入口文件。",
+            "Explain the overall architecture, core modules, and key entry points of this workspace."
+          );
+        } else if (kind === "git") {
+          comp.value = tr(
+            "@git 请审查当前工作区的 Git 未提交变更，指出潜在 Bug、竞态条件或边界遗漏。",
+            "@git Review uncommitted Git changes in this workspace and flag potential bugs or edge cases."
+          );
+        } else if (kind === "tdd") {
+          comp.value = tr(
+            "请分析当前项目的核心模块，为关键业务逻辑编写高覆盖率的单元测试并运行验证。",
+            "Analyze the core modules and write comprehensive unit tests for critical business logic."
+          );
+        }
+        comp.focus?.();
+        scheduleDraftSave();
+      }
+      return;
+    }
     if (ev.target.closest("[data-dismiss-run-error]")) {
       state.lastRunError = "";
       renderReloadBanner("");
@@ -6613,12 +7387,36 @@ function bindEvents() {
     btn.addEventListener("click", () => switchInspectorTab(btn.dataset.tab));
   });
   $("file-filter-input")?.addEventListener("input", () => renderFilesList());
+  $("expand-all-files-btn")?.addEventListener("click", () => expandAllWorkspaceFolders());
+  $("collapse-all-files-btn")?.addEventListener("click", () => collapseAllWorkspaceFolders());
   $("refresh-files-btn")?.addEventListener("click", () => {
     if (state.activeWorkspaceId) refreshWorkspaceInspector(state.activeWorkspaceId);
   });
   $("workspace-files-list")?.addEventListener("click", (ev) => {
+    const citeBtn = ev.target.closest("[data-cite-file]");
+    if (citeBtn) {
+      ev.stopPropagation();
+      citeFileInComposer(citeBtn.dataset.citeFile);
+      return;
+    }
+    const dirRow = ev.target.closest("[data-toggle-dir]");
+    if (dirRow) {
+      const dirPath = dirRow.dataset.toggleDir;
+      if (!(state.expandedTreeDirs instanceof Set)) state.expandedTreeDirs = new Set();
+      if (state.expandedTreeDirs.has(dirPath)) state.expandedTreeDirs.delete(dirPath);
+      else state.expandedTreeDirs.add(dirPath);
+      renderFilesList();
+      return;
+    }
     const row = ev.target.closest("[data-open-file]");
     if (row) openFilePreview(row.dataset.openFile);
+  });
+  $("cite-file-in-chat-btn")?.addEventListener("click", () => {
+    const rel = $("file-viewer-card")?.dataset.currentPath || "";
+    if (rel) citeFileInComposer(rel);
+  });
+  $("close-file-viewer-btn")?.addEventListener("click", () => {
+    $("file-viewer-card")?.classList.add("hidden");
   });
   $("safe-open-file-btn")?.addEventListener("click", () => {
     const rel = $("file-viewer-card")?.dataset.currentPath || "";
@@ -6952,6 +7750,12 @@ export {
   updateComposerPalette,
   renderConfigStudio,
   getModelsForProvider,
+  renderModelCatalogOptgroupsHTML,
+  fetchProviderModels,
+  confirmAndSaveCatalogModels,
+  buildWorkspaceFileTree,
+  updateSessionContextMeter,
+  citeFileInComposer,
   renderMarkdownHTML
 };
 

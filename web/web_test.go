@@ -50,10 +50,33 @@ func TestEmbeddedAssetsSingleSettingsHomeAndUIDeduplication(t *testing.T) {
 		`id="toggle-add-provider-btn"`,
 		`id="lang-toggle-btn"`,
 		`allow-same-origin`,
+		`id="vault-path-label"`,
+		`class="vault-meta"`,
+		`class="vault-formats"`,
+		`TOML · MD · JSONL · HTML`,
+		`class="dot dot-red"`,
+		`class="dot dot-amber"`,
+		`class="dot dot-green"`,
 	}
 	for _, bad := range forbiddenHTMLSubstrings {
 		if strings.Contains(indexHTML, bad) {
 			t.Errorf("index.html must not contain removed duplicate/unsafe fragment %q", bad)
+		}
+	}
+
+	// Verify #agent-role-select, #model-override-input, #perm-mode-select, and #stop-run-btn are relocated inside #composer-shell and NOT inside .session-bar.
+	composerIdx := strings.Index(indexHTML, `id="composer-shell"`)
+	if composerIdx < 0 {
+		t.Fatalf("index.html missing #composer-shell")
+	}
+	beforeComposer := indexHTML[:composerIdx]
+	afterComposer := indexHTML[composerIdx:]
+	for _, movedID := range []string{`id="agent-role-select"`, `id="model-override-input"`, `id="perm-mode-select"`, `id="stop-run-btn"`} {
+		if strings.Contains(beforeComposer, movedID) {
+			t.Errorf("%s must be removed from top .session-bar and placed inside #composer-shell", movedID)
+		}
+		if !strings.Contains(afterComposer, movedID) {
+			t.Errorf("%s must be present inside #composer-shell", movedID)
 		}
 	}
 
@@ -88,8 +111,14 @@ func TestEmbeddedAssetsSingleSettingsHomeAndUIDeduplication(t *testing.T) {
 		`id="health-pill"`,
 		`id="reload-diag-banner"`,
 		`id="session-worktree-pill"`,
+		`id="session-context-meter"`,
+		`id="session-git-pill"`,
 		`id="session-actions-menu-btn"`,
 		`id="session-actions-menu"`,
+		`id="expand-all-files-btn"`,
+		`id="collapse-all-files-btn"`,
+		`id="cite-file-in-chat-btn"`,
+		`id="close-file-viewer-btn"`,
 		`data-session-action="new-worktree"`,
 		`data-session-action="compact"`,
 		`data-session-action="export-html"`,
@@ -148,6 +177,18 @@ func TestEmbeddedAssetsSingleSettingsHomeAndUIDeduplication(t *testing.T) {
 	for _, deadCSS := range []string{".mac-input-xs", ".raw-vault-disclosure", ".agent-matrix-rows", ".alwayson-grid"} {
 		if strings.Contains(stylesCSS, deadCSS) {
 			t.Errorf("styles.css must not contain dead selector %q", deadCSS)
+		}
+	}
+	for _, appleCSS := range []string{
+		"backdrop-filter: blur(20px) saturate(180%)",
+		"#8E8E93",
+		".onboarding-empty-state",
+		".tree-view",
+		".fetched-models-panel",
+		".inset-group",
+	} {
+		if !strings.Contains(stylesCSS, appleCSS) {
+			t.Errorf("styles.css missing required Apple HIG style fragment %q", appleCSS)
 		}
 	}
 }
@@ -460,6 +501,20 @@ globalThis.fetch = async (input, init = {}) => {
   if (String(input).startsWith("/api/config/files?rel=")) {
     return new Response(JSON.stringify({ rel_path: "config.toml", content: "theme = 'dark'\n" }), { status: 200 });
   }
+  if (input === "/api/config/providers/fetch-models") {
+    return new Response(JSON.stringify({
+      source: "remote",
+      models: [
+        { id: "claude-opus-4-6", name: "Claude Opus 4.6", context_window: 200000, max_output_tokens: 32000, supports_thinking: true },
+        { id: "claude-sonnet-5-5", name: "Claude Sonnet 5.5", context_window: 200000, max_output_tokens: 16384, supports_thinking: true }
+      ]
+    }), { status: 200, headers: { "Content-Type": "application/json" } });
+  }
+  if (input === "/api/config/providers" && method === "POST") {
+    const nextCfg = structuredClone(mod.state.config);
+    nextCfg.providers[body.id] = body;
+    return new Response(JSON.stringify(nextCfg), { status: 200, headers: { "Content-Type": "application/json" } });
+  }
   return new Response(JSON.stringify({ ok: true }), { status: 200, headers: { "Content-Type": "application/json" } });
 };
 
@@ -494,9 +549,9 @@ assert.match(chatHTML, /Web audit clean/, "paired subagent result must render in
 
 // D. Verify all 8 visual Settings pages render clean form controls, custom MCP servers, lifecycle hooks, and per-node role_models[nd.id]!
 const pageChecks = [
-  ["general", /id="cfg-ui-theme-select"[\s\S]*id="cfg-ui-lang-select"[\s\S]*id="gen-max-runs"/],
+  ["general", /id="cfg-ui-theme-select"[\s\S]*id="cfg-ui-lang-select"[\s\S]*data-global-num-select="auto_compact_threshold_percent"[\s\S]*data-global-num-select="max_tool_concurrency"[\s\S]*data-global-num-select="subagent_max_steps"[\s\S]*data-global-num-select="command_timeout_seconds"[\s\S]*data-global-bool-select="auto_generate_title"[\s\S]*data-global-num-select="dreamer_idle_minutes"[\s\S]*data-global-num-select="witness_timeout_seconds"[\s\S]*id="gen-max-runs"/],
   ["matrix", /data-matrix-subtab="core"[\s\S]*id="cfg-global-provider"[\s\S]*data-agent-model-select="coder"[\s\S]*data-agent-effort-select="coder"/],
-  ["providers", /id="keychain-key-input"[\s\S]*id="prov-edit-baseurl"[\s\S]*id="delete-provider-btn"/],
+  ["providers", /id="keychain-key-input"[\s\S]*id="prov-edit-baseurl"[\s\S]*id="fetch-provider-models-btn"[\s\S]*id="delete-provider-btn"/],
   ["agents", /id="ag-edit-id"[\s\S]*id="ag-edit-model"[\s\S]*id="ag-edit-sysprompt"/],
   ["workflows", /id="wf-edit-id"[\s\S]*id="wf-edit-topology"[\s\S]*id="wf-flow-preview-bar"[\s\S]*data-wf-node-field="model_override"/],
   ["permissions", /id="trust-workspace-btn"[\s\S]*id="rules-category-select"[\s\S]*id="rules-quick-add-input"[\s\S]*id="hook-phase-select"[\s\S]*id="add-hook-btn"/],
@@ -536,8 +591,13 @@ await mod.handleSlashCommand("/rewind 1 --no-files");
 const rewNoFiles = apiCalls.find((c) => c.url.endsWith("/rewind"));
 assert.deepEqual(rewNoFiles.body, { to_seq: 1, restore_files: false });
 
-// G. Verify keyboard navigation on #composer-palette (@file)
+// G. Verify keyboard navigation on #composer-palette (@file and @git)
 const comp = getEl("composer-input");
+comp.value = "@";
+comp.selectionStart = comp.value.length;
+mod.updateComposerPalette();
+assert.equal(mod.state.paletteItems[0].insert, "@git ");
+
 comp.value = "@web/";
 comp.selectionStart = comp.value.length;
 mod.updateComposerPalette();
@@ -549,11 +609,48 @@ mod.handleComposerKeydown({ key: "Enter", shiftKey: false, preventDefault() {} }
 assert.equal(comp.value, "@web/index.html ");
 assert.equal(getEl("composer-palette").classList.contains("hidden"), true);
 
-// H. Verify safe zero-XSS Markdown preview & native NSOpenPanel callback
+// H. Verify safe zero-XSS Markdown preview, onboarding empty state, file tree hierarchy, and provider model catalog fetching
 const mdHTML = mod.renderMarkdownHTML("# Title\n- **bold** \x60code\x60\n<script>alert(1)</script>");
 assert.match(mdHTML, /<h1>Title<\/h1>/);
 assert.match(mdHTML, /<strong>bold<\/strong> <code>code<\/code>/);
 assert.doesNotMatch(mdHTML, /<script>/);
+
+// Onboarding Empty State when session has no entries
+mod.state.activeEntries = [];
+mod.renderChatHistory();
+const emptyChatHTML = getEl("chat-history-entries").innerHTML;
+assert.match(emptyChatHTML, /class="onboarding-empty-state"/);
+assert.match(emptyChatHTML, /data-onboarding-card="arch"[\s\S]*data-onboarding-card="git"[\s\S]*data-onboarding-card="tdd"[\s\S]*data-onboarding-card="fleet"/);
+
+// Nested Workspace File Tree & @cite in Composer
+const treeRoots = mod.buildWorkspaceFileTree([
+  { path: "README.md", is_dir: false, size: 512 },
+  { path: "internal/server/server.go", is_dir: false, size: 4096 },
+  { path: "cmd/gorness/main.go", is_dir: false, size: 1024 }
+]);
+assert.equal(treeRoots[0].name, "cmd");
+assert.equal(treeRoots[0].is_dir, true);
+assert.equal(treeRoots[1].name, "internal");
+assert.equal(treeRoots[2].name, "README.md");
+comp.value = "";
+mod.citeFileInComposer("internal/server/server.go");
+assert.equal(comp.value, "@internal/server/server.go ");
+
+// Provider Model Discovery & Catalog Confirmation Flow
+mod.openSettingsModal("providers");
+getEl("prov-edit-id").value = "anthropic";
+getEl("prov-edit-name").value = "Anthropic";
+getEl("prov-edit-protocol").value = "anthropic";
+getEl("prov-edit-baseurl").value = "https://api.anthropic.com";
+getEl("prov-edit-apikey").value = "keychain:ANTHROPIC_API_KEY";
+await mod.fetchProviderModels();
+assert.equal(mod.state.fetchedProviderModels.length, 2);
+mod.state.selectedFetchedModels.add("claude-opus-4-6");
+await mod.confirmAndSaveCatalogModels();
+assert.ok(mod.state.config.providers.anthropic.models["claude-opus-4-6"], "confirmed model must be saved to provider catalog");
+const optgroupsHTML = mod.renderModelCatalogOptgroupsHTML("anthropic/claude-opus-4-6", "跟随角色默认");
+assert.match(optgroupsHTML, /<optgroup label="Anthropic \(anthropic\)">/);
+assert.match(optgroupsHTML, /value="anthropic\/claude-opus-4-6" selected/);
 
 assert.equal(typeof globalThis.window.onNativeWorkspaceRegistered, "function");
 await globalThis.window.onNativeWorkspaceRegistered({ id: "ws_1", name: "DemoRepo" });
