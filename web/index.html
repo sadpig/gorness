@@ -25,9 +25,9 @@
 
       <div class="topbar-center">
         <div class="segmented-control" role="tablist" aria-label="主工作区模式">
-          <button id="mode-chat-btn" class="seg-btn active" type="button" data-mode="chat" data-i18n="modeChat">对话工作台</button>
+          <button id="mode-chat-btn" class="seg-btn active" type="button" data-mode="chat" data-i18n="modeChat">💬 简单对话</button>
           <button id="mode-fleet-btn" class="seg-btn" type="button" data-mode="fleet">
-            <span data-i18n="modeFleet">多智能体编排画布</span>
+            <span data-i18n="modeFleet">🛸 舰队协同</span>
             <span id="fleet-live-badge" class="pill-count hidden">0</span>
           </button>
         </div>
@@ -38,12 +38,6 @@
           <span class="pulse-dot idle" id="alwayson-dot"></span>
           <span data-i18n="alwaysOnBtn">常驻中枢</span>
           <span id="alwayson-count" class="pill-count hidden">0</span>
-        </button>
-
-        <button id="open-settings-top-btn" class="toolbar-btn" type="button" title="打开系统设置中心 (⌘,)">
-          <span aria-hidden="true">⚙</span>
-          <span data-i18n="settingsBtn">设置</span>
-          <kbd class="kbd-inline">⌘,</kbd>
         </button>
       </div>
     </header>
@@ -84,14 +78,17 @@
 
         <div id="workspace-tree" class="workspace-tree"></div>
 
-        <!-- ~/.gorness/ Zero-DB Vault Indicator Footer -->
+        <!-- ~/.gorness/ Zero-DB Vault Indicator Footer + Unique Bottom-Left Config Button -->
         <footer class="vault-footer">
           <div class="vault-meta">
             <div class="vault-title">
               <span class="vault-dot"></span>
               <code id="vault-path-label">~/.gorness</code>
             </div>
-            <span class="vault-formats">TOML · MD · JSONL · HTML</span>
+            <button id="open-config-studio-btn" class="toolbar-btn" type="button" title="打开系统设置中心 (⌘,)">
+              <span data-i18n="settingsBtn">⚙ 配置矩阵</span>
+              <kbd class="kbd-inline">⌘,</kbd>
+            </button>
           </div>
         </footer>
       </aside>
@@ -189,7 +186,8 @@
                 <span id="draft-saved-indicator" class="draft-indicator"></span>
               </div>
               <div class="composer-actions">
-                <button id="send-or-steer-btn" class="primary-sm-btn" type="button" data-i18n="sendBtn">发送</button>
+                <button id="switch-to-fleet-btn" class="ghost-sm-btn" type="button" data-i18n="switchToFleetBtn">🛸 切换舰队协同</button>
+                <button id="send-or-steer-btn" class="primary-sm-btn" type="button" data-i18n="sendBtn">发送对话</button>
               </div>
             </div>
           </div>
@@ -199,6 +197,7 @@
         <section id="fleet-mode-view" class="mode-view hidden">
           <div class="fleet-toolbar">
             <div class="fleet-toolbar-left">
+              <button id="back-to-chat-btn" class="ghost-xs-btn" type="button" data-action="back-to-chat" data-i18n="backToChatBtn">💬 返回简单对话</button>
               <select id="mission-select" class="mac-select wide"></select>
               <span id="mission-status-pill" class="status-pill">空闲</span>
               <span id="mission-cost-pill" class="meta-chip mono">$0.0000</span>
@@ -212,50 +211,20 @@
           </div>
 
           <div class="fleet-studio-body">
-            <!-- Unified In-Studio Mission Launcher (Backed by state.config.workflows + Editable Overrides) -->
+            <!-- Streamlined In-Studio Mission Launcher (Workflow + Goal + Collapsible Advanced Overrides) -->
             <form id="launch-fleet-form" class="fleet-launcher-card hidden">
               <div class="subhead-row">
                 <strong data-i18n="launchFleetTitle">启动异构多智能体协同编排</strong>
-                <button id="close-fleet-launcher-btn" class="ghost-xs-btn" type="button" data-i18n="collapseBtn">收起 ✕</button>
-              </div>
-
-              <div class="topology-cards-grid" id="topology-cards-grid"></div>
-
-              <div class="three-col">
-                <label class="cfg-field-label">
-                  <span data-i18n="fleetWorkflowLabel">工作流模板 (workflows/*.toml)</span>
-                  <select id="fleet-workflow-select" class="mac-select mono"></select>
-                </label>
-                <label class="cfg-field-label">
-                  <span data-i18n="fleetTopologyLabel">编排拓扑引擎 (Topology Override)</span>
-                  <select id="fleet-topology-select" class="mac-select mono">
-                    <option value="hybrid-fleet">hybrid-fleet</option>
-                    <option value="review-loop">review-loop</option>
-                    <option value="parallel-explore">parallel-explore</option>
-                    <option value="worktree-team">worktree-team</option>
-                    <option value="event-pipeline">event-pipeline</option>
-                    <option value="shared-board">shared-board</option>
-                  </select>
-                </label>
-                <label class="cfg-field-label">
-                  <span data-i18n="budgetLabel">预算上限 (USD, 0=不限)</span>
-                  <input id="fleet-budget-input" class="mac-input mono" type="number" min="0" step="0.5" value="0">
-                </label>
-              </div>
-
-              <div class="cfg-field-label">
-                <div class="subhead-row">
-                  <span data-i18n="verifyCmdLabel">Refinery 验收门控命令 (可自由编辑或点选快捷芯片)</span>
-                  <div class="chips-wrap">
-                    <button class="chip-btn mono" type="button" data-verify-chip="go test ./...">go test ./...</button>
-                    <button class="chip-btn mono" type="button" data-verify-chip="CGO_ENABLED=0 go test -race ./...">go test -race</button>
-                    <button class="chip-btn mono" type="button" data-verify-chip="npm test">npm test</button>
-                    <button class="chip-btn mono" type="button" data-verify-chip="pytest">pytest</button>
-                    <button class="chip-btn" type="button" data-verify-chip="" data-i18n="noVerifyChip">无命令</button>
-                  </div>
+                <div class="row-actions">
+                  <button id="launcher-back-to-chat-btn" class="ghost-xs-btn" type="button" data-action="back-to-chat" data-i18n="backToChatBtn">💬 返回简单对话</button>
+                  <button id="close-fleet-launcher-btn" class="ghost-xs-btn" type="button" data-i18n="collapseBtn">收起 ✕</button>
                 </div>
-                <input id="fleet-verify-input" class="mac-input mono" type="text" placeholder="go test ./...">
               </div>
+
+              <label class="cfg-field-label">
+                <span data-i18n="fleetWorkflowLabel">选择工作流模板 (workflows/*.toml)</span>
+                <select id="fleet-workflow-select" class="mac-select mono"></select>
+              </label>
 
               <div class="cfg-field-label">
                 <div class="subhead-row">
@@ -269,12 +238,51 @@
                 <textarea id="fleet-goal-input" class="mac-textarea" rows="2" data-i18n-placeholder="fleetGoalPh" placeholder="输入具体编排目标，或点选上方快捷模板后补充细节…" required></textarea>
               </div>
 
-              <div class="subhead-row">
-                <label class="checkbox-row">
-                  <input id="fleet-worktrees-cb" type="checkbox" checked>
-                  <span data-i18n="useWorktreesLabel">启用独立 Git Worktree 物理隔离与串行变基合入 (--ff-only)</span>
-                </label>
-                <button class="primary-sm-btn" type="submit" data-i18n="startMissionSubmit">立即启动拓扑</button>
+              <details class="advanced-config-disclosure">
+                <summary data-i18n="fleetAdvancedSummary">高级运行参数（可选）</summary>
+                <div class="advanced-config-body">
+                  <div class="topology-cards-grid" id="topology-cards-grid"></div>
+                  <div class="two-col">
+                    <label class="cfg-field-label">
+                      <span data-i18n="fleetTopologyLabel">编排拓扑引擎覆盖 (Topology Override)</span>
+                      <select id="fleet-topology-select" class="mac-select mono">
+                        <option value="hybrid-fleet">hybrid-fleet</option>
+                        <option value="review-loop">review-loop</option>
+                        <option value="parallel-explore">parallel-explore</option>
+                        <option value="worktree-team">worktree-team</option>
+                        <option value="event-pipeline">event-pipeline</option>
+                        <option value="shared-board">shared-board</option>
+                      </select>
+                    </label>
+                    <label class="cfg-field-label">
+                      <span data-i18n="budgetLabel">预算上限 (USD, 0=不限)</span>
+                      <input id="fleet-budget-input" class="mac-input mono" type="number" min="0" step="0.5" value="0">
+                    </label>
+                  </div>
+
+                  <div class="cfg-field-label">
+                    <div class="subhead-row">
+                      <span data-i18n="verifyCmdLabel">Refinery 验收门控命令 (可自由编辑或点选快捷芯片)</span>
+                      <div class="chips-wrap">
+                        <button class="chip-btn mono" type="button" data-verify-chip="go test ./...">go test ./...</button>
+                        <button class="chip-btn mono" type="button" data-verify-chip="CGO_ENABLED=0 go test -race ./...">go test -race</button>
+                        <button class="chip-btn mono" type="button" data-verify-chip="npm test">npm test</button>
+                        <button class="chip-btn mono" type="button" data-verify-chip="pytest">pytest</button>
+                        <button class="chip-btn" type="button" data-verify-chip="" data-i18n="noVerifyChip">无命令</button>
+                      </div>
+                    </div>
+                    <input id="fleet-verify-input" class="mac-input mono" type="text" placeholder="go test ./...">
+                  </div>
+
+                  <label class="checkbox-row">
+                    <input id="fleet-worktrees-cb" type="checkbox" checked>
+                    <span data-i18n="useWorktreesLabel">启用独立 Git Worktree 物理隔离与串行变基合入 (--ff-only)</span>
+                  </label>
+                </div>
+              </details>
+
+              <div class="subhead-row" style="justify-content:flex-end;">
+                <button class="primary-sm-btn" type="submit" data-i18n="startMissionSubmit">立即启动</button>
               </div>
             </form>
 
@@ -450,21 +458,17 @@
         </button>
         <button class="settings-nav-btn" type="button" data-cfg-page="permissions">
           <span class="settings-tile">🛡️</span>
-          <span data-i18n="cfgPagePermissions">权限、信任与授权</span>
+          <span data-i18n="cfgPagePermissions">权限、信任与钩子</span>
         </button>
         <button class="settings-nav-btn" type="button" data-cfg-page="mcp">
           <span class="settings-tile">🔌</span>
           <span data-i18n="cfgPageMCP">MCP 扩展服务</span>
         </button>
 
-        <div class="settings-sidebar-group-label" data-i18n="cfgGroupVault">记忆与透明文件仓</div>
+        <div class="settings-sidebar-group-label" data-i18n="cfgGroupVault">记忆与经验</div>
         <button class="settings-nav-btn" type="button" data-cfg-page="memory">
           <span class="settings-tile">🧠</span>
           <span data-i18n="cfgPageMemory">四层记忆与候选技能</span>
-        </button>
-        <button class="settings-nav-btn" type="button" data-cfg-page="files">
-          <span class="settings-tile">📄</span>
-          <span data-i18n="cfgPageFiles">底层源文件</span>
         </button>
       </aside>
 

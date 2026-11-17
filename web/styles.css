@@ -1552,38 +1552,76 @@ details.subagent-card > summary::-webkit-details-marker {
   line-height: 1.38;
 }
 
-/* Agent Role Matrix Cards */
+/* Agent Role Matrix Cards & Compact 4-Column Matrix Table */
 .role-cards-grid {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.matrix-table,
+.role-matrix-card,
+.role-field-grid > *,
+.three-col > *,
+.two-col > *,
+.cfg-field-label {
+  min-width: 0;
+  max-width: 100%;
+  overflow: hidden;
+}
+.matrix-subtabs {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  padding: 4px;
+  border-radius: 10px;
+  background: var(--bg-subtle);
+  border: 1px solid var(--hairline);
+}
+.matrix-table {
+  width: 100%;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.matrix-header-row,
+.role-matrix-card {
   display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(390px, 1fr));
-  gap: 12px;
+  grid-template-columns: minmax(190px, 1.35fr) minmax(130px, 1fr) minmax(170px, 1.4fr) minmax(120px, 0.85fr);
+  align-items: center;
+  gap: 10px;
+}
+.matrix-header-row {
+  padding: 4px 14px;
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--ink-secondary);
 }
 .role-matrix-card {
   background: var(--bg-surface);
   border: 1px solid var(--hairline-strong);
-  border-radius: 12px;
-  padding: 13px 15px;
+  border-radius: 10px;
+  padding: 10px 14px;
   box-shadow: var(--shadow-card);
-  display: flex;
-  flex-direction: column;
-  gap: 10px;
 }
 .role-card-head {
   display: flex;
   justify-content: space-between;
-  align-items: flex-start;
-  gap: 8px;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
 }
 .role-title-wrap {
   display: flex;
   flex-direction: column;
   gap: 2px;
+  min-width: 0;
 }
 .role-title-line {
   display: flex;
   align-items: center;
-  gap: 7px;
+  gap: 6px;
   flex-wrap: wrap;
+  min-width: 0;
 }
 .role-id-badge {
   padding: 2px 7px;
@@ -1598,6 +1636,7 @@ details.subagent-card > summary::-webkit-details-marker {
   display: grid;
   grid-template-columns: 1fr 1.45fr;
   gap: 8px;
+  min-width: 0;
 }
 .cfg-field-label {
   display: flex;
@@ -1606,6 +1645,48 @@ details.subagent-card > summary::-webkit-details-marker {
   font-size: 11px;
   font-weight: 500;
   color: var(--ink-secondary);
+}
+.topo-flow-preview {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  padding: 10px 14px;
+  border-radius: 10px;
+  background: var(--bg-selected);
+  border: 1px solid rgba(0, 113, 227, 0.25);
+  font-size: 12.5px;
+  font-weight: 600;
+  color: var(--ink-primary);
+}
+.wf-stage-row {
+  display: grid;
+  grid-template-columns: minmax(170px, 1.2fr) minmax(140px, 1fr) minmax(180px, 1.4fr);
+  align-items: center;
+  gap: 10px;
+  padding: 9px 12px;
+  border-radius: 9px;
+  background: var(--bg-canvas);
+  border: 1px solid var(--hairline-strong);
+}
+.advanced-config-disclosure {
+  border: 1px solid var(--hairline-strong);
+  border-radius: 9px;
+  padding: 8px 12px;
+  background: var(--bg-canvas);
+}
+.advanced-config-disclosure > summary {
+  cursor: pointer;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--ink-secondary);
+  user-select: none;
+}
+.advanced-config-body {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  margin-top: 10px;
 }
 
 /* Segmented Pill Selector Bars */
@@ -1810,9 +1891,18 @@ details.subagent-card > summary::-webkit-details-marker {
   font-size: 12px;
   outline: none;
 }
-.mac-input { flex: 1; min-width: 0; }
-.mac-select.full, .mac-textarea { width: 100%; }
-.mac-select.wide { min-width: 220px; }
+.mac-input { flex: 1; min-width: 0; max-width: 100%; }
+.mac-select {
+  width: 100%;
+  max-width: 100%;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.mac-select.full, .mac-textarea { width: 100%; max-width: 100%; min-width: 0; }
+.mac-select.wide { min-width: 180px; width: auto; }
+.inline-select-label .mac-select { width: auto; max-width: 210px; }
 .mac-input:focus, .mac-select:focus, .mac-textarea:focus {
   border-color: var(--accent);
 }
@@ -1941,7 +2031,7 @@ details.subagent-card > summary::-webkit-details-marker {
 }
 .two-col {
   display: grid;
-  grid-template-columns: 1fr 1fr;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 10px;
 }
 .three-col {

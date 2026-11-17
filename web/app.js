@@ -4,10 +4,10 @@
 const I18N = {
   zh: {
     brandSub: "macOS 纯 Go · 零数据库工作台",
-    modeChat: "对话工作台",
-    modeFleet: "多智能体编排画布",
+    modeChat: "💬 简单对话",
+    modeFleet: "🛸 舰队协同",
     alwaysOnBtn: "常驻中枢",
-    settingsBtn: "设置",
+    settingsBtn: "⚙ 配置矩阵",
     searchPlaceholder: "跨项目搜索会话、笔记与产物 (⌘K)...",
     needsAttention: "待审批事项",
     projectsHeader: "工作区与会话",
@@ -37,15 +37,18 @@ const I18N = {
     hintFile: "文件",
     hintSkill: "技能",
     hintCmd: "命令",
-    sendBtn: "发送",
+    sendBtn: "发送对话",
+    switchToFleetBtn: "🛸 切换舰队协同",
+    backToChatBtn: "💬 返回简单对话",
+    fleetAdvancedSummary: "高级运行参数（可选）",
     steerBtn: "注入 Steer",
     stopMissionBtn: "终止编排",
     deleteMissionBtn: "删除记录",
     newMissionBtn: "+ 新建舰队编排",
     launchFleetTitle: "启动异构多智能体协同编排",
     collapseBtn: "收起 ✕",
-    fleetWorkflowLabel: "工作流模板 (workflows/*.toml)",
-    fleetTopologyLabel: "编排拓扑引擎 (Topology Override)",
+    fleetWorkflowLabel: "选择工作流模板 (workflows/*.toml)",
+    fleetTopologyLabel: "编排拓扑引擎覆盖 (Topology Override)",
     budgetLabel: "预算上限 (USD, 0=不限)",
     verifyCmdLabel: "Refinery 验收门控命令 (可自由编辑或点选快捷芯片)",
     noVerifyChip: "无命令",
@@ -55,7 +58,7 @@ const I18N = {
     goalPresetTDD: "🧪 TDD 补测与盲审",
     fleetGoalPh: "输入具体编排目标，或点选上方快捷模板后补充细节…",
     useWorktreesLabel: "启用独立 Git Worktree 物理隔离与串行变基合入 (--ff-only)",
-    startMissionSubmit: "立即启动拓扑",
+    startMissionSubmit: "立即启动",
     fleetEmptyGoal: "选择或启动任意异构模型多智能体拓扑",
     nodeInspectorTitle: "节点详情与 Git Worktree 差异",
     jumpSessionBtn: "打开会话 ↗",
@@ -83,11 +86,10 @@ const I18N = {
     cfgPageAgents: "智能体专家定义",
     cfgGroupOrch: "编排、安全与扩展",
     cfgPageWorkflows: "多智能体工作流",
-    cfgPagePermissions: "权限、信任与授权",
+    cfgPagePermissions: "权限、信任与钩子",
     cfgPageMCP: "MCP 扩展服务",
-    cfgGroupVault: "记忆与透明文件仓",
+    cfgGroupVault: "记忆与经验",
     cfgPageMemory: "四层记忆与候选技能",
-    cfgPageFiles: "底层源文件",
     autoSaveReady: "实时热生效 ✓",
     autoSaving: "保存中…",
     autoSaveErr: "校验未通过",
@@ -122,10 +124,10 @@ const I18N = {
   },
   en: {
     brandSub: "macOS Pure Go · Zero-DB Agent Workbench",
-    modeChat: "Conversation",
-    modeFleet: "Fleet Studio",
+    modeChat: "💬 Simple Chat",
+    modeFleet: "🛸 Fleet Collaboration",
     alwaysOnBtn: "Always-On Hub",
-    settingsBtn: "Settings",
+    settingsBtn: "⚙ Config Matrix",
     searchPlaceholder: "Search sessions, notes & artifacts across projects (⌘K)...",
     needsAttention: "Needs Attention",
     projectsHeader: "Workspaces & Sessions",
@@ -155,14 +157,17 @@ const I18N = {
     hintFile: "file",
     hintSkill: "skill",
     hintCmd: "command",
-    sendBtn: "Send",
+    sendBtn: "Send Message",
+    switchToFleetBtn: "🛸 Switch to Fleet",
+    backToChatBtn: "💬 Back to Chat",
+    fleetAdvancedSummary: "Advanced Parameters (Optional)",
     steerBtn: "Inject Steer",
     stopMissionBtn: "Stop Fleet",
     deleteMissionBtn: "Delete Record",
     newMissionBtn: "+ Launch Fleet",
     launchFleetTitle: "Launch Heterogeneous Multi-Agent Fleet",
     collapseBtn: "Collapse ✕",
-    fleetWorkflowLabel: "Workflow Template (workflows/*.toml)",
+    fleetWorkflowLabel: "Select Workflow Template (workflows/*.toml)",
     fleetTopologyLabel: "Topology Engine Override",
     budgetLabel: "Budget Cap (USD, 0=unlimited)",
     verifyCmdLabel: "Refinery Verify Gate Command (editable or click a chip)",
@@ -173,7 +178,7 @@ const I18N = {
     goalPresetTDD: "🧪 TDD & Blind Review",
     fleetGoalPh: "Describe mission goal or pick a quick-fill chip above…",
     useWorktreesLabel: "Enable isolated Git worktrees & serialized Refinery merge (--ff-only)",
-    startMissionSubmit: "Launch Topology",
+    startMissionSubmit: "Launch Now",
     fleetEmptyGoal: "Select or launch a heterogeneous multi-agent topology",
     nodeInspectorTitle: "Node Session, Stream & Git Worktree Diff",
     jumpSessionBtn: "Open Session ↗",
@@ -201,11 +206,10 @@ const I18N = {
     cfgPageAgents: "Agent Definitions",
     cfgGroupOrch: "Orchestration & Security",
     cfgPageWorkflows: "Multi-Agent Workflows",
-    cfgPagePermissions: "Permissions, Trust & Grants",
+    cfgPagePermissions: "Permissions, Trust & Hooks",
     cfgPageMCP: "MCP Extensions",
-    cfgGroupVault: "Memory & Transparent Vault",
+    cfgGroupVault: "Memory & Skills",
     cfgPageMemory: "4-Layer Memory & Skills",
-    cfgPageFiles: "Raw Vault Files",
     autoSaveReady: "Live Reloaded ✓",
     autoSaving: "Saving…",
     autoSaveErr: "Validation Error",
@@ -476,6 +480,8 @@ const state = {
   inspectorTab: "files",
   settingsOpen: false,
   configPage: "matrix",
+  matrixSubTab: "core",
+  activeRuleCategory: "allow_commands",
   alwaysOnOpen: false,
 
   vaultRoot: "~/.gorness",
@@ -813,8 +819,7 @@ function syncSettingsDialogPageTitle() {
     workflows: "cfgPageWorkflows",
     permissions: "cfgPagePermissions",
     mcp: "cfgPageMCP",
-    memory: "cfgPageMemory",
-    files: "cfgPageFiles"
+    memory: "cfgPageMemory"
   };
   const titleEl = $("settings-dialog-page-title");
   const key = titleKeyMap[state.configPage] || "cfgPageMatrix";
@@ -828,7 +833,8 @@ function syncSettingsDialogPageTitle() {
 }
 
 function openSettingsModal(page) {
-  if (page) state.configPage = page;
+  if (page) state.configPage = page === "files" ? "matrix" : page;
+  else if (state.configPage === "files") state.configPage = "matrix";
   state.settingsOpen = true;
   syncSettingsDialogPageTitle();
   $("config-mode-view")?.classList.remove("hidden");
@@ -1883,7 +1889,6 @@ function renderContextInspector() {
         <span class="tiny-muted">${tr("门控", "Gate")}: <code>${esc(ws.permission_mode || "auto")}</code> · ${tr("沙箱", "Sandbox")}: <code>${esc(ws.sandbox_mode || "workspace-write")}</code></span>
         <div class="row-actions">
           <button class="ghost-xs-btn" type="button" id="ctx-trust-ws-btn">${tr("信任 .gorness", "Trust .gorness")}</button>
-          <button class="ghost-xs-btn" type="button" id="ctx-open-perm-btn">${tr("权限设置 ↗", "Permissions ↗")}</button>
         </div>
       </div>
     </div>
@@ -1899,7 +1904,6 @@ function renderContextInspector() {
     <div class="ctx-card">
       <div class="subhead-row">
         <strong>🧠 ${tr("四层记忆与经验提取", "4-Layer Memory & Candidate Skills")}</strong>
-        <button class="ghost-xs-btn" type="button" id="ctx-open-memory-btn">${tr("管理记忆 ↗", "Edit Memory ↗")}</button>
       </div>
       <span class="tiny-muted">${tr(
         "全局 INSTRUCTIONS.md、INDEX.md、主题笔记与项目级进度记忆在每轮对话自动按需注入。",
@@ -3681,10 +3685,6 @@ function renderConfigStudio() {
     case "memory":
       host.innerHTML = renderMemorySettingsPage();
       break;
-    case "files":
-      host.innerHTML = renderRawFilesSettingsPage();
-      loadSelectedVaultFile();
-      break;
     default:
       host.innerHTML = renderMatrixSettingsPage();
   }
@@ -3704,6 +3704,11 @@ function renderGeneralSettingsPage() {
     { v: "workspace-write", l: tr("仅写工作区 (Seatbelt)", "workspace-write (Seatbelt)") },
     { v: "read-only", l: tr("只读沙箱 (read-only)", "read-only") },
     { v: "off", l: tr("关闭沙箱 (off)", "off") }
+  ];
+  const themeModes = [
+    { v: "auto", l: tr("自动跟随系统 (Auto)", "Auto (System)") },
+    { v: "light", l: tr("浅色模式 (Light)", "Light") },
+    { v: "dark", l: tr("深色模式 (Dark)", "Dark") }
   ];
 
   return `
@@ -3734,69 +3739,40 @@ function renderGeneralSettingsPage() {
     <div class="cfg-section-card">
       <div class="cfg-section-head">
         <div>
-          <h3 class="cfg-section-title">🎨 ${tr("界面外观与语言 (持久化至 config.toml)", "Appearance & Language (Persisted in config.toml)")}</h3>
-          <p class="cfg-section-desc">${tr("切换后立即更新全局界面并同步保存至 ~/.gorness/config.toml。", "Updates UI immediately and persists ui_theme / ui_lang via PUT /api/config/global.")}</p>
+          <h3 class="cfg-section-title">🎨 ${tr("界面外观与默认安全策略 (config.toml)", "Appearance & Default Security Policy (config.toml)")}</h3>
+          <p class="cfg-section-desc">${tr("选择下拉项后立即生效并同步保存至 ~/.gorness/config.toml。", "Select from dropdowns to update immediately and persist via PUT /api/config/global.")}</p>
         </div>
       </div>
 
-      <div class="settings-form-row">
-        <div class="settings-row-info">
-          <strong>${tr("色彩主题 (Theme)", "Color Theme")}</strong>
-          <span>${tr("自动跟随 macOS 系统外观，或强制浅色 / 深色模式", "Follow macOS system appearance or force Light / Dark")}</span>
-        </div>
-        <div class="pill-bar">
-          ${[
-            { v: "auto", l: tr("自动 (Auto)", "Auto") },
-            { v: "light", l: tr("浅色 (Light)", "Light") },
-            { v: "dark", l: tr("深色 (Dark)", "Dark") }
-          ]
-            .map((it) => `<button class="pill-opt ${state.theme === it.v ? "active" : ""}" type="button" data-cfg-ui-theme="${it.v}">${esc(it.l)}</button>`)
-            .join("")}
-        </div>
+      <div class="two-col">
+        <label class="cfg-field-label">
+          <span>${tr("色彩主题 (Theme)", "Color Theme")}</span>
+          <select id="cfg-ui-theme-select" class="mac-select" data-cfg-ui-theme-select="1">
+            ${themeModes.map((it) => `<option value="${it.v}" ${state.theme === it.v ? "selected" : ""}>${esc(it.l)}</option>`).join("")}
+          </select>
+        </label>
+        <label class="cfg-field-label">
+          <span>${tr("界面语言 (Language)", "Interface Language")}</span>
+          <select id="cfg-ui-lang-select" class="mac-select" data-cfg-ui-lang-select="1">
+            <option value="zh" ${state.lang === "zh" ? "selected" : ""}>简体中文</option>
+            <option value="en" ${state.lang === "en" ? "selected" : ""}>English</option>
+          </select>
+        </label>
       </div>
 
-      <div class="settings-form-row">
-        <div class="settings-row-info">
-          <strong>${tr("界面语言 (Language)", "Interface Language")}</strong>
-          <span>${tr("支持完整中英双语即时切换", "Instant bilingual UI toggle")}</span>
-        </div>
-        <div class="pill-bar">
-          <button class="pill-opt ${state.lang === "zh" ? "active" : ""}" type="button" data-cfg-ui-lang="zh">简体中文</button>
-          <button class="pill-opt ${state.lang === "en" ? "active" : ""}" type="button" data-cfg-ui-lang="en">English</button>
-        </div>
-      </div>
-    </div>
-
-    <div class="cfg-section-card">
-      <div class="cfg-section-head">
-        <div>
-          <h3 class="cfg-section-title">⚙️ ${tr("全局默认门控与调度阈值", "Default Gate, Sandbox & Engine Limits")}</h3>
-          <p class="cfg-section-desc">${tr("新建会话与后台任务的默认安全策略与并发预算。", "Default execution guardrails written to config.toml.")}</p>
-        </div>
-      </div>
-
-      <div class="settings-form-row">
-        <div class="settings-row-info">
-          <strong>${tr("默认权限门控 (permission_mode)", "Default Permission Mode")}</strong>
-          <span>${tr("控制工具调用是否自动放行、仅接受编辑或逐次审批", "Controls whether tool calls auto-pass, accept edits, or prompt")}</span>
-        </div>
-        <div class="pill-bar">
-          ${permModes
-            .map((m) => `<button class="pill-opt ${(g.permission_mode || "auto") === m.v ? "active" : ""}" type="button" data-global-pill="permission_mode" data-val="${m.v}">${esc(m.l)}</button>`)
-            .join("")}
-        </div>
-      </div>
-
-      <div class="settings-form-row">
-        <div class="settings-row-info">
-          <strong>${tr("默认 macOS Seatbelt 沙箱 (sandbox_mode)", "Default macOS Seatbelt Sandbox")}</strong>
-          <span>${tr("限制子进程仅允许写入当前项目与临时目录", "Restricts child processes via sandbox-exec")}</span>
-        </div>
-        <div class="pill-bar">
-          ${sbModes
-            .map((m) => `<button class="pill-opt ${(g.sandbox_mode || "workspace-write") === m.v ? "active" : ""}" type="button" data-global-pill="sandbox_mode" data-val="${m.v}">${esc(m.l)}</button>`)
-            .join("")}
-        </div>
+      <div class="two-col">
+        <label class="cfg-field-label">
+          <span>${tr("默认权限门控 (permission_mode)", "Default Permission Mode")}</span>
+          <select id="cfg-global-perm-select" class="mac-select" data-global-select="permission_mode">
+            ${permModes.map((m) => `<option value="${m.v}" ${(g.permission_mode || "auto") === m.v ? "selected" : ""}>${esc(m.l)}</option>`).join("")}
+          </select>
+        </label>
+        <label class="cfg-field-label">
+          <span>${tr("默认 macOS Seatbelt 沙箱 (sandbox_mode)", "Default macOS Seatbelt Sandbox")}</span>
+          <select id="cfg-global-sandbox-select" class="mac-select" data-global-select="sandbox_mode">
+            ${sbModes.map((m) => `<option value="${m.v}" ${(g.sandbox_mode || "workspace-write") === m.v ? "selected" : ""}>${esc(m.l)}</option>`).join("")}
+          </select>
+        </label>
       </div>
 
       <div class="three-col" style="margin-top:6px;">
@@ -3820,7 +3796,7 @@ function renderGeneralSettingsPage() {
   `;
 }
 
-// --- Page 2: Role-Model Matrix ---
+// --- Page 2: Role-Model Matrix (Sub-tab Categories + 4-Col Single-Row Alignment + Effort Select) ---
 function renderMatrixSettingsPage() {
   const g = state.config.global || {};
   const provIds = Object.keys(state.config.providers || {}).sort();
@@ -3828,6 +3804,13 @@ function renderMatrixSettingsPage() {
   const defModels = getModelsForProvider(defProv);
   const defModel = g.default_model || defModels[0]?.id || "";
   const allRefs = getAllAvailableModelRefs();
+  const effortOpts = [
+    { v: "low", l: tr("低 (low)", "Low (low)") },
+    { v: "medium", l: tr("中 (medium)", "Medium (medium)") },
+    { v: "high", l: tr("高 (high)", "High (high)") },
+    { v: "xhigh", l: tr("超高 (xhigh)", "Extra High (xhigh)") },
+    { v: "max", l: tr("极高 (max)", "Max (max)") }
+  ];
 
   const schemesHTML = MATRIX_SCHEMES.map(
     (sc) => `
@@ -3851,11 +3834,22 @@ function renderMatrixSettingsPage() {
     return a.localeCompare(b);
   });
 
-  const roleCardsHTML = agentKeys
+  const subTabs = [
+    { id: "core", label: tr("💬 核心对话角色", "💬 Core Chat Roles"), match: (id) => id === "lead" || id === "coder" },
+    { id: "fleet", label: tr("🛸 舰队协同专家", "🛸 Fleet Specialists"), match: (id) => id === "explorer" || id === "verifier" },
+    { id: "utility", label: tr("⚡ 轻量辅助与自定义", "⚡ Utility & Custom"), match: (id) => id === "utility" || !["lead", "coder", "explorer", "verifier"].includes(id) },
+    { id: "all", label: tr("📋 全部角色一览", "📋 All Roles"), match: () => true }
+  ];
+  const activeTabObj = subTabs.find((st) => st.id === state.matrixSubTab) || subTabs[0];
+  let visibleKeys = agentKeys.filter(activeTabObj.match);
+  if (visibleKeys.length === 0) visibleKeys = agentKeys;
+
+  const roleRowsHTML = visibleKeys
     .map((aId) => {
       const ag = state.config.agents[aId] || {};
       const meta = ROLE_META[aId] || { icon: "🤖", zh: ag.name || aId, en: ag.name || aId };
       const curProv = ag.provider || defProv;
+      const curProvName = state.config.providers?.[curProv]?.name || curProv;
       const models = getModelsForProvider(curProv);
       const curModel = ag.model || defModel;
       const curEffort = ag.effort || g.default_effort || "high";
@@ -3883,47 +3877,41 @@ function renderMatrixSettingsPage() {
                 <span>${meta.icon}</span>
                 <strong>${esc(state.lang === "zh" ? meta.zh : meta.en)}</strong>
                 <span class="role-id-badge">${esc(aId)}</span>
-                ${ag.read_only ? `<span class="status-pill">${tr("只读", "read-only")}</span>` : ""}
+                ${ag.read_only ? `<span class="status-pill">${tr("只读", "RO")}</span>` : ""}
               </div>
-              <span class="tiny-muted">${esc(ag.description || "")}</span>
-            </div>
-            <button class="ghost-xs-btn" type="button" data-jump-edit-agent="${esc(aId)}">${tr("编辑 Prompt 与工具 ↗", "Edit Agent ↗")}</button>
-          </div>
-
-          <div class="role-field-grid">
-            <label class="cfg-field-label">
-              <span>${tr("供应商 (Provider)", "Provider")}</span>
-              <select class="mac-select" data-agent-provider="${esc(aId)}">
-                ${provOpts.map((p) => `<option value="${esc(p)}" ${p === curProv ? "selected" : ""}>${esc(state.config.providers?.[p]?.name || p)}</option>`).join("")}
-              </select>
-            </label>
-            <label class="cfg-field-label">
-              <span>${tr("绑定模型 (Model)", "Bound Model")}</span>
-              <select class="mac-select mono" data-agent-model-select="${esc(aId)}">
-                ${modelList.map((m) => `<option value="${esc(m.id)}" ${m.id === curModel ? "selected" : ""}>${esc(m.name)} (${esc(m.id)})</option>`).join("")}
-              </select>
-            </label>
-          </div>
-
-          <div class="subhead-row">
-            <span class="tiny-muted">${tr("推理强度 (Effort)", "Reasoning Effort")}</span>
-            <div class="pill-bar">
-              ${["low", "medium", "high", "xhigh", "max"]
-                .map((ef) => `<button class="pill-opt ${curEffort === ef ? "active" : ""}" type="button" data-agent-effort-pill="${esc(aId)}" data-effort="${ef}">${ef}</button>`)
-                .join("")}
+              <div class="row-actions" style="gap:6px;">
+                <button class="ghost-xs-btn" type="button" data-jump-edit-agent="${esc(aId)}">${tr("编辑详情 ↗", "Edit ↗")}</button>
+                <details style="font-size:11px;">
+                  <summary class="tiny-muted" style="cursor:pointer;">${tr("降级链", "Fallbacks")} (${fallbacks.length})</summary>
+                  <div class="chips-wrap" style="margin-top:4px;">
+                    ${fbChips || `<span class="tiny-muted">${tr("无", "None")}</span>`}
+                    <select class="mac-select mono" style="max-width:160px;" data-add-fallback="${esc(aId)}" title="${tr("添加备选降级模型", "Add fallback model")}">
+                      <option value="">${tr("+ 备选…", "+ Add…")}</option>
+                      ${addFbOpts}
+                    </select>
+                  </div>
+                </details>
+              </div>
             </div>
           </div>
 
-          <div class="cfg-field-label">
-            <span>${tr("故障自动降级备选链 (Fallbacks)", "Failover Fallbacks")}</span>
-            <div class="chips-wrap">
-              ${fbChips || `<span class="tiny-muted">${tr("无备选链", "None")}</span>`}
-              <select class="mac-select mono" style="max-width:200px;" data-add-fallback="${esc(aId)}">
-                <option value="">${tr("+ 添加降级模型…", "+ Add fallback…")}</option>
-                ${addFbOpts}
-              </select>
-            </div>
-          </div>
+          <label class="cfg-field-label">
+            <select class="mac-select matrix-select" data-agent-provider="${esc(aId)}" title="${esc(curProvName)}">
+              ${provOpts.map((p) => `<option value="${esc(p)}" ${p === curProv ? "selected" : ""}>${esc(state.config.providers?.[p]?.name || p)}</option>`).join("")}
+            </select>
+          </label>
+
+          <label class="cfg-field-label">
+            <select class="mac-select matrix-select mono" data-agent-model-select="${esc(aId)}" title="${esc(curModel)}">
+              ${modelList.map((m) => `<option value="${esc(m.id)}" ${m.id === curModel ? "selected" : ""}>${esc(m.name)} (${esc(m.id)})</option>`).join("")}
+            </select>
+          </label>
+
+          <label class="cfg-field-label">
+            <select class="mac-select matrix-select" data-agent-effort-select="${esc(aId)}" title="${esc(curEffort)}">
+              ${effortOpts.map((ef) => `<option value="${ef.v}" ${curEffort === ef.v ? "selected" : ""}>${esc(ef.l)}</option>`).join("")}
+            </select>
+          </label>
         </div>
       `;
     })
@@ -3931,41 +3919,56 @@ function renderMatrixSettingsPage() {
 
   return `
     <div class="cfg-section-card">
-      <div class="cfg-section-head">
-        <div>
-          <h3 class="cfg-section-title">⚡ ${tr("一键异构模型组合预设", "1-Click Heterogeneous Matrix Schemes")}</h3>
-          <p class="cfg-section-desc">${tr("点击任意方案自动补齐所需供应商并批量更新角色路由；下方可随时单独微调。", "Applies role-model assignments immediately; customize individual roles below or in Agent Definitions.")}</p>
+      <div class="subhead-row">
+        <div class="matrix-subtabs" role="tablist">
+          ${subTabs
+            .map(
+              (st) => `<button class="pill-opt ${state.matrixSubTab === st.id ? "active" : ""}" type="button" data-matrix-subtab="${st.id}">${esc(st.label)}</button>`
+            )
+            .join("")}
         </div>
       </div>
-      <div class="scheme-presets-grid">${schemesHTML}</div>
+
+      <details class="advanced-config-disclosure">
+        <summary>⚡ ${tr("一键异构模型组合预设（点击展开）", "1-Click Heterogeneous Matrix Presets")}</summary>
+        <div class="scheme-presets-grid" style="margin-top:8px;">${schemesHTML}</div>
+      </details>
 
       <div class="three-col" style="padding-top:8px;border-top:1px solid var(--hairline);">
         <label class="cfg-field-label">
-          <span>${tr("全局兜底供应商 (default_provider)", "Global Default Provider")}</span>
-          <select id="cfg-global-provider" class="mac-select">
+          <span>${tr("全局默认供应商 (default_provider)", "Global Default Provider")}</span>
+          <select id="cfg-global-provider" class="mac-select" title="${esc(defProv)}">
             ${provIds.map((p) => `<option value="${esc(p)}" ${p === defProv ? "selected" : ""}>${esc(state.config.providers?.[p]?.name || p)}</option>`).join("")}
           </select>
         </label>
         <label class="cfg-field-label">
-          <span>${tr("全局兜底模型 (default_model)", "Global Default Model")}</span>
-          <select id="cfg-global-model" class="mac-select mono">
+          <span>${tr("全局默认模型 (default_model)", "Global Default Model")}</span>
+          <select id="cfg-global-model" class="mac-select mono" title="${esc(defModel)}">
             ${(defModels.some((m) => m.id === defModel) ? defModels : [{ id: defModel, name: defModel }, ...defModels])
               .map((m) => `<option value="${esc(m.id)}" ${m.id === defModel ? "selected" : ""}>${esc(m.name)} (${esc(m.id)})</option>`)
               .join("")}
           </select>
         </label>
         <label class="cfg-field-label">
-          <span>${tr("全局默认推理强度 (default_effort)", "Global Default Effort")}</span>
-          <select id="cfg-global-effort" class="mac-select">
-            ${["low", "medium", "high", "xhigh", "max"]
-              .map((ef) => `<option value="${ef}" ${(g.default_effort || "high") === ef ? "selected" : ""}>${ef}</option>`)
+          <span>${tr("全局默认思考强度 (default_effort)", "Global Default Effort")}</span>
+          <select id="cfg-global-effort" class="mac-select" title="${esc(g.default_effort || "high")}">
+            ${effortOpts
+              .map((ef) => `<option value="${ef.v}" ${(g.default_effort || "high") === ef.v ? "selected" : ""}>${esc(ef.l)}</option>`)
               .join("")}
           </select>
         </label>
       </div>
     </div>
 
-    <div class="role-cards-grid">${roleCardsHTML}</div>
+    <div class="matrix-table">
+      <div class="matrix-header-row">
+        <span>${tr("角色名称与职责", "Role & Responsibility")}</span>
+        <span>${tr("模型供应商", "Provider")}</span>
+        <span>${tr("绑定模型", "Bound Model")}</span>
+        <span>${tr("思考强度", "Reasoning Effort")}</span>
+      </div>
+      ${roleRowsHTML}
+    </div>
   `;
 }
 
@@ -4109,7 +4112,7 @@ function renderProvidersSettingsPage() {
         </label>
       </div>
 
-      <div class="three-col">
+      <div class="two-col">
         <label class="cfg-field-label">
           <span>Base URL</span>
           <input id="prov-edit-baseurl" class="mac-input mono" type="text" value="${esc(draft.base_url)}" placeholder="https://api.openai.com/v1">
@@ -4118,16 +4121,23 @@ function renderProvidersSettingsPage() {
           <span>${tr("API Key 引用 (keychain:KEY / env:VAR)", "API Key Ref (keychain:KEY / env:VAR)")}</span>
           <input id="prov-edit-apikey" class="mac-input mono" type="text" value="${esc(draft.api_key)}" placeholder="keychain:OPENAI_API_KEY">
         </label>
-        <label class="cfg-field-label">
-          <span>${tr("超时秒数 (timeout_sec)", "Timeout (sec)")}</span>
-          <input id="prov-edit-timeout" class="mac-input mono" type="number" min="5" max="1800" value="${Number(draft.timeout_sec || 180)}">
-        </label>
       </div>
 
-      <label class="cfg-field-label">
-        <span>${tr("自定义 HTTP 请求头 (每行 Header: Value，可选)", "Custom HTTP Headers (one 'Header: Value' per line)")}</span>
-        <textarea id="prov-edit-headers" class="mac-textarea mono" rows="2" placeholder="X-Team: platform">${esc(headersLines)}</textarea>
-      </label>
+      <details class="advanced-config-disclosure">
+        <summary>${tr("高级连接选项：超时与自定义 HTTP 请求头 (可选)", "Advanced: Timeout & Custom HTTP Headers (Optional)")}</summary>
+        <div class="advanced-config-body">
+          <div class="two-col">
+            <label class="cfg-field-label">
+              <span>${tr("超时秒数 (timeout_sec)", "Timeout (sec)")}</span>
+              <input id="prov-edit-timeout" class="mac-input mono" type="number" min="5" max="1800" value="${Number(draft.timeout_sec || 180)}">
+            </label>
+            <label class="cfg-field-label">
+              <span>${tr("自定义请求头 (Key: Value)", "Custom Headers (Key: Value)")}</span>
+              <input id="prov-edit-headers" class="mac-input mono" type="text" value="${esc(Object.entries(draft.headers || {}).map(([k, v]) => `${k}: ${v}`).join("; "))}" placeholder="X-Team: platform; X-Env: prod">
+            </label>
+          </div>
+        </div>
+      </details>
 
       <div class="cfg-field-label">
         <span>${tr("模型目录 (Models Catalog)", "Models Catalog")}</span>
@@ -4382,6 +4392,102 @@ function ensureEditingWorkflowDraft() {
   return state.editingWorkflowDraft;
 }
 
+function buildStandardTopologyTemplate(topology) {
+  switch (topology) {
+    case "review-loop":
+      return {
+        nodes: [
+          { id: "coder_a", label: "编码实现阶段", role: "coder", worktree: true },
+          { id: "reviewer", label: "对抗盲审阶段", role: "verifier", worktree: false }
+        ],
+        edges: [
+          { from: "coder_a", to: "reviewer", kind: "seq" },
+          { from: "reviewer", to: "coder_a", kind: "feedback" }
+        ]
+      };
+    case "worktree-team":
+      return {
+        nodes: [
+          { id: "lead_plan", label: "架构拆解阶段", role: "lead", worktree: false },
+          { id: "coder_a", label: "并行工作树研发 A", role: "coder", worktree: true },
+          { id: "coder_b", label: "并行工作树研发 B", role: "coder", worktree: true }
+        ],
+        edges: [
+          { from: "lead_plan", to: "coder_a", kind: "seq" },
+          { from: "lead_plan", to: "coder_b", kind: "seq" }
+        ]
+      };
+    case "parallel-explore":
+      return {
+        nodes: [
+          { id: "scout_a", label: "并发侦察路 A", role: "explorer", worktree: false },
+          { id: "scout_b", label: "并发侦察路 B", role: "explorer", worktree: false },
+          { id: "synthesizer", label: "主控综合决策", role: "lead", worktree: false }
+        ],
+        edges: [
+          { from: "scout_a", to: "synthesizer", kind: "seq" },
+          { from: "scout_b", to: "synthesizer", kind: "seq" }
+        ]
+      };
+    case "event-pipeline":
+      return {
+        nodes: [
+          { id: "stage_explore", label: "第一阶段：探索分析", role: "explorer", worktree: false },
+          { id: "stage_code", label: "第二阶段：核心编码", role: "coder", worktree: true },
+          { id: "stage_verify", label: "第三阶段：盲审验收", role: "verifier", worktree: false }
+        ],
+        edges: [
+          { from: "stage_explore", to: "stage_code", kind: "seq" },
+          { from: "stage_code", to: "stage_verify", kind: "seq" }
+        ]
+      };
+    case "shared-board":
+      return {
+        nodes: [
+          { id: "coordinator", label: "黑板协调主控", role: "lead", worktree: false },
+          { id: "worker_coder", label: "黑板研发专家", role: "coder", worktree: true },
+          { id: "worker_verifier", label: "黑板审计专家", role: "verifier", worktree: false }
+        ],
+        edges: [
+          { from: "coordinator", to: "worker_coder", kind: "seq" },
+          { from: "worker_coder", to: "worker_verifier", kind: "seq" }
+        ]
+      };
+    default:
+      return {
+        nodes: [
+          { id: "scout", label: "探索阶段", role: "explorer", worktree: false },
+          { id: "coder_a", label: "编码阶段", role: "coder", worktree: true },
+          { id: "reviewer", label: "审查阶段", role: "verifier", worktree: false }
+        ],
+        edges: [
+          { from: "scout", to: "coder_a", kind: "seq" },
+          { from: "coder_a", to: "reviewer", kind: "seq" },
+          { from: "reviewer", to: "coder_a", kind: "feedback" }
+        ]
+      };
+  }
+}
+
+function formatTopologyFlowPreview(topology, conc, rounds) {
+  const c = Number(conc || 3);
+  const r = Number(rounds || 2);
+  switch (topology) {
+    case "review-loop":
+      return `💻 ${tr("主控编码实现", "Coder Implementation")} ➔ 🔍 ${tr("异构盲审验收", "Blind Review")} (↺ ${tr("最多", "max")} ${r} ${tr("轮", "rounds")})`;
+    case "worktree-team":
+      return `🧭 ${tr("任务拆解", "Task Split")} ➔ 🌿 ${tr("并行编码", "Worktree Coders")} ×${c} ➔ 🏁 ${tr("Refinery 变基合入", "Refinery Merge")}`;
+    case "parallel-explore":
+      return `🔭 ${tr("多路并行探索", "Parallel Scouts")} ×${c} ➔ 🧭 ${tr("主控汇总决策", "Lead Synthesis")}`;
+    case "event-pipeline":
+      return `🧭 ${tr("探索分析", "Explore")} ➔ 💻 ${tr("串行编码", "Pipeline Code")} ➔ 🔍 ${tr("终审门控", "Verify Gate")}`;
+    case "shared-board":
+      return `📋 ${tr("共享黑板派单", "Shared Blackboard")} ➔ 💻 ${tr("多专家协同", "Specialists")} ×${c} ➔ 🔍 ${tr("汇总验收", "Final Review")}`;
+    default:
+      return `🧭 ${tr("探索", "Explore")} ➔ 💻 ${tr("并行编码", "Parallel Code")} ×${c} ➔ 🔍 ${tr("盲审验收", "Blind Verify")}`;
+  }
+}
+
 function renderWorkflowsSettingsPage() {
   const workflows = state.config.workflows || {};
   const wfIds = Object.keys(workflows).sort();
@@ -4389,37 +4495,55 @@ function renderWorkflowsSettingsPage() {
   const allRefs = getAllAvailableModelRefs();
   const draft = ensureEditingWorkflowDraft();
 
-  const edgesText = (draft.edges || [])
-    .map((e) => `${e.from} -> ${e.to}${e.kind && e.kind !== "seq" ? ` (${e.kind})` : ""}`)
-    .join("\n");
+  const topoOptions = [
+    { id: "hybrid-fleet", label: tr("异构混合舰队 (hybrid-fleet)", "Hybrid Fleet (hybrid-fleet)") },
+    { id: "review-loop", label: tr("主从实现与盲审 (review-loop)", "Review Loop (review-loop)") },
+    { id: "worktree-team", label: tr("并行工作树小队 (worktree-team)", "Worktree Team (worktree-team)") },
+    { id: "parallel-explore", label: tr("多路并行探索 (parallel-explore)", "Parallel Explore (parallel-explore)") },
+    { id: "event-pipeline", label: tr("串行流水线 (event-pipeline)", "Event Pipeline (event-pipeline)") },
+    { id: "shared-board", label: tr("共享黑板协同 (shared-board)", "Shared Board (shared-board)") }
+  ];
+  const verifyPresets = [
+    { v: "go test ./...", l: "Go: go test ./..." },
+    { v: "CGO_ENABLED=0 go test -race ./...", l: "Go Race: CGO_ENABLED=0 go test -race ./..." },
+    { v: "npm test", l: "Node: npm test" },
+    { v: "pytest", l: "Python: pytest" },
+    { v: "cargo test", l: "Rust: cargo test" },
+    { v: "", l: tr("自定义 / 无验收命令", "Custom / No verify command") }
+  ];
+  const concVal = Number(draft.max_concurrency || 3);
+  const concChoices = [1, 2, 3, 4, 5, 6].includes(concVal) ? [1, 2, 3, 4, 5, 6] : [concVal, 1, 2, 3, 4, 5, 6];
+  const roundsVal = Number(draft.max_rounds ?? draft.max_review_rounds ?? 2);
+  const roundsChoices = [1, 2, 3, 4, 5].includes(roundsVal) ? [1, 2, 3, 4, 5] : [roundsVal, 1, 2, 3, 4, 5];
 
-  const nodeRowsHTML = (draft.nodes || [])
+  const stageCardsHTML = (draft.nodes || [])
     .map((nd, idx) => {
       const nodeRole = nd.role || nd.agent_role || "coder";
-      // Fix #6 §2.5 key bug: key role_models by node.id (falling back to role only for legacy read)
       const overrideVal = draft.role_models?.[nd.id] ?? draft.role_models?.[nodeRole] ?? "";
+      const roleMeta = ROLE_META[nodeRole] || { icon: "🤖", zh: nodeRole, en: nodeRole };
       return `
-        <tr>
-          <td><input class="mac-input mono" type="text" data-wf-node-idx="${idx}" data-wf-node-field="id" value="${esc(nd.id || "")}" placeholder="coder_1"></td>
-          <td><input class="mac-input" type="text" data-wf-node-idx="${idx}" data-wf-node-field="label" value="${esc(nd.label || "")}" placeholder="Coder 1"></td>
-          <td>
-            <select class="mac-select mono" data-wf-node-idx="${idx}" data-wf-node-field="role">
+        <div class="wf-stage-row">
+          <div class="role-title-line">
+            <span>${roleMeta.icon}</span>
+            <strong>${esc(nd.label || nd.id)}</strong>
+            <span class="role-id-badge">${esc(nd.id)}</span>
+          </div>
+          <label class="cfg-field-label">
+            <span>${tr("绑定角色", "Stage Role")}</span>
+            <select class="mac-select mono" data-wf-node-idx="${idx}" data-wf-node-field="role" title="${esc(nodeRole)}">
               ${(agentRoles.includes(nodeRole) ? agentRoles : [nodeRole, ...agentRoles])
-                .map((r) => `<option value="${esc(r)}" ${r === nodeRole ? "selected" : ""}>${esc(r)}</option>`)
+                .map((r) => `<option value="${esc(r)}" ${r === nodeRole ? "selected" : ""}>${esc(state.config.agents?.[r]?.name || r)} (${esc(r)})</option>`)
                 .join("")}
             </select>
-          </td>
-          <td>
-            <select class="mac-select mono" data-wf-node-idx="${idx}" data-wf-node-field="model_override">
+          </label>
+          <label class="cfg-field-label">
+            <span>${tr("指定模型", "Stage Model")}</span>
+            <select class="mac-select mono" data-wf-node-idx="${idx}" data-wf-node-field="model_override" title="${esc(overrideVal || tr("跟随角色矩阵", "Follow Matrix"))}">
               <option value="">${tr("跟随角色矩阵", "Follow Matrix")}</option>
               ${allRefs.map((r) => `<option value="${esc(r.ref)}" ${overrideVal === r.ref ? "selected" : ""}>${esc(r.ref)}</option>`).join("")}
             </select>
-          </td>
-          <td style="text-align:center;">
-            <input type="checkbox" data-wf-node-idx="${idx}" data-wf-node-field="worktree" ${nd.worktree ? "checked" : ""}>
-          </td>
-          <td><button class="danger-xs-btn" type="button" data-wf-del-node="${idx}">✕</button></td>
-        </tr>
+          </label>
+        </div>
       `;
     })
     .join("");
@@ -4428,8 +4552,8 @@ function renderWorkflowsSettingsPage() {
     <div class="cfg-section-card">
       <div class="cfg-section-head">
         <div>
-          <h3 class="cfg-section-title">🕸️ ${tr("多智能体工作流模板编辑器 (workflows/*.toml)", "Multi-Agent Workflow Editor (workflows/*.toml)")}</h3>
-          <p class="cfg-section-desc">${tr("支持完整自定义工作流 ID、拓扑引擎、任意 Refinery 验收命令、独立节点角色/模型覆盖 (role_models[node.id]) 与有向边。", "Full CRUD via POST/DELETE /api/config/workflows with per-node role_models[node.id] overrides.")}</p>
+          <h3 class="cfg-section-title">🕸️ ${tr("多智能体拓扑极简配置 (workflows/*.toml)", "Simplified Multi-Agent Topology Config (workflows/*.toml)")}</h3>
+          <p class="cfg-section-desc">${tr("三步完成多智能体协同拓扑配置：1. 选择拓扑模式 ➔ 2. 设定并发与验收参数 ➔ 3. 绑定各阶段角色与模型。", "3-step topology setup: 1. Pick Topology Mode ➔ 2. Set Concurrency & Verify Gate ➔ 3. Bind Stage Roles & Models.")}</p>
         </div>
         <button id="new-workflow-draft-btn" class="primary-xs-btn" type="button">${tr("+ 新建工作流", "+ New Workflow")}</button>
       </div>
@@ -4443,9 +4567,10 @@ function renderWorkflowsSettingsPage() {
         ${state.editingWorkflowId === "__new__" ? `<button class="pill-opt active" type="button">${tr("✨ 新建工作流", "✨ New Workflow")}</button>` : ""}
       </div>
 
+      <!-- Step 1: Basic Info & Topology Preset -->
       <div class="three-col">
         <label class="cfg-field-label">
-          <span>${tr("工作流 ID (workflows/<id>.toml)", "Workflow ID")}</span>
+          <span>1. ${tr("工作流 ID (workflows/<id>.toml)", "Workflow ID")}</span>
           <input id="wf-edit-id" class="mac-input mono" type="text" value="${esc(draft.id)}" placeholder="custom-review-fleet">
         </label>
         <label class="cfg-field-label">
@@ -4453,69 +4578,56 @@ function renderWorkflowsSettingsPage() {
           <input id="wf-edit-name" class="mac-input" type="text" value="${esc(draft.name)}" placeholder="Custom Review Fleet">
         </label>
         <label class="cfg-field-label">
-          <span>${tr("拓扑引擎 (Topology)", "Topology Engine")}</span>
-          <select id="wf-edit-topology" class="mac-select mono">
-            ${SIX_TOPOLOGIES.map((tp) => `<option value="${esc(tp.id)}" ${draft.topology === tp.id ? "selected" : ""}>${esc(tp.id)}</option>`).join("")}
+          <span>${tr("拓扑预设模式 (切换自动生成阶段)", "Topology Mode Preset")}</span>
+          <select id="wf-edit-topology" class="mac-select mono" title="${esc(draft.topology)}">
+            ${topoOptions.map((tp) => `<option value="${esc(tp.id)}" ${draft.topology === tp.id ? "selected" : ""}>${esc(tp.label)}</option>`).join("")}
           </select>
         </label>
       </div>
 
-      <div class="cfg-field-label">
-        <div class="subhead-row">
-          <span>${tr("Refinery 验收测试命令 (verify_command — 可输入任意命令)", "Refinery Verify Command (editable)")}</span>
-          <div class="chips-wrap">
-            ${["go test ./...", "CGO_ENABLED=0 go test -race ./...", "npm test", "pytest", "cargo test"]
-              .map((cmd) => `<button class="chip-btn mono" type="button" data-wf-verify-chip="${esc(cmd)}">${esc(cmd)}</button>`)
-              .join("")}
-          </div>
-        </div>
-        <input id="wf-edit-verify" class="mac-input mono" type="text" value="${esc(draft.verify_command || "")}" placeholder="go test ./...">
-      </div>
-
+      <!-- Step 2: Core Run Parameters -->
       <div class="three-col">
         <label class="cfg-field-label">
-          <span>${tr("最大并发节点 (max_concurrency)", "Max Concurrency")}</span>
-          <input id="wf-edit-conc" class="mac-input mono" type="number" min="1" max="16" value="${Number(draft.max_concurrency || 3)}">
+          <span>2. ${tr("并发执行数 (max_concurrency)", "Max Concurrency")}</span>
+          <select id="wf-edit-conc" class="mac-select mono">
+            ${concChoices.map((n) => `<option value="${n}" ${concVal === n ? "selected" : ""}>${n} ${tr("并发", "workers")}</option>`).join("")}
+          </select>
         </label>
         <label class="cfg-field-label">
-          <span>${tr("最大盲审轮次 (max_rounds)", "Max Review Rounds")}</span>
-          <input id="wf-edit-rounds" class="mac-input mono" type="number" min="1" max="10" value="${Number(draft.max_rounds ?? draft.max_review_rounds ?? 2)}">
+          <span>${tr("最大审查轮次 (max_rounds)", "Max Review Rounds")}</span>
+          <select id="wf-edit-rounds" class="mac-select mono">
+            ${roundsChoices.map((n) => `<option value="${n}" ${roundsVal === n ? "selected" : ""}>${n} ${tr("轮", "rounds")}</option>`).join("")}
+          </select>
         </label>
         <label class="cfg-field-label">
-          <span>${tr("预算上限 USD (budget_usd, 0=不限)", "Budget USD (0=unlimited)")}</span>
-          <input id="wf-edit-budget" class="mac-input mono" type="number" min="0" step="0.5" value="${Number(draft.budget_usd || 0)}">
+          <span>${tr("验收命令预设", "Verify Command Preset")}</span>
+          <select id="wf-verify-preset-select" class="mac-select mono">
+            ${verifyPresets.map((vp) => `<option value="${esc(vp.v)}" ${(draft.verify_command || "") === vp.v ? "selected" : ""}>${esc(vp.l)}</option>`).join("")}
+          </select>
         </label>
       </div>
 
-      <label class="checkbox-row">
-        <input id="wf-edit-wt" type="checkbox" ${draft.use_worktrees ? "checked" : ""}>
-        <span>${tr("默认启用 Git Worktree 物理分支隔离 (use_worktrees)", "Enable isolated Git worktrees by default")}</span>
-      </label>
+      <div class="two-col" style="align-items:end;">
+        <label class="cfg-field-label">
+          <span>${tr("验收测试命令 (可自由编辑)", "Verify Command (editable)")}</span>
+          <input id="wf-edit-verify" class="mac-input mono" type="text" value="${esc(draft.verify_command || "")}" placeholder="go test ./...">
+        </label>
+        <label class="checkbox-row" style="padding-bottom:6px;">
+          <input id="wf-edit-wt" type="checkbox" ${draft.use_worktrees ? "checked" : ""}>
+          <span>${tr("启用 Git Worktree 物理隔离与串行合入", "Isolate stages in Git worktrees")}</span>
+        </label>
+      </div>
 
+      <!-- Step 3: Visual Flow Preview Bar + Stage Role & Model Cards -->
       <div class="cfg-field-label">
-        <div class="subhead-row">
-          <span>${tr("拓扑节点表 (按 node.id 独立保存模型覆盖，支持同角色多节点异构模型)", "Workflow Nodes (per-node model overrides keyed by node.id)")}</span>
-          <button id="wf-add-node-btn" class="ghost-xs-btn" type="button">${tr("+ 添加节点", "+ Add Node")}</button>
+        <span>3. ${tr("阶段角色与模型绑定（可视化拓扑流程）", "Stage Roles & Model Bindings")}</span>
+        <div class="topo-flow-preview" id="wf-flow-preview-bar">
+          ${formatTopologyFlowPreview(draft.topology, concVal, roundsVal)}
         </div>
-        <table class="editable-table">
-          <thead>
-            <tr>
-              <th>${tr("节点 ID (Node ID)", "Node ID")}</th>
-              <th>${tr("名称", "Label")}</th>
-              <th>${tr("角色", "Agent Role")}</th>
-              <th>${tr("独立模型覆盖 (role_models[id])", "Node Model Override")}</th>
-              <th>${tr("Worktree 隔离", "Worktree")}</th>
-              <th></th>
-            </tr>
-          </thead>
-          <tbody>${nodeRowsHTML}</tbody>
-        </table>
+        <div style="display:flex;flex-direction:column;gap:8px;margin-top:6px;">
+          ${stageCardsHTML}
+        </div>
       </div>
-
-      <label class="cfg-field-label">
-        <span>${tr("节点连线 (每行格式: from -> to 或 from -> to (feedback))", "Edges (one per line: from -> to or from -> to (feedback))")}</span>
-        <textarea id="wf-edit-edges" class="mac-textarea mono" rows="4" placeholder="scout -> coder_a\ncoder_a -> reviewer\nreviewer -> coder_a (feedback)">${esc(edgesText)}</textarea>
-      </label>
 
       <div class="subhead-row" style="padding-top:6px;border-top:1px solid var(--hairline);">
         ${
@@ -4529,7 +4641,7 @@ function renderWorkflowsSettingsPage() {
   `;
 }
 
-// --- Page 6: Permissions, Workspace Trust & Persisted Grants ---
+// --- Page 6: Permissions, Workspace Trust, Visual Rules & Lifecycle Hooks ---
 function renderPermissionsSettingsPage() {
   const r = state.config.rules || {};
   const allowCmds = Array.isArray(r.allow_commands) ? r.allow_commands : [];
@@ -4540,12 +4652,61 @@ function renderPermissionsSettingsPage() {
   const allowDomains = Array.isArray(r.allowed_domains) ? r.allowed_domains : [];
   const customRules = Array.isArray(r.rules) ? r.rules : [];
 
+  const ruleCategories = [
+    { key: "allow_commands", label: tr("✅ 自动放行命令 (allow_commands)", "✅ Allow Commands (allow_commands)"), list: allowCmds, chipClass: "" },
+    { key: "ask_commands", label: tr("⚠️ 每次询问命令 (ask_commands)", "⚠️ Ask Commands (ask_commands)"), list: askCmds, chipClass: "warn-chip" },
+    { key: "deny_commands", label: tr("🚫 严禁执行命令 (deny_commands)", "🚫 Deny Commands (deny_commands)"), list: denyCmds, chipClass: "danger-chip" },
+    { key: "allow_paths", label: tr("📂 允许读写路径 (allow_paths)", "📂 Allow Paths (allow_paths)"), list: allowPaths, chipClass: "" },
+    { key: "deny_paths", label: tr("🔒 敏感路径黑名单 (deny_paths)", "🔒 Deny Paths (deny_paths)"), list: denyPaths, chipClass: "danger-chip" },
+    { key: "allowed_domains", label: tr("🌐 出网域名白名单 (allowed_domains)", "🌐 Allowed Domains (allowed_domains)"), list: allowDomains, chipClass: "" }
+  ];
+  const activeCatKey = state.activeRuleCategory || "allow_commands";
+
   const activeWs = state.workspaces.find((w) => w.id === state.activeWorkspaceId) || null;
   const trustHashes = activeWs ? Object.keys(activeWs.trusted_hashes || {}) : [];
 
-  const structuredRulesLines = customRules
-    .map((rl) => `${rl.action || rl.effect || "ask"} | ${rl.tool || "*"} | ${rl.pattern || "*"} | ${rl.reason || ""}`)
-    .join("\n");
+  const categoryTagsHTML = ruleCategories
+    .map((cat) => {
+      const tags = cat.list
+        .map(
+          (val) =>
+            `<span class="chip-btn active ${cat.chipClass} mono">${esc(val)} <span class="chip-remove" data-remove-rule-tag="${esc(cat.key)}" data-val="${esc(val)}">✕</span></span>`
+        )
+        .join("");
+      return `
+        <div class="subagent-worker-row" style="align-items:flex-start;">
+          <strong style="min-width:190px;font-size:11.5px;">${esc(cat.label)}</strong>
+          <div class="chips-wrap" style="flex:1;">
+            ${tags || `<span class="tiny-muted">${tr("暂无规则", "Empty")}</span>`}
+          </div>
+        </div>
+      `;
+    })
+    .join("");
+
+  const hooksCfg = state.config.hooks || {};
+  const hookPhases = [
+    { key: "pre_tool_use", label: tr("PreToolUse · 工具调用前", "PreToolUse · Before Tool") },
+    { key: "post_tool_use", label: tr("PostToolUse · 工具调用后", "PostToolUse · After Tool") },
+    { key: "turn_stopping", label: tr("TurnStopping · 回合结束前", "TurnStopping · Turn Stopping") }
+  ];
+  const hookRows = [];
+  hookPhases.forEach((ph) => {
+    const arr = Array.isArray(hooksCfg[ph.key]) ? hooksCfg[ph.key] : [];
+    arr.forEach((hk, idx) => {
+      hookRows.push(`
+        <div class="subagent-worker-row mono">
+          <div class="row-actions" style="min-width:0;flex:1;">
+            <span class="role-id-badge">${esc(ph.label)}</span>
+            <span class="meta-chip mono">${esc(hk.matcher || (hk.tools || []).join("|") || "*")}</span>
+            <code style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${esc(hk.command || "")}</code>
+            <span class="tiny-muted">${Number(hk.timeout_sec || 10)}s</span>
+          </div>
+          <button class="danger-xs-btn" type="button" data-del-hook-phase="${esc(ph.key)}" data-del-hook-idx="${idx}">✕</button>
+        </div>
+      `);
+    });
+  });
 
   return `
     <!-- Section A: Active Workspace Policy, .gorness Repo Trust & Persisted Grants -->
@@ -4593,7 +4754,7 @@ function renderPermissionsSettingsPage() {
                   : ""
               }
             </div>
-            <div class="ao-list" style="max-height:150px;">
+            <div class="ao-list" style="max-height:130px;">
               ${
                 state.workspaceGrants.length === 0
                   ? `<span class="tiny-muted">${tr("当前工作区暂无已记住的持久化授权。", "No persisted approval grants for this workspace.")}</span>`
@@ -4615,69 +4776,70 @@ function renderPermissionsSettingsPage() {
       }
     </div>
 
-    <!-- Section B: Editable Global rules.toml -->
+    <!-- Section B: Visual Rules Tag List & Single-Line Quick Add (rules.toml) -->
     <div class="cfg-section-card">
       <div class="cfg-section-head">
         <div>
-          <h3 class="cfg-section-title">📜 ${tr("全局命令、路径与域名规则编辑器 (rules.toml)", "Global Command, Path & Network Rules (rules.toml)")}</h3>
-          <p class="cfg-section-desc">${tr("点选快捷芯片即时生效，也可直接在下方文本框编辑任意通配规则并保存至 PUT /api/config/rules。", "Click quick chips or edit full glob lists below (persisted via PUT /api/config/rules).")}</p>
+          <h3 class="cfg-section-title">📜 ${tr("全局命令、路径与域名可视化规则 (rules.toml)", "Visual Command, Path & Network Rules (rules.toml)")}</h3>
+          <p class="cfg-section-desc">${tr("选择分类后单行快速添加，或点击标签 ✕ 立即移除并自动保存至 PUT /api/config/rules。", "Pick a category to add rules or click ✕ on any tag to auto-save via PUT /api/config/rules.")}</p>
         </div>
       </div>
 
+      <div class="inline-form">
+        <select id="rules-category-select" class="mac-select" style="max-width:250px;">
+          ${ruleCategories.map((c) => `<option value="${esc(c.key)}" ${c.key === activeCatKey ? "selected" : ""}>${esc(c.label)}</option>`).join("")}
+        </select>
+        <input id="rules-quick-add-input" class="mac-input mono" type="text" placeholder="${tr("输入通配规则，如 go test* / .env* / api.openai.com", "Enter glob rule, e.g. go test* / .env* / api.openai.com")}">
+        <button id="rules-quick-add-btn" class="primary-xs-btn" type="button">${tr("+ 快速添加", "+ Add Rule")}</button>
+      </div>
+
       <div class="chips-wrap">
-        <span class="tiny-muted">${tr("快捷放行命令：", "Quick allow:")}</span>
+        <span class="tiny-muted">${tr("常用快捷点选：", "Quick presets:")}</span>
         ${SAFE_CMD_PRESETS.map((c) => `<button class="chip-btn mono ${allowCmds.includes(c) ? "active" : ""}" type="button" data-rule-chip="allow_commands" data-val="${esc(c)}">${esc(c)}</button>`).join("")}
-      </div>
-      <div class="chips-wrap">
-        <span class="tiny-muted">${tr("快捷询问命令：", "Quick ask:")}</span>
-        ${ASK_CMD_PRESETS.map((c) => `<button class="chip-btn warn-chip mono ${askCmds.includes(c) ? "active" : ""}" type="button" data-rule-chip="ask_commands" data-val="${esc(c)}">${esc(c)}</button>`).join("")}
-      </div>
-      <div class="chips-wrap">
-        <span class="tiny-muted">${tr("快捷拒绝命令：", "Quick deny:")}</span>
-        ${DENY_CMD_PRESETS.map((c) => `<button class="chip-btn danger-chip mono ${denyCmds.includes(c) ? "active" : ""}" type="button" data-rule-chip="deny_commands" data-val="${esc(c)}">${esc(c)}</button>`).join("")}
-      </div>
-      <div class="chips-wrap">
-        <span class="tiny-muted">${tr("快捷出网白名单：", "Quick domains:")}</span>
         ${SAFE_DOMAIN_PRESETS.map((d) => `<button class="chip-btn mono ${allowDomains.includes(d) ? "active" : ""}" type="button" data-rule-chip="allowed_domains" data-val="${esc(d)}">${esc(d)}</button>`).join("")}
       </div>
 
-      <div class="three-col">
-        <label class="cfg-field-label">
-          <span>allow_commands (${tr("每行一条", "one per line")})</span>
-          <textarea id="rules-allow-cmds" class="mac-textarea mono" rows="4">${esc(allowCmds.join("\n"))}</textarea>
-        </label>
-        <label class="cfg-field-label">
-          <span>ask_commands (${tr("每行一条", "one per line")})</span>
-          <textarea id="rules-ask-cmds" class="mac-textarea mono" rows="4">${esc(askCmds.join("\n"))}</textarea>
-        </label>
-        <label class="cfg-field-label">
-          <span>deny_commands (${tr("每行一条", "one per line")})</span>
-          <textarea id="rules-deny-cmds" class="mac-textarea mono" rows="4">${esc(denyCmds.join("\n"))}</textarea>
-        </label>
+      <div style="display:flex;flex-direction:column;gap:6px;">
+        ${categoryTagsHTML}
+      </div>
+    </div>
+
+    <!-- Section C: Visual Lifecycle Hooks Card (hooks.toml) -->
+    <div class="cfg-section-card">
+      <div class="cfg-section-head">
+        <div>
+          <h3 class="cfg-section-title">🪝 ${tr("生命周期钩子可视化配置 (hooks.toml)", "Lifecycle Command Hooks (hooks.toml)")}</h3>
+          <p class="cfg-section-desc">${tr("在工具执行前 (PreToolUse)、执行后 (PostToolUse) 或回合结束前 (TurnStopping) 自动运行校验脚本，实时保存至 PUT /api/config/hooks。", "Run shell hooks on PreToolUse, PostToolUse, or TurnStopping (saved via PUT /api/config/hooks).")}</p>
+        </div>
       </div>
 
       <div class="three-col">
         <label class="cfg-field-label">
-          <span>allow_paths (${tr("路径白名单", "allowed paths")})</span>
-          <textarea id="rules-allow-paths" class="mac-textarea mono" rows="3">${esc(allowPaths.join("\n"))}</textarea>
+          <span>${tr("触发阶段 (Phase)", "Lifecycle Phase")}</span>
+          <select id="hook-phase-select" class="mac-select">
+            ${hookPhases.map((p) => `<option value="${esc(p.key)}">${esc(p.label)}</option>`).join("")}
+          </select>
         </label>
         <label class="cfg-field-label">
-          <span>deny_paths (${tr("敏感路径黑名单", "denied paths")})</span>
-          <textarea id="rules-deny-paths" class="mac-textarea mono" rows="3">${esc(denyPaths.join("\n"))}</textarea>
+          <span>${tr("匹配工具 (Matcher)", "Target Tool")}</span>
+          <select id="hook-matcher-select" class="mac-select mono">
+            <option value="*">* (${tr("全部工具", "All Tools")})</option>
+            ${ALL_BUILTIN_TOOLS.map((tl) => `<option value="${esc(tl)}">${esc(tl)}</option>`).join("")}
+          </select>
         </label>
         <label class="cfg-field-label">
-          <span>allowed_domains (${tr("出网域名白名单", "allowed domains")})</span>
-          <textarea id="rules-allow-domains" class="mac-textarea mono" rows="3">${esc(allowDomains.join("\n"))}</textarea>
+          <span>${tr("超时秒数 (timeout_sec)", "Timeout (sec)")}</span>
+          <input id="hook-timeout-input" class="mac-input mono" type="number" min="1" max="300" value="10">
         </label>
       </div>
 
-      <label class="cfg-field-label">
-        <span>${tr("细粒度结构化规则 [[rules]] (每行: effect | tool | pattern | reason)", "Structured Rules [[rules]] (one per line: effect | tool | pattern | reason)")}</span>
-        <textarea id="rules-structured-lines" class="mac-textarea mono" rows="3" placeholder="deny | run_command | git push --force* | Block force push">${esc(structuredRulesLines)}</textarea>
-      </label>
+      <div class="inline-form">
+        <input id="hook-command-input" class="mac-input mono" type="text" placeholder="${tr("输入钩子 Shell 命令，例如：go vet ./... 或自定义安全审计脚本", "Shell command, e.g. go vet ./...")}">
+        <button id="add-hook-btn" class="primary-xs-btn" type="button">${tr("+ 添加钩子", "+ Add Hook")}</button>
+      </div>
 
-      <div class="modal-actions">
-        <button id="save-rules-form-btn" class="primary-sm-btn" type="button">${tr("保存全部安全规则", "Save Security Rules")}</button>
+      <div style="display:flex;flex-direction:column;gap:6px;">
+        ${hookRows.join("") || `<span class="tiny-muted">${tr("当前暂无已配置的生命周期钩子。", "No lifecycle hooks configured yet.")}</span>`}
       </div>
     </div>
   `;
@@ -4807,24 +4969,28 @@ function renderMCPSettingsPage() {
               <input id="mcp-edit-cmd" class="mac-input mono" type="text" value="${esc(draft.command)}" placeholder="npx / uvx / /usr/local/bin/mcp">
             </label>
             <label class="cfg-field-label">
-              <span>${tr("命令参数 (args，每行一个参数)", "Arguments (one per line)")}</span>
-              <textarea id="mcp-edit-args" class="mac-textarea mono" rows="3">${esc((draft.args || []).join("\n"))}</textarea>
+              <span>${tr("命令参数 (args，空格或换行分隔)", "Arguments")}</span>
+              <input id="mcp-edit-args" class="mac-input mono" type="text" value="${esc((draft.args || []).join(" "))}" placeholder="-y @modelcontextprotocol/server-filesystem .">
             </label>
           </div>
-          <label class="cfg-field-label">
-            <span>${tr("环境变量 (env，每行 KEY=VALUE，支持 keychain:KEY)", "Environment Variables (one KEY=VALUE per line)")}</span>
-            <textarea id="mcp-edit-env" class="mac-textarea mono" rows="2" placeholder="GITHUB_TOKEN=keychain:GITHUB_TOKEN">${esc(envText)}</textarea>
-          </label>
+          <details class="advanced-config-disclosure">
+            <summary>${tr("高级选项：环境变量 (KEY=VALUE，可选)", "Advanced: Environment Variables (Optional)")}</summary>
+            <div class="advanced-config-body">
+              <input id="mcp-edit-env" class="mac-input mono" type="text" value="${esc(Object.entries(draft.env || {}).map(([k, v]) => `${k}=${v}`).join("; "))}" placeholder="GITHUB_TOKEN=keychain:GITHUB_TOKEN">
+            </div>
+          </details>
         `
           : `
           <label class="cfg-field-label">
             <span>${tr("远程服务 URL (http / sse)", "Endpoint URL")}</span>
             <input id="mcp-edit-url" class="mac-input mono" type="text" value="${esc(draft.url)}" placeholder="http://127.0.0.1:8090/mcp">
           </label>
-          <label class="cfg-field-label">
-            <span>${tr("自定义 HTTP 请求头 (每行 Header: Value)", "Custom Headers (one Header: Value per line)")}</span>
-            <textarea id="mcp-edit-headers" class="mac-textarea mono" rows="2" placeholder="Authorization: Bearer ...">${esc(hdrText)}</textarea>
-          </label>
+          <details class="advanced-config-disclosure">
+            <summary>${tr("高级选项：自定义请求头 (Header: Value，可选)", "Advanced: Custom HTTP Headers (Optional)")}</summary>
+            <div class="advanced-config-body">
+              <input id="mcp-edit-headers" class="mac-input mono" type="text" value="${esc(Object.entries(draft.headers || {}).map(([k, v]) => `${k}: ${v}`).join("; "))}" placeholder="Authorization: Bearer ...">
+            </div>
+          </details>
         `
       }
 
@@ -4953,46 +5119,6 @@ function renderMemorySettingsPage() {
       }
     </div>
   `;
-}
-
-// --- Page 9: Raw Vault Files (with Pre-Write Validation Error Display) ---
-function renderRawFilesSettingsPage() {
-  const files = state.configFiles || [];
-  if (!files.includes(state.selectedVaultFile) && files.length > 0) {
-    state.selectedVaultFile = files[0];
-  }
-  return `
-    <div class="cfg-section-card">
-      <div class="cfg-section-head">
-        <div>
-          <h3 class="cfg-section-title">📄 ${tr("~/.gorness/ 透明源文件直编 (写前语法与 Schema 校验)", "Raw ~/.gorness/ Vault Editor (Pre-Write Schema Validation)")}</h3>
-          <p class="cfg-section-desc">${tr("支持检视与编辑全部 TOML / Markdown 底层文件；若存在语法或未知字段错误，将在保存前拦截并高亮显示。", "Inspect & edit raw TOML/MD files via GET/PUT /api/config/files with atomic validation.")}</p>
-        </div>
-        <div class="row-actions">
-          <select id="studio-vault-select" class="mac-select mono wide">
-            ${files.map((f) => `<option value="${esc(f)}" ${f === state.selectedVaultFile ? "selected" : ""}>${esc(f)}</option>`).join("")}
-          </select>
-          <button id="studio-vault-save-btn" class="primary-sm-btn" type="button">${tr("校验并保存文件", "Validate & Save")}</button>
-        </div>
-      </div>
-      <div id="studio-vault-validation-err" class="validation-banner ${state.vaultValidationError ? "" : "hidden"}">${escHtml(state.vaultValidationError)}</div>
-      <textarea id="studio-vault-textarea" class="vault-editor mono" style="min-height:420px;" spellcheck="false"></textarea>
-    </div>
-  `;
-}
-
-async function loadSelectedVaultFile() {
-  const sel = $("studio-vault-select");
-  const ta = $("studio-vault-textarea");
-  const rel = sel?.value || state.selectedVaultFile;
-  if (!rel || !ta) return;
-  state.selectedVaultFile = rel;
-  try {
-    const res = await apiFetch(`/api/config/files?rel=${encodeURIComponent(rel)}`);
-    ta.value = res.content || "";
-  } catch (err) {
-    notifyError(err, tr("读取源文件失败", "Failed to load vault file"));
-  }
 }
 
 // ============================================================================
@@ -5199,6 +5325,20 @@ function parseLinesList(raw) {
     .filter(Boolean);
 }
 
+function parseSemicolonOrLinesList(raw) {
+  return String(raw || "")
+    .split(/[\r\n;]+/)
+    .map((s) => s.trim())
+    .filter(Boolean);
+}
+
+function parseArgsText(raw) {
+  const s = String(raw || "").trim();
+  if (!s) return [];
+  if (s.includes("\n")) return parseLinesList(s);
+  return s.split(/\s+/).filter(Boolean);
+}
+
 function parseCommaList(raw) {
   return String(raw || "")
     .split(",")
@@ -5208,7 +5348,7 @@ function parseCommaList(raw) {
 
 function parseHeadersText(raw) {
   const out = {};
-  parseLinesList(raw).forEach((line) => {
+  parseSemicolonOrLinesList(raw).forEach((line) => {
     const idx = line.indexOf(":");
     if (idx > 0) {
       const k = line.slice(0, idx).trim();
@@ -5221,7 +5361,7 @@ function parseHeadersText(raw) {
 
 function parseEnvText(raw) {
   const out = {};
-  parseLinesList(raw).forEach((line) => {
+  parseSemicolonOrLinesList(raw).forEach((line) => {
     const idx = line.indexOf("=");
     if (idx > 0) {
       const k = line.slice(0, idx).trim();
@@ -5230,33 +5370,6 @@ function parseEnvText(raw) {
     }
   });
   return out;
-}
-
-function parseEdgesText(raw) {
-  const edges = [];
-  parseLinesList(raw).forEach((line) => {
-    const m = line.match(/^([a-zA-Z0-9_.-]+)\s*->\s*([a-zA-Z0-9_.-]+)(?:\s*\(([a-zA-Z0-9_-]+)\))?$/);
-    if (m) {
-      edges.push({ from: m[1], to: m[2], kind: m[3] || "seq" });
-    }
-  });
-  return edges;
-}
-
-function parseStructuredRulesText(raw) {
-  const rules = [];
-  parseLinesList(raw).forEach((line) => {
-    const parts = line.split("|").map((p) => p.trim());
-    if (parts.length >= 3) {
-      rules.push({
-        action: parts[0] || "ask",
-        tool: parts[1] || "*",
-        pattern: parts[2] || "*",
-        reason: parts[3] || ""
-      });
-    }
-  });
-  return rules;
 }
 
 function syncProviderFormIntoDraft() {
@@ -5281,12 +5394,14 @@ function syncWorkflowFormIntoDraft() {
   if ($("wf-edit-rounds")) d.max_rounds = Number($("wf-edit-rounds").value || 2);
   if ($("wf-edit-budget")) d.budget_usd = Number($("wf-edit-budget").value || 0);
   if ($("wf-edit-wt")) d.use_worktrees = Boolean($("wf-edit-wt").checked);
-  if ($("wf-edit-edges")) d.edges = parseEdgesText($("wf-edit-edges").value);
+  if (!Array.isArray(d.edges) || d.edges.length === 0) {
+    d.edges = buildStandardTopologyTemplate(d.topology).edges;
+  }
   return d;
 }
 
 function bindConfigStudioEvents() {
-  // Sidebar navigation across all 9 pages
+  // Sidebar navigation across all 8 visual pages
   $$(".settings-nav-btn[data-cfg-page]").forEach((btn) => {
     btn.addEventListener("click", () => {
       state.configPage = btn.dataset.cfgPage;
@@ -5306,23 +5421,6 @@ function bindConfigStudioEvents() {
 
   studio.addEventListener("click", async (ev) => {
     // --- Page 1: General ---
-    const themeBtn = ev.target.closest("[data-cfg-ui-theme]");
-    if (themeBtn) {
-      applyTheme(themeBtn.dataset.cfgUiTheme, true);
-      renderConfigStudio();
-      return;
-    }
-    const langBtn = ev.target.closest("[data-cfg-ui-lang]");
-    if (langBtn) {
-      applyLanguage(langBtn.dataset.cfgUiLang, true);
-      return;
-    }
-    const gPill = ev.target.closest("[data-global-pill]");
-    if (gPill) {
-      await saveGlobalConfigPatch({ [gPill.dataset.globalPill]: gPill.dataset.val });
-      renderConfigStudio();
-      return;
-    }
     if (ev.target.closest("#save-general-limits-btn")) {
       const maxConc = Number($("gen-max-runs")?.value || 8);
       const maxSteps = Number($("gen-max-steps")?.value || 32);
@@ -5341,14 +5439,15 @@ function bindConfigStudioEvents() {
     }
 
     // --- Page 2: Matrix ---
+    const subTabBtn = ev.target.closest("[data-matrix-subtab]");
+    if (subTabBtn) {
+      state.matrixSubTab = subTabBtn.dataset.matrixSubtab;
+      renderConfigStudio();
+      return;
+    }
     const schemeBtn = ev.target.closest("[data-apply-scheme]");
     if (schemeBtn) {
       await applyMatrixScheme(schemeBtn.dataset.applyScheme);
-      return;
-    }
-    const effortPill = ev.target.closest("[data-agent-effort-pill]");
-    if (effortPill) {
-      await patchAgentRole(effortPill.dataset.agentEffortPill, { effort: effortPill.dataset.effort });
       return;
     }
     const rmFb = ev.target.closest("[data-remove-fallback]");
@@ -5606,27 +5705,6 @@ function bindConfigStudioEvents() {
       renderConfigStudio();
       return;
     }
-    const wfVerifyChip = ev.target.closest("[data-wf-verify-chip]");
-    if (wfVerifyChip && $("wf-edit-verify")) {
-      $("wf-edit-verify").value = wfVerifyChip.dataset.wfVerifyChip;
-      return;
-    }
-    if (ev.target.closest("#wf-add-node-btn")) {
-      const d = syncWorkflowFormIntoDraft();
-      const nextNum = (d.nodes || []).length + 1;
-      d.nodes.push({ id: `node_${nextNum}`, label: `Worker ${nextNum}`, role: "coder", worktree: true });
-      renderConfigStudio();
-      return;
-    }
-    const delWfNode = ev.target.closest("[data-wf-del-node]");
-    if (delWfNode) {
-      const d = syncWorkflowFormIntoDraft();
-      const idx = Number(delWfNode.dataset.wfDelNode);
-      const removed = d.nodes.splice(idx, 1)[0];
-      if (removed?.id && d.role_models) delete d.role_models[removed.id];
-      renderConfigStudio();
-      return;
-    }
     if (ev.target.closest("#save-workflow-def-btn")) {
       const d = syncWorkflowFormIntoDraft();
       if (!d.id) {
@@ -5666,34 +5744,87 @@ function bindConfigStudioEvents() {
       return;
     }
 
-    // --- Page 6: Permissions, Trust & Grants ---
+    // --- Page 6: Permissions, Trust, Grants & Hooks ---
     const ruleChip = ev.target.closest("[data-rule-chip]");
     if (ruleChip) {
+      state.activeRuleCategory = ruleChip.dataset.ruleChip;
       await toggleRuleChip(ruleChip.dataset.ruleChip, ruleChip.dataset.val);
       return;
     }
-    if (ev.target.closest("#save-rules-form-btn")) {
+    const rmRuleTag = ev.target.closest("[data-remove-rule-tag]");
+    if (rmRuleTag) {
+      await toggleRuleChip(rmRuleTag.dataset.removeRuleTag, rmRuleTag.dataset.val);
+      return;
+    }
+    if (ev.target.closest("#rules-quick-add-btn")) {
+      const cat = $("rules-category-select")?.value || state.activeRuleCategory || "allow_commands";
+      const val = ($("rules-quick-add-input")?.value || "").trim();
+      if (!val) return;
+      state.activeRuleCategory = cat;
+      const curList = Array.isArray(state.config?.rules?.[cat]) ? state.config.rules[cat] : [];
+      if (!curList.includes(val)) {
+        await toggleRuleChip(cat, val);
+      }
+      if ($("rules-quick-add-input")) $("rules-quick-add-input").value = "";
+      return;
+    }
+    if (ev.target.closest("#add-hook-btn")) {
+      const phase = $("hook-phase-select")?.value || "pre_tool_use";
+      const tool = $("hook-tool-select")?.value || "*";
+      const command = ($("hook-command-input")?.value || "").trim();
+      const timeoutSec = Number($("hook-timeout-input")?.value || 15);
+      if (!command) {
+        showToast(tr("请填写钩子执行命令", "Hook command is required"), "error");
+        return;
+      }
+      const curHooks = state.config?.hooks || {};
+      const nextHooks = {
+        pre_tool_use: Array.isArray(curHooks.pre_tool_use) ? [...curHooks.pre_tool_use] : [],
+        post_tool_use: Array.isArray(curHooks.post_tool_use) ? [...curHooks.post_tool_use] : [],
+        turn_stopping: Array.isArray(curHooks.turn_stopping) ? [...curHooks.turn_stopping] : []
+      };
+      if (!Array.isArray(nextHooks[phase])) nextHooks[phase] = [];
+      nextHooks[phase].push({ tool, command, timeout_sec: timeoutSec });
       setAutoSaveIndicator("saving");
       try {
-        const snap = await apiFetch("/api/config/rules", {
-          method: "PUT",
-          body: {
-            allow_commands: parseLinesList($("rules-allow-cmds")?.value),
-            ask_commands: parseLinesList($("rules-ask-cmds")?.value),
-            deny_commands: parseLinesList($("rules-deny-cmds")?.value),
-            allow_paths: parseLinesList($("rules-allow-paths")?.value),
-            deny_paths: parseLinesList($("rules-deny-paths")?.value),
-            allowed_domains: parseLinesList($("rules-allow-domains")?.value),
-            rules: parseStructuredRulesText($("rules-structured-lines")?.value)
-          }
-        });
-        state.config = snap;
+        const res = await apiFetch("/api/config/hooks", { method: "PUT", body: nextHooks });
+        if (res?.config) state.config = res.config;
+        else if (res?.global) state.config = res;
+        else state.config = Object.assign({}, state.config || {}, { hooks: res?.hooks || nextHooks });
         setAutoSaveIndicator("ok");
         renderConfigStudio();
-        showToast(tr("全局安全规则已保存", "Security rules saved"), "ok");
+        showToast(tr("生命周期钩子已添加并保存", "Lifecycle hook saved"), "ok");
       } catch (err) {
         setAutoSaveIndicator("err", err.message);
-        notifyError(err, tr("保存规则失败", "Failed to save rules"));
+        notifyError(err, tr("保存钩子失败", "Failed to save hooks"));
+      }
+      return;
+    }
+    const delHookBtn = ev.target.closest("[data-del-hook-phase]");
+    if (delHookBtn) {
+      const phase = delHookBtn.dataset.delHookPhase;
+      const idx = Number(delHookBtn.dataset.delHookIdx);
+      const curHooks = state.config?.hooks || {};
+      const nextHooks = {
+        pre_tool_use: Array.isArray(curHooks.pre_tool_use) ? [...curHooks.pre_tool_use] : [],
+        post_tool_use: Array.isArray(curHooks.post_tool_use) ? [...curHooks.post_tool_use] : [],
+        turn_stopping: Array.isArray(curHooks.turn_stopping) ? [...curHooks.turn_stopping] : []
+      };
+      if (Array.isArray(nextHooks[phase])) {
+        nextHooks[phase].splice(idx, 1);
+      }
+      setAutoSaveIndicator("saving");
+      try {
+        const res = await apiFetch("/api/config/hooks", { method: "PUT", body: nextHooks });
+        if (res?.config) state.config = res.config;
+        else if (res?.global) state.config = res;
+        else state.config = Object.assign({}, state.config || {}, { hooks: res?.hooks || nextHooks });
+        setAutoSaveIndicator("ok");
+        renderConfigStudio();
+        showToast(tr("已移除该钩子", "Hook removed"), "ok");
+      } catch (err) {
+        setAutoSaveIndicator("err", err.message);
+        notifyError(err, tr("删除钩子失败", "Failed to delete hook"));
       }
       return;
     }
@@ -5820,7 +5951,7 @@ function bindConfigStudioEvents() {
         timeout_sec: Number($("mcp-edit-timeout")?.value || 60),
         enabled: Boolean($("mcp-edit-enabled")?.checked),
         command: transport === "stdio" ? ($("mcp-edit-cmd")?.value || "").trim() : "",
-        args: transport === "stdio" ? parseLinesList($("mcp-edit-args")?.value) : [],
+        args: transport === "stdio" ? parseArgsText($("mcp-edit-args")?.value) : [],
         env: transport === "stdio" ? parseEnvText($("mcp-edit-env")?.value) : {},
         url: transport !== "stdio" ? ($("mcp-edit-url")?.value || "").trim() : "",
         headers: transport !== "stdio" ? parseHeadersText($("mcp-edit-headers")?.value) : {}
@@ -5957,38 +6088,33 @@ function bindConfigStudioEvents() {
       return;
     }
 
-    // --- Page 9: Raw Vault Files ---
-    if (ev.target.closest("#studio-vault-save-btn")) {
-      const rel = $("studio-vault-select")?.value;
-      const content = $("studio-vault-textarea")?.value ?? "";
-      if (!rel) return;
-      setAutoSaveIndicator("saving");
-      state.vaultValidationError = "";
-      try {
-        const res = await apiFetch("/api/config/files", {
-          method: "PUT",
-          body: { rel_path: rel, content }
-        });
-        if (res.snapshot || res.config) state.config = res.snapshot || res.config;
-        $("studio-vault-validation-err")?.classList.add("hidden");
-        setAutoSaveIndicator("ok");
-        populateAgentAndModelControls();
-        showToast(`${tr("已校验并写入", "Validated & saved")}: ${rel}`, "ok");
-      } catch (err) {
-        state.vaultValidationError = err.message;
-        const errBox = $("studio-vault-validation-err");
-        if (errBox) {
-          errBox.textContent = err.message;
-          errBox.classList.remove("hidden");
-        }
-        setAutoSaveIndicator("err", err.message);
-        notifyError(err, tr("配置校验未通过", "Validation failed"));
-      }
+  });
+
+  studio.addEventListener("keydown", async (ev) => {
+    if (ev.target.id === "rules-quick-add-input" && ev.key === "Enter") {
+      ev.preventDefault();
+      $("rules-quick-add-btn")?.click?.();
     }
   });
 
   studio.addEventListener("change", async (ev) => {
     const tEl = ev.target;
+
+    // General page selects
+    if (tEl.id === "cfg-ui-theme-select") {
+      applyTheme(tEl.value, true);
+      renderConfigStudio();
+      return;
+    }
+    if (tEl.id === "cfg-ui-lang-select") {
+      applyLanguage(tEl.value, true);
+      return;
+    }
+    if (tEl.dataset.globalSelect) {
+      await saveGlobalConfigPatch({ [tEl.dataset.globalSelect]: tEl.value });
+      renderConfigStudio();
+      return;
+    }
 
     // Matrix global selects
     if (tEl.id === "cfg-global-provider") {
@@ -6016,6 +6142,10 @@ function bindConfigStudioEvents() {
       await patchAgentRole(tEl.dataset.agentModelSelect, { model: tEl.value });
       return;
     }
+    if (tEl.dataset.agentEffortSelect) {
+      await patchAgentRole(tEl.dataset.agentEffortSelect, { effort: tEl.value });
+      return;
+    }
     if (tEl.dataset.addFallback && tEl.value) {
       const aId = tEl.dataset.addFallback;
       const cur = Array.isArray(state.config?.agents?.[aId]?.fallbacks) ? [...state.config.agents[aId].fallbacks] : [];
@@ -6033,6 +6163,27 @@ function bindConfigStudioEvents() {
           .map((m) => `<option value="${esc(m.id)}">${esc(m.name)}</option>`)
           .join("");
       }
+      return;
+    }
+
+    // Workflows 3-step visual configuration
+    if (tEl.id === "wf-edit-topology") {
+      const d = syncWorkflowFormIntoDraft();
+      const tpl = buildStandardTopologyTemplate(tEl.value);
+      d.topology = tEl.value;
+      d.nodes = tpl.nodes;
+      d.edges = tpl.edges;
+      renderConfigStudio();
+      return;
+    }
+    if (tEl.id === "wf-verify-preset-select" && tEl.value) {
+      if ($("wf-edit-verify")) $("wf-edit-verify").value = tEl.value;
+      return;
+    }
+    if (tEl.id === "wf-edit-conc" || tEl.id === "wf-edit-rounds") {
+      const d = syncWorkflowFormIntoDraft();
+      const bar = $("wf-flow-preview-bar");
+      if (bar) bar.textContent = formatTopologyFlowPreview(d.topology, d.max_concurrency, d.max_rounds);
       return;
     }
 
@@ -6066,6 +6217,13 @@ function bindConfigStudioEvents() {
       return;
     }
 
+    // Permissions rule category switch
+    if (tEl.id === "rules-category-select") {
+      state.activeRuleCategory = tEl.value;
+      renderConfigStudio();
+      return;
+    }
+
     // MCP transport switch re-renders stdio vs http/sse fields
     if (tEl.id === "mcp-edit-transport") {
       const d = ensureEditingMCPDraft();
@@ -6095,13 +6253,6 @@ function bindConfigStudioEvents() {
         notifyError(err, tr("更新项目策略失败", "Failed to update workspace policy"));
       }
       return;
-    }
-
-    // Raw Vault file switch
-    if (tEl.id === "studio-vault-select") {
-      state.vaultValidationError = "";
-      $("studio-vault-validation-err")?.classList.add("hidden");
-      loadSelectedVaultFile();
     }
   });
 }
@@ -6197,10 +6348,13 @@ function bindAlwaysOnDrawerEvents() {
 // ============================================================================
 
 function bindEvents() {
-  // Topbar: 2 Center Modes (Chat | Fleet) + ONE Settings Button (⚙)
+  // Topbar: 2 Center Modes (Simple Chat | Fleet Collaboration) + Sole Bottom-Left Settings Button (#open-config-studio-btn)
   $("mode-chat-btn")?.addEventListener("click", () => setCenterMode("chat"));
   $("mode-fleet-btn")?.addEventListener("click", () => setCenterMode("fleet"));
-  $("open-settings-top-btn")?.addEventListener("click", () => openSettingsModal(state.configPage || "matrix"));
+  $("switch-to-fleet-btn")?.addEventListener("click", () => setCenterMode("fleet"));
+  $("back-to-chat-btn")?.addEventListener("click", () => setCenterMode("chat"));
+  $("launcher-back-to-chat-btn")?.addEventListener("click", () => setCenterMode("chat"));
+  $("open-config-studio-btn")?.addEventListener("click", () => openSettingsModal(state.configPage || "matrix"));
 
   // Left Sidebar: Workspaces & Sessions
   $("add-workspace-btn")?.addEventListener("click", () => {
@@ -6521,14 +6675,6 @@ function bindEvents() {
       } catch (err) {
         notifyError(err);
       }
-      return;
-    }
-    if (ev.target.closest("#ctx-open-perm-btn")) {
-      openSettingsModal("permissions");
-      return;
-    }
-    if (ev.target.closest("#ctx-open-memory-btn")) {
-      openSettingsModal("memory");
     }
   });
 

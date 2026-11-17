@@ -32,7 +32,8 @@ func TestEmbeddedAssetsSingleSettingsHomeAndUIDeduplication(t *testing.T) {
 	// 1. Deleted duplicate entrypoints, redundant tabs, scattered buttons & dead forms MUST be absent from index.html.
 	forbiddenHTMLSubstrings := []string{
 		`id="mode-config-btn"`,
-		`id="open-config-studio-btn"`,
+		`id="open-settings-top-btn"`,
+		`data-cfg-page="files"`,
 		`id="insp-panel-config"`,
 		`data-tab="config"`,
 		`id="expand-full-config-btn"`,
@@ -60,7 +61,9 @@ func TestEmbeddedAssetsSingleSettingsHomeAndUIDeduplication(t *testing.T) {
 	forbiddenJSSubstrings := []string{
 		"renderWorkspaceFleetSubagentsHTML",
 		"renderAgentMatrixAndVaultEditor",
-		"open-config-studio-btn",
+		"renderRawFilesSettingsPage",
+		"open-settings-top-btn",
+		"data-agent-effort-pill",
 		"insp-panel-config",
 		"launch-fleet-quick-btn",
 		"quick-provider-form",
@@ -72,12 +75,16 @@ func TestEmbeddedAssetsSingleSettingsHomeAndUIDeduplication(t *testing.T) {
 		}
 	}
 
-	// 3. Required single Settings home (9 pages), 2-mode switch, Always-On drawer, consolidated session controls & server_test.go contracts MUST exist.
+	// 3. Required single Settings button in bottom-left (#open-config-studio-btn), 8 visual Settings pages,
+	//    2-mode switch (#switch-to-fleet-btn & #back-to-chat-btn), Always-On drawer, consolidated session controls & server_test.go contracts MUST exist.
 	requiredHTMLSubstrings := []string{
 		`id="mode-chat-btn"`,
 		`id="mode-fleet-btn"`,
+		`id="switch-to-fleet-btn"`,
+		`id="back-to-chat-btn"`,
+		`id="launcher-back-to-chat-btn"`,
 		`id="alwayson-drawer-btn"`,
-		`id="open-settings-top-btn"`,
+		`id="open-config-studio-btn"`,
 		`id="health-pill"`,
 		`id="reload-diag-banner"`,
 		`id="session-worktree-pill"`,
@@ -115,7 +122,6 @@ func TestEmbeddedAssetsSingleSettingsHomeAndUIDeduplication(t *testing.T) {
 		`data-cfg-page="permissions"`,
 		`data-cfg-page="mcp"`,
 		`data-cfg-page="memory"`,
-		`data-cfg-page="files"`,
 		`id="alwayson-drawer"`,
 		`id="alwayson-drawer-body"`,
 		`id="trigger-dream-btn"`,
@@ -204,8 +210,8 @@ func TestCanonicalAPIRoutesAndZeroLegacyPaths(t *testing.T) {
 		`"/api/config/agents"`,
 		`"/api/config/workflows"`,
 		`"/api/config/rules"`,
+		`"/api/config/hooks"`,
 		`"/api/config/mcp"`,
-		`"/api/config/files"`,
 		`"/api/memory"`,
 		`"/api/memory/layer"`,
 		`"/api/skills/candidates"`,
@@ -486,17 +492,16 @@ assert.match(chatHTML, /class="subagent-card/, "session-scoped spawn_subagent mu
 assert.match(chatHTML, /Audit web package/, "subagent task must render in Chat");
 assert.match(chatHTML, /Web audit clean/, "paired subagent result must render in Chat");
 
-// D. Verify all 9 Settings pages render editable controls, custom MCP servers, and per-node role_models[nd.id]!
+// D. Verify all 8 visual Settings pages render clean form controls, custom MCP servers, lifecycle hooks, and per-node role_models[nd.id]!
 const pageChecks = [
-  ["general", /data-cfg-ui-theme="dark"[\s\S]*id="gen-max-runs"/],
-  ["matrix", /id="cfg-global-provider"[\s\S]*data-agent-model-select="coder"/],
+  ["general", /id="cfg-ui-theme-select"[\s\S]*id="cfg-ui-lang-select"[\s\S]*id="gen-max-runs"/],
+  ["matrix", /data-matrix-subtab="core"[\s\S]*id="cfg-global-provider"[\s\S]*data-agent-model-select="coder"[\s\S]*data-agent-effort-select="coder"/],
   ["providers", /id="keychain-key-input"[\s\S]*id="prov-edit-baseurl"[\s\S]*id="delete-provider-btn"/],
   ["agents", /id="ag-edit-id"[\s\S]*id="ag-edit-model"[\s\S]*id="ag-edit-sysprompt"/],
-  ["workflows", /id="wf-edit-id"[\s\S]*id="wf-edit-verify"[\s\S]*data-wf-node-field="model_override"/],
-  ["permissions", /id="trust-workspace-btn"[\s\S]*id="rules-allow-cmds"[\s\S]*id="rules-structured-lines"/],
+  ["workflows", /id="wf-edit-id"[\s\S]*id="wf-edit-topology"[\s\S]*id="wf-flow-preview-bar"[\s\S]*data-wf-node-field="model_override"/],
+  ["permissions", /id="trust-workspace-btn"[\s\S]*id="rules-category-select"[\s\S]*id="rules-quick-add-input"[\s\S]*id="hook-phase-select"[\s\S]*id="add-hook-btn"/],
   ["mcp", /custom-internal-sse[\s\S]*id="mcp-edit-id"[\s\S]*id="mcp-edit-transport"/],
-  ["memory", /id="mem-instructions-editor"[\s\S]*id="mem-note-body"[\s\S]*id="mem-prog-body"/],
-  ["files", /id="studio-vault-select"[\s\S]*id="studio-vault-textarea"/]
+  ["memory", /id="mem-instructions-editor"[\s\S]*id="mem-note-body"[\s\S]*id="mem-prog-body"/]
 ];
 for (const [page, pattern] of pageChecks) {
   mod.openSettingsModal(page);
@@ -504,6 +509,10 @@ for (const [page, pattern] of pageChecks) {
   const html = getEl("config-studio-content").innerHTML;
   assert.match(html, pattern, "Settings page " + page + " failed editable controls assertion");
 }
+// Verify removed raw files page falls back cleanly to matrix without rendering raw textarea
+mod.openSettingsModal("files");
+assert.equal(mod.state.configPage, "matrix");
+assert.doesNotMatch(getEl("config-studio-content").innerHTML, /studio-vault-textarea/);
 // Verify workflow node coder_a has its per-node override selected while coder_b (same role!) does NOT inherit coder_a's override
 mod.openSettingsModal("workflows");
 const wfHTML = getEl("config-studio-content").innerHTML;
